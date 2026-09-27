@@ -40,9 +40,29 @@ class Scenario:
     checkout_latency_ms: int = 0
     address: str | None = "Jl. Contoh Raya No. 1, Kebayoran Baru, Jakarta Selatan"
     balance: int | None = 1_250_000
-    price: int = 99_000
-    original_price: int = 1_499_000
+    product_name: str = "Ponsel Uji Coba 128GB"
+    description: str = pages.DEFAULT_DESCRIPTION
+    price: int = 99_000  # harga flash
+    variant_prices: dict[str, int] = field(default_factory=dict)  # harga flash per variasi
+    original_price: int = 1_499_000  # harga normal
     shipping: int = 12_000
+    service_fee: int = 0
+    # --- harga & UI halaman produk
+    buy_active_before_open: bool = False  # tombol aktif + harga normal sebelum slot dibuka
+    flash_available: bool = True  # False: stok flash habis -> harga normal, tombol tetap aktif
+    live_update: bool = True  # False: UI tidak berubah live; status baru terlihat setelah reload
+    verification_on_reload: bool = False  # GET produk setelah slot buka -> /verify/traffic
+    # --- setelah klik Beli
+    captcha_redirect_after_buy: bool = False  # redirect penuh ke /verify/captcha
+    captcha_iframe_after_buy: bool = False  # overlay iframe captcha (bukan dialog)
+    unknown_page_after_buy: bool = False  # redirect ke halaman asing
+    # --- keranjang & checkout
+    cart_other_items: list[dict] = field(default_factory=list)  # {"name","price","checked"}
+    cart_uncheck_fails: bool = False
+    checkout_qty: int | None = None
+    checkout_name: str | None = None
+    price_format_broken: bool = False
+    shipping_delay_ms: int = 0
 
 
 PRESETS: dict[str, dict] = {
@@ -52,7 +72,17 @@ PRESETS: dict[str, dict] = {
     "verification": {"verification_after_buy": True},
     "login_expired": {"login_expired": True},
     "payment_not_shopeepay": {"payment_default": "cod"},
-    "variant_required": {"variants": ["64GB Putih", "128GB Hitam", "256GB Biru"]},
+    "variant_required": {"variants": ["64GB Putih", "128GB Hitam", "256GB Biru"],
+                         "variant_prices": {"64GB Putih": 89_000, "128GB Hitam": 99_000, "256GB Biru": 129_000}},
+    "normal_price_before_open": {"buy_active_before_open": True},
+    "flash_sold_out_normal_price": {"flash_available": False},
+    "static_ui": {"live_update": False},
+    "cart_other_checked": {"cart_other_items": [
+        {"name": "Kabel Data USB-C 1m", "price": 25_000, "checked": True},
+        {"name": "Casing HP Bening", "price": 15_000, "checked": False}]},
+    "captcha_redirect": {"captcha_redirect_after_buy": True},
+    "captcha_iframe": {"captcha_iframe_after_buy": True},
+    "unknown_page": {"unknown_page_after_buy": True},
 }
 
 
@@ -123,6 +153,16 @@ class MockShopee:
         if s.open_at is None:
             return "open"
         return "open" if self.now() >= s.open_at + s.sale_skew_ms / 1000.0 else "not_started"
+
+    def ui_flash_now(self) -> bool:
+        """Tampilan halaman menganggap flash sale sudah mulai (tombol aktif) — dipakai saat render."""
+        s = self.scenario
+        if s.open_at is None:
+            return True
+        return self.now() >= s.open_at + s.button_delay_ms / 1000.0
+
+    def flash_price(self, variant: str | None) -> int:
+        return self.scenario.variant_prices.get(variant or "", self.scenario.price)
 
 
 class MockAdmin:
@@ -233,12 +273,20 @@ def _make_handler(mock: MockShopee):
                     return self._html(pages.login(query.get("next", "/")))
                 if path == "/verify/traffic":
                     return self._html(pages.verification())
+                if path == "/verify/captcha":
+                    return self._html(pages.captcha_page())
+                if path == "/captcha/frame":
+                    return self._html(pages.captcha_frame())
+                if path == "/promo/kejutan":
+                    return self._html(pages.unknown_page())
                 # halaman yang butuh login
                 if s.login_expired:
                     if path.startswith("/api/"):
                         return self._json({"error": "login", "redirect": "/buyer/login"}, 401)
                     return self._login_redirect()
                 if _PRODUCT_RE.match(path):
+                    if s.verification_on_reload and s.open_at is not None and mock.now() >= s.open_at:
+                        return self._redirect("/verify/traffic")
                     return self._product()
                 if path == "/api/buy" and method == "POST":
                     return self._buy(body)
@@ -247,7 +295,7 @@ def _make_handler(mock: MockShopee):
                 if path == "/checkout":
                     if s.checkout_latency_ms:
                         time.sleep(s.checkout_latency_ms / 1000.0)
-                    return self._checkout(query.get("sid", ""))
+                    return self._checkout(query.get("sid", ""), query.get("items", "t"))
                 if path == "/api/order" and method == "POST":
                     return self._order(body)
                 if path == "/pin":
@@ -269,14 +317,17 @@ def _make_handler(mock: MockShopee):
             open_ms = int((s.open_at if s.open_at is not None else mock.now() - 3600) * 1000)
             sold_out_now = s.sold_out and mock.sale_state() == "open"
             self._html(pages.product(
-                item="1001.2002", server_now_ms=now_ms, open_at_ms=open_ms,
-                button_delay_ms=s.button_delay_ms, variants=s.variants, sold_out=sold_out_now,
-                price=_rupiah(s.price), original_price=_rupiah(s.original_price),
-                shipping=_rupiah(s.shipping)))
+                item="1001.2002", name=s.product_name, server_now_ms=now_ms, open_at_ms=open_ms,
+                button_delay_ms=s.button_delay_ms, variants=s.variants, variant_prices=s.variant_prices,
+                sold_out=sold_out_now, price=s.price, original_price=s.original_price,
+                shipping=_rupiah(s.shipping), active_before_open=s.buy_active_before_open,
+                live_update=s.live_update, initial_flash=mock.ui_flash_now(),
+                flash_available=s.flash_available, description=s.description))
 
         def _buy(self, body: dict) -> None:
             s = mock.scenario
-            if mock.sale_state() == "not_started":
+            state = mock.sale_state()
+            if state == "not_started" and not s.buy_active_before_open:
                 return self._json({"error": "not_started", "message": "Flash sale belum dimulai"})
             if s.variants and body.get("variant") not in s.variants:
                 return self._json({"error": "variant",
@@ -287,28 +338,55 @@ def _make_handler(mock: MockShopee):
                 return self._json({"captcha": True})
             if s.verification_after_buy:
                 return self._json({"redirect": "/verify/traffic"})
+            if s.captcha_redirect_after_buy:
+                return self._json({"redirect": "/verify/captcha"})
+            if s.captcha_iframe_after_buy:
+                return self._json({"captcha_iframe": True})
+            if s.unknown_page_after_buy:
+                return self._json({"redirect": "/promo/kejutan"})
+            flash = state == "open" and s.flash_available
+            unit = mock.flash_price(body.get("variant")) if flash else s.original_price
             sid = secrets.token_hex(6)
             with mock.lock:
-                mock.sessions[sid] = {"variant": body.get("variant"), "qty": int(body.get("qty", 1))}
+                mock.sessions[sid] = {"variant": body.get("variant"), "qty": int(body.get("qty", 1)),
+                                      "unit": unit, "flash": flash}
             return self._json({"redirect": f"/cart?sid={sid}"})
+
+        def _cart_rows(self, sess: dict) -> list[dict]:
+            s = mock.scenario
+            rows = [{"id": "t", "name": s.product_name, "variant": sess["variant"], "price": sess["unit"],
+                     "qty": sess["qty"], "checked": True}]
+            for i, o in enumerate(s.cart_other_items):
+                rows.append({"id": f"o{i}", "name": o["name"], "variant": o.get("variant"),
+                             "price": o["price"], "qty": o.get("qty", 1), "checked": o.get("checked", False)})
+            return rows
 
         def _cart(self, sid: str) -> None:
             sess = mock.sessions.get(sid)
             if not sess:
                 return self._html(pages.simple("Keranjang", "Keranjang belanja kosong."))
-            s = mock.scenario
-            self._html(pages.cart(sid, sess["variant"], sess["qty"], _rupiah(s.price * sess["qty"])))
+            self._html(pages.cart(sid, self._cart_rows(sess), mock.scenario.cart_uncheck_fails))
 
-        def _checkout(self, sid: str) -> None:
+        def _checkout(self, sid: str, items: str) -> None:
             sess = mock.sessions.get(sid)
             if not sess:
                 return self._html(pages.simple("Checkout", "Sesi checkout tidak valid."), 400)
             s = mock.scenario
-            total = s.price * sess["qty"] + s.shipping
+            wanted = [i for i in items.split(",") if i]
+            rows = []
+            for r in self._cart_rows(sess):
+                if r["id"] not in wanted:
+                    continue
+                target = r["id"] == "t"
+                qty = (s.checkout_qty or r["qty"]) if target else r["qty"]
+                fmt = (lambda n: "Rp" + f"{n:,}") if (target and s.price_format_broken) else _rupiah
+                rows.append({"name": (s.checkout_name or r["name"]) if target else r["name"],
+                             "variant": r["variant"], "unit": r["price"], "qty": qty,
+                             "unit_text": fmt(r["price"]), "subtotal_text": fmt(r["price"] * qty),
+                             "strike": _rupiah(s.original_price) if target and sess.get("flash") else None})
             self._html(pages.checkout(
-                sid=sid, address=s.address or "-", variant=sess["variant"], qty=sess["qty"],
-                price=_rupiah(s.price), shipping=_rupiah(s.shipping), total=_rupiah(total),
-                payment_default=s.payment_default,
+                sid=sid, address=s.address or "-", rows=rows, shipping=s.shipping, service_fee=s.service_fee,
+                shipping_delay_ms=s.shipping_delay_ms, payment_default=s.payment_default,
                 balance=_rupiah(s.balance) if s.balance is not None else None))
 
         def _order(self, body: dict) -> None:
@@ -356,4 +434,7 @@ def _kind(method: str, path: str) -> str:
         ("GET", "/user/account/address"): "address",
         ("GET", "/user/shopeepay"): "wallet",
         ("GET", "/verify/traffic"): "verify",
+        ("GET", "/verify/captcha"): "verify",
+        ("GET", "/captcha/frame"): "captcha_frame",
+        ("GET", "/promo/kejutan"): "unknown",
     }.get((method, path), "other")

@@ -36,7 +36,8 @@ def test_missing_config_exit_2(tmp_path):
 
 def test_run_rejects_non_shopee_url_without_hidden_flag(tmp_path):
     p = tmp_path / "t.yaml"
-    p.write_text('product_url: "http://127.0.0.1:1/P-i.1.2"\nstart_time: "2099-01-01T00:00:00+07:00"\n')
+    p.write_text('product_url: "http://127.0.0.1:1/P-i.1.2"\nstart_time: "2099-01-01T00:00:00+07:00"\n'
+                 'max_item_price: 1\nmax_total: 1\n')
     assert cli.main(["run", "--config", str(p), "--only", "web"]) == 2
 
 
@@ -48,6 +49,8 @@ def _write_cfg(tmp_path, mock, open_at):
     p = tmp_path / "target.yaml"
     p.write_text(f"""product_url: "{mock.product_url}"
 start_time: "{datetime.fromtimestamp(open_at, WIB).isoformat()}"
+max_item_price: 100000
+max_total: 120000
 web:
   profile_dir: "{tmp_path / 'profile'}"
   channel: null

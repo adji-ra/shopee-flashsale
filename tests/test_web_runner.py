@@ -93,14 +93,16 @@ def test_variant_selected_early(mock, admin, tmp_path, run):
 
 
 def test_variant_required_but_not_configured(mock, admin, tmp_path, run):
-    out = run(run_web(mock, admin, tmp_path, scenario="variant_required"))
+    # harga tunggal -> tombol & harga valid, server menolak karena variasi belum dipilih
+    out = run(run_web(mock, admin, tmp_path, scenario="variant_required", variant_prices={}))
     assert out.result.status == RunStatus.ERROR
     assert "variasi" in out.result.message
     assert len(out.kind("buy")) == 1
 
 
 def test_variant_not_found(mock, admin, tmp_path, run):
-    out = run(run_web(mock, admin, tmp_path, scenario="variant_required", variant="512GB Emas"))
+    out = run(run_web(mock, admin, tmp_path, scenario="variant_required", variant="512GB Emas",
+                      variant_prices={}))
     assert out.result.status == RunStatus.ERROR
     assert "512GB Emas" in out.result.message
 
@@ -199,7 +201,8 @@ def test_order_clicked_but_no_pin_screen_still_alarms(mock, admin, tmp_path, run
         await runner.page.evaluate("document.querySelector('[data-method=cod]').click()")
 
     out = run(run_web(mock, admin, tmp_path, live=True, during=during))
-    assert out.result.status in (RunStatus.TIMEOUT, RunStatus.ERROR), out.result.message
+    # halaman "Pesanan dibuat" (COD) tidak dikenali -> jaring UNKNOWN_STATE, tetap alarm
+    assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
     assert "SUDAH diklik" in out.result.message
     assert len(out.kind("order")) == 1
     assert [e["event"] for e in out.notifier.events] == [str(out.result.status)]

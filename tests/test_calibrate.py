@@ -32,6 +32,8 @@ async def _calibrate(mock, admin, tmp_path):
         buy = page.get_by_role("button", name="Beli Sekarang")
         await at("variant_option")
         await variant.click(modifiers=["Alt"])
+        await at("product_price")
+        await page.locator("#price").click(modifiers=["Alt"])
         await at("buy_button")
         events["variant_after_alt"] = await variant.get_attribute("aria-pressed")
         await variant.click()  # klik biasa memilih variasi
@@ -69,8 +71,12 @@ def test_calibrate_records_and_blocks_place_order(mock, admin, tmp_path, run):
     assert ev["orders"] == 0, "Buat Pesanan tidak boleh terkirim saat kalibrasi"
     assert res.skipped == ["payment_change", "sold_out"]
     assert res.steps["variant_option"][0] == {"role": "button", "name": "{variant}", "exact": True}
+    # harga: hanya kandidat CSS (teks harga berubah-ubah)
+    assert res.steps["product_price"] and all("css" in c for c in res.steps["product_price"])
+    assert {"css": '[id="price"]'} in res.steps["product_price"]
     assert res.steps["buy_button"][0] == {"role": "button", "name": "Beli Sekarang", "exact": True}
-    assert res.steps["cart_checkout"][0] == {"role": "button", "name": "Checkout", "exact": True}
+    # nama tombol "Checkout (1)" berisi angka -> dipakai bagian stabilnya
+    assert res.steps["cart_checkout"][0] == {"role": "button", "name": "Checkout"}
     # nama opsi ShopeePay berisi saldo (angka) -> dipakai bagian stabilnya
     assert res.steps["payment_shopeepay"][0] == {"role": "radio", "name": "ShopeePay"}
     assert {"css": '[id="place-order"]'} in res.steps["place_order"]
@@ -93,10 +99,10 @@ def test_calibrated_selectors_drive_dry_run(mock, admin, tmp_path, run):
     assert data["web"]["calibrated"]["skipped"] == ["payment_change", "sold_out"]
 
     admin.reset()
-    out = run(run_web(mock, admin, tmp_path, scenario="variant_required", variant="256GB Biru",
+    out = run(run_web(mock, admin, tmp_path, scenario="variant_required", variant="64GB Putih",
                       selectors=sel))
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
-    assert out.kind("buy")[0]["body"]["variant"] == "256GB Biru"
+    assert out.kind("buy")[0]["body"]["variant"] == "64GB Putih"
     assert out.kind("order") == []
 
 
@@ -110,6 +116,10 @@ def test_stable_text_and_candidates():
     assert {"css": '[data-testid="buy"]'} in c
     assert {"css": '[id="btn-8812731"]'} not in c  # id berangka panjang dianggap tidak stabil
     assert c[-1] == {"css": "body > main > button"}
+    price = candidates_from({"tag": "span", "role": None, "name": "Rp99.000", "text": "Rp99.000",
+                             "attrs": {"id": "price"}, "classes": ["price", "x9f3k2ab"], "css": "body > span"},
+                            css_only=True)
+    assert price == [{"css": '[id="price"]'}, {"css": "span.price"}, {"css": "body > span"}]
     t = candidates_from({"role": "radio", "name": "64GB Putih", "text": "64GB Putih", "attrs": {}},
                         variant_template=True)
     assert t == [{"role": "radio", "name": "{variant}", "exact": True}, {"text": "{variant}", "exact": True}]

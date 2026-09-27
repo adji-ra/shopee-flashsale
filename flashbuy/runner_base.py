@@ -36,15 +36,19 @@ class RunStatus(StrEnum):
     VERIFICATION = "VERIFICATION"
     LOGIN_REQUIRED = "LOGIN_REQUIRED"
     TIMEOUT = "TIMEOUT"
+    PRICE_GUARD = "PRICE_GUARD"  # harga/isi pesanan di luar batas atau tidak terbaca (fail-closed)
+    UNKNOWN_STATE = "UNKNOWN_STATE"  # halaman tak dikenali terlalu lama (jaring pengaman)
     ABORTED = "ABORTED"
     ERROR = "ERROR"
 
 
-# CAPTCHA/verifikasi: hentikan SEMUA runner, alarm, tanpa retry.
-STOP_ALL_STATUSES = frozenset({RunStatus.CAPTCHA, RunStatus.VERIFICATION})
-# Status yang butuh tindakan manual -> alarm + browser/app dibiarkan terbuka.
+# CAPTCHA/verifikasi/halaman tak dikenal: hentikan SEMUA runner, alarm, tanpa retry.
+STOP_ALL_STATUSES = frozenset({RunStatus.CAPTCHA, RunStatus.VERIFICATION, RunStatus.UNKNOWN_STATE})
+# Status yang butuh tindakan manual -> browser/app dibiarkan terbuka.
 NEEDS_USER_STATUSES = frozenset({RunStatus.ORDER_PLACED_AWAIT_PIN, RunStatus.CAPTCHA,
-                                 RunStatus.VERIFICATION, RunStatus.LOGIN_REQUIRED})
+                                 RunStatus.VERIFICATION, RunStatus.LOGIN_REQUIRED, RunStatus.UNKNOWN_STATE})
+# Status yang membunyikan alarm.
+ALARM_STATUSES = NEEDS_USER_STATUSES | {RunStatus.PRICE_GUARD}
 
 
 @dataclass

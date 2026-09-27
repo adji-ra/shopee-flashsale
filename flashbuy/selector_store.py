@@ -27,6 +27,9 @@ DEFAULT_PATH = Path("selectors.json")
 SCHEMA_VERSION = 1
 
 WEB_DEFAULT_STEPS: dict[str, list[dict]] = {
+    # Harga tampil di halaman produk. Kosong = heuristik (nominal non-coret dengan font terbesar).
+    # Hanya kandidat {"css": ...} yang dipakai (dievaluasi di dalam halaman).
+    "product_price": [],
     "buy_button": [
         {"role": "button", "name": "Beli Sekarang"},
         {"text": "Beli Sekarang", "exact": True},
@@ -60,6 +63,14 @@ WEB_DEFAULT_STEPS: dict[str, list[dict]] = {
     ],
 }
 
+# CSS tata letak untuk pengaman harga. Kosong = heuristik (lihat web_js.py).
+WEB_DEFAULT_LAYOUT: dict[str, list[str]] = {
+    "cart_row": [],  # satu elemen per item keranjang
+    "checkout_row": [],  # satu elemen per baris produk di checkout
+    "checkout_total": [],  # elemen nominal "Total Pembayaran"
+    "checkout_shipping": [],  # elemen nominal ongkos kirim
+}
+
 WEB_DEFAULT_URLS: dict[str, str] = {
     # regex (dicocokkan ke URL penuh)
     "cart_pattern": r"/cart(\b|/|\?|$)",
@@ -77,15 +88,21 @@ class SelectorSet:
     steps: dict[str, list[dict]] = field(default_factory=dict)
     urls: dict[str, str] = field(default_factory=dict)
     guards: dict[str, dict[str, list[str]]] = field(default_factory=dict)  # tambahan aturan guard
+    layout: dict[str, list[str]] = field(default_factory=dict)
     calibrated: dict[str, Any] = field(default_factory=dict)  # metadata kalibrasi
     source: Path | None = None
 
     def candidates(self, step: str) -> list[dict]:
         return self.steps.get(step, [])
 
+    def css(self, step: str) -> list[str]:
+        """Kandidat CSS saja (untuk dievaluasi langsung di halaman)."""
+        return [c["css"] for c in self.candidates(step) if "css" in c]
+
 
 def defaults() -> SelectorSet:
-    return SelectorSet(steps=copy.deepcopy(WEB_DEFAULT_STEPS), urls=dict(WEB_DEFAULT_URLS))
+    return SelectorSet(steps=copy.deepcopy(WEB_DEFAULT_STEPS), urls=dict(WEB_DEFAULT_URLS),
+                       layout=copy.deepcopy(WEB_DEFAULT_LAYOUT))
 
 
 def _merge(primary: list[dict], fallback: list[dict]) -> list[dict]:
@@ -107,6 +124,8 @@ def load(path: str | Path = DEFAULT_PATH, platform: str = "web") -> SelectorSet:
     for step, cands in section.get("steps", {}).items():
         sel.steps[step] = _merge(cands, sel.steps.get(step, []))
     sel.urls.update(section.get("urls", {}))
+    for key, css in section.get("layout", {}).items():
+        sel.layout[key] = list(css)
     sel.guards = section.get("guards", {})
     sel.calibrated = section.get("calibrated", {})
     sel.source = path
@@ -128,6 +147,7 @@ def save(path: str | Path, platform: str, steps: dict[str, list[dict]], urls: di
     section["urls"] = {**section.get("urls", {}), **urls}
     section["calibrated"] = meta
     section.setdefault("guards", {})
+    section.setdefault("layout", copy.deepcopy(WEB_DEFAULT_LAYOUT))
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     return backup
 

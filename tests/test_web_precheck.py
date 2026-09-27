@@ -21,7 +21,7 @@ def test_precheck_ok(mock, admin, tmp_path, run, monkeypatch):
     pre = _pre(mock, admin, tmp_path, run)
     assert pre.ok and pre.status is None
     assert _item(pre, "saldo ShopeePay").ok is True
-    assert "Rp111,000" in _item(pre, "saldo ShopeePay").detail  # 99.000 + ongkir 12.000
+    assert "Rp111.000" in _item(pre, "saldo ShopeePay").detail  # 99.000 + ongkir 12.000
     assert admin.log("buy") == [] and admin.log("cart") == []  # tidak menambah ke keranjang
 
 

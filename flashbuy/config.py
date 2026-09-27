@@ -64,6 +64,10 @@ class TargetConfig(_Strict):
     variant: str | None = None
     start_time: datetime
     payment: Literal["ShopeePay"] = "ShopeePay"
+    # Pengaman harga (wajib, fail-closed). Rupiah bulat.
+    max_item_price: int = Field(gt=0)  # harga satuan maksimum (harga flash)
+    max_total: int = Field(gt=0)  # total pembayaran maks, termasuk ongkir & biaya layanan
+    expected_name: str | None = None  # substring nama produk (case-insensitive)
     lead_ms: int = Field(DEFAULT_LEAD_MS, ge=0, le=1000)
     web: WebConfig = WebConfig()
     android: AndroidConfig = AndroidConfig()
@@ -80,9 +84,9 @@ class TargetConfig(_Strict):
             raise ValueError("harus URL https produk di shopee.co.id")
         return v
 
-    @field_validator("variant")
+    @field_validator("variant", "expected_name")
     @classmethod
-    def _empty_variant(cls, v: str | None) -> str | None:
+    def _empty_to_none(cls, v: str | None) -> str | None:
         return v or None
 
     @field_validator("start_time")
@@ -103,7 +107,15 @@ class TargetConfig(_Strict):
     def _one_platform(self) -> TargetConfig:
         if not (self.web.enabled or self.android.enabled):
             raise ValueError("minimal satu jalur (web/android) harus enabled")
+        if self.max_total < self.max_item_price:
+            raise ValueError("max_total harus >= max_item_price")
         return self
+
+    @property
+    def limits(self):
+        from flashbuy.pricing import Limits
+
+        return Limits(self.max_item_price, self.max_total, self.expected_name)
 
     @property
     def start_epoch(self) -> float:

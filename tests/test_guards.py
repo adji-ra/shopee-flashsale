@@ -41,6 +41,9 @@ async def _classify(html: str, url: str = "http://mock.test/Produk-i.1.2", buy: 
      PageState.VARIANT_REQUIRED),
     ("<h1>Checkout</h1>", "http://mock.test/checkout?sid=1", PageState.CHECKOUT),
     ("<h1>Keranjang</h1>", "http://mock.test/cart", PageState.CART),
+    ("<h1>Tunggu</h1>", "http://mock.test/x/traffic?y=1", PageState.VERIFICATION),
+    ('<div style="position:fixed;inset:0"><iframe src="/verify/frame" width="320" height="200"></iframe></div>'
+     + LONG, None, PageState.VERIFICATION),
 ])
 def test_classify_states(run, html, url, state):
     c = run(_classify(html, url or "http://mock.test/Produk-i.1.2"))
@@ -69,3 +72,20 @@ def test_hidden_captcha_is_ignored(run):
     html = ('<div id="captcha" style="display:none"><p>Geser untuk menyelesaikan puzzle</p></div>'
             "<button>Beli Sekarang</button>" + LONG)
     assert run(_classify(html, buy=True)).state == PageState.PRODUCT_ACTIVE
+
+
+def test_small_or_hidden_captcha_iframe_is_ignored(run):
+    html = ('<iframe src="https://t.test/captcha/pixel" width="1" height="1"></iframe>'
+            '<iframe src="https://t.test/captcha/x" width="300" height="200" style="display:none"></iframe>'
+            "<button>Beli Sekarang</button>" + LONG)
+    assert run(_classify(html, buy=True)).state == PageState.PRODUCT_ACTIVE
+
+
+def test_url_state_and_custom_patterns():
+    g = Guard(selector_store.defaults())
+    assert g.url_state("https://shopee.co.id/verify/captcha?x") == PageState.CAPTCHA
+    assert g.url_state("https://shopee.co.id/verify/traffic") == PageState.VERIFICATION
+    assert g.url_state("https://shopee.co.id/Ponsel-i.1.2") is None
+    sel = selector_store.defaults()
+    sel.guards = {"CAPTCHA": {"url": [r"/cek-robot"]}}
+    assert Guard(sel).url_state("https://shopee.co.id/cek-robot/1") == PageState.CAPTCHA

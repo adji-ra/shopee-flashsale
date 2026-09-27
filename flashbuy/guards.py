@@ -9,6 +9,7 @@ false positive. Teks kuat (mis. "aktivitas tidak biasa") dicari di seluruh halam
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -48,16 +49,18 @@ ORDER = [
     PageState.CHECKOUT, PageState.CART,
 ]
 
-# url/text/overlay_text: regex (case-insensitive). css: harus terlihat. button_text: teks persis.
+# url: regex ke URL main frame DAN src iframe terlihat berukuran signifikan (CAPTCHA/VERIFICATION).
+# text/overlay_text: regex (case-insensitive). css: harus terlihat. button_text: teks persis.
+# Pola URL bisa ditambah lewat selectors.json -> web.guards.{CAPTCHA|VERIFICATION}.url
 DEFAULT_RULES: dict[str, dict[str, list[str]]] = {
     "CAPTCHA": {
-        "url": [r"/verify/captcha", r"captcha"],
+        "url": [r"captcha"],
         "text": [r"geser untuk (menyelesaikan|verifikasi)", r"bukan robot", r"selesaikan puzzle"],
         "overlay_text": [r"verifikasi keamanan", r"\bcaptcha\b", r"geser"],
-        "css": ["iframe[src*='captcha' i]", "[id*='captcha' i]", "[class*='captcha' i]"],
+        "css": ["[id*='captcha' i]", "[class*='captcha' i]"],
     },
     "VERIFICATION": {
-        "url": [r"/verify/"],
+        "url": [r"verify", r"traffic"],
         "text": [r"aktivitas (yang )?tidak biasa", r"aktivitas mencurigakan"],
         "overlay_text": [r"kode verifikasi", r"masukkan (kode )?otp", r"verifikasi (akun|identitas|diperlukan)"],
     },
@@ -93,6 +96,11 @@ _CLASSIFY_JS = r"""
     return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   };
   const url = location.href;
+  const bigVisible = (f) => {
+    if (!vis(f)) return false;
+    const r = f.getBoundingClientRect();
+    return r.width >= cfg.minIframe && r.height >= cfg.minIframe;
+  };
   const body = document.body;
   const text = body ? body.innerText : '';
   let overlay = null;
@@ -117,7 +125,16 @@ _CLASSIFY_JS = r"""
   for (const state of cfg.order) {
     const r = cfg.rules[state];
     if (!r) continue;
-    for (const p of r.url || []) if (new RegExp(p, 'i').test(url)) return [state, 'url ' + p];
+    for (const p of r.url || []) {
+      const re = new RegExp(p, 'i');
+      if (re.test(url)) return [state, 'url ' + p];
+      if (cfg.frameStates.includes(state)) {
+        for (const f of document.querySelectorAll('iframe')) {
+          const src = f.src || '';
+          if (src && re.test(src) && bigVisible(f)) return [state, 'iframe ' + src.slice(0, 100)];
+        }
+      }
+    }
     for (const p of r.text || []) {
       const m = text.match(new RegExp(p, 'i'));
       if (m) return [state, 'teks "' + m[0] + '"'];
@@ -139,20 +156,9 @@ _CLASSIFY_JS = r"""
 ENABLED_JS = r"""el => el.isConnected && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
   && !/(^|[\s_-])disabled([\s_-]|$)/i.test(typeof el.className === 'string' ? el.className : '')"""
 
-# Tunggu tombol aktif lewat MutationObserver (tanpa polling jaringan). Resolve true saat aktif
-# atau elemen terlepas dari DOM, false saat timeout.
-WAIT_ENABLED_JS = f"""(el, timeoutMs) => new Promise((resolve) => {{
-  const enabled = {ENABLED_JS};
-  const ok = () => !el.isConnected || enabled(el);
-  if (ok()) return resolve(true);
-  const obs = new MutationObserver(() => {{
-    if (ok()) {{ obs.disconnect(); clearTimeout(timer); resolve(true); }}
-  }});
-  obs.observe(document.documentElement, {{attributes: true, childList: true, subtree: true}});
-  const timer = setTimeout(() => {{ obs.disconnect(); resolve(ok()); }}, timeoutMs);
-}})"""
-
 SHORT_PAGE_CHARS = 1500
+MIN_IFRAME_PX = 60  # iframe tracking kecil/tersembunyi diabaikan
+FRAME_STATES = (PageState.CAPTCHA, PageState.VERIFICATION)
 
 
 @dataclass(frozen=True)
@@ -173,12 +179,22 @@ def build_rules(sel: SelectorSet) -> dict:
     for state, extra in sel.guards.items():
         for kind, patterns in extra.items():
             rules.setdefault(state, {}).setdefault(kind, []).extend(patterns)
-    return {"order": [str(s) for s in ORDER], "rules": rules, "shortPage": SHORT_PAGE_CHARS}
+    return {"order": [str(s) for s in ORDER], "rules": rules, "shortPage": SHORT_PAGE_CHARS,
+            "minIframe": MIN_IFRAME_PX, "frameStates": [str(s) for s in FRAME_STATES]}
 
 
 class Guard:
     def __init__(self, sel: SelectorSet):
         self.payload = build_rules(sel)
+        self._url_rules = [(state, [re.compile(p, re.I) for p in self.payload["rules"][str(state)]["url"]])
+                           for state in FRAME_STATES]
+
+    def url_state(self, url: str) -> PageState | None:
+        """CAPTCHA/VERIFICATION dari URL (main frame atau iframe) tanpa round-trip ke halaman."""
+        for state, patterns in self._url_rules:
+            if any(p.search(url or "") for p in patterns):
+                return state
+        return None
 
     async def classify(self, page: Page, buy: Locator | None = None) -> Classification:
         try:

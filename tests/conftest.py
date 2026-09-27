@@ -78,7 +78,11 @@ def quiet_console() -> Console:
     return Console(file=io.StringIO(), width=200)
 
 
-def make_cfg(mock, tmp_path, open_at: float, variant: str | None = None, **web):
+PRICE_DEFAULTS = {"max_item_price": 100_000, "max_total": 120_000}
+
+
+def make_cfg(mock, tmp_path, open_at: float, variant: str | None = None, web: dict | None = None,
+             **top):
     from flashbuy.config import TargetConfig
     from flashbuy.timesync import WIB
 
@@ -86,8 +90,9 @@ def make_cfg(mock, tmp_path, open_at: float, variant: str | None = None, **web):
         "product_url": mock.product_url,
         "variant": variant,
         "start_time": datetime.fromtimestamp(open_at, WIB).isoformat(),
-        "web": {"profile_dir": str(tmp_path / "profile"), "channel": None, **web},
+        "web": {"profile_dir": str(tmp_path / "profile"), "channel": None, **(web or {})},
         "android": {"enabled": False},
+        **PRICE_DEFAULTS, **top,
     }, context={"allow_local": True})
 
 
@@ -109,6 +114,7 @@ class WebOutcome:
 async def run_web(mock, admin, tmp_path, *, scenario: str = "normal", live: bool = False,
                   open_in_ms: int = 3500, variant: str | None = None, before=None,
                   lead_ms: float = 150, selectors=None, web: dict | None = None,
+                  cfg: dict | None = None, runner_attrs: dict | None = None,
                   inspect=None, during=None, **overrides) -> WebOutcome:
     from flashbuy import selector_store
     from flashbuy.notifier import Notifier
@@ -121,11 +127,13 @@ async def run_web(mock, admin, tmp_path, *, scenario: str = "normal", live: bool
     st = admin.state()["scenario"]
     open_at = st["open_at"]
     clock = ServerClock(st["clock_offset_ms"] / 1000)
-    cfg = make_cfg(mock, tmp_path, open_at, variant, **(web or {}))
+    target = make_cfg(mock, tmp_path, open_at, variant, web=web, **(cfg or {}))
     log = RunLog(tmp_path / "logs", clock, "web", quiet_console())
     notifier = Notifier(beep=lambda f, d: None, post=lambda u, p: None, repeat=1)
-    runner = WebRunner(cfg, selectors or selector_store.defaults(), log=log, notifier=notifier,
+    runner = WebRunner(target, selectors or selector_store.defaults(), log=log, notifier=notifier,
                        headless=HEADLESS, before_place_order=before or always_allow)
+    for k, v in (runner_attrs or {}).items():
+        setattr(runner, k, v)
     task = None
     try:
         if during is not None:

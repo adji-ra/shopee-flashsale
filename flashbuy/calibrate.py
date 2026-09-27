@@ -29,12 +29,15 @@ class CalStep:
     instruction: str
     optional: bool = False
     variant_template: bool = False
+    css_only: bool = False  # teks elemen berubah (mis. harga) -> hanya kandidat CSS
     url_key: str | None = None  # simpan pola URL halaman tempat elemen direkam
 
 
 WEB_STEPS: list[CalStep] = [
     CalStep("variant_option", "Alt+klik salah satu PILIHAN VARIASI, lalu klik biasa untuk memilihnya. "
             "Lewati jika produk tanpa variasi.", optional=True, variant_template=True),
+    CalStep("product_price", "Alt+klik HARGA produk yang tampil (bukan harga coret). Lewati untuk memakai "
+            "deteksi otomatis (nominal terbesar yang tidak dicoret).", optional=True, css_only=True),
     CalStep("buy_button", "Alt+klik tombol 'Beli Sekarang'. Setelah terekam, klik biasa untuk lanjut."),
     CalStep("cart_checkout", "Alt+klik tombol 'Checkout' di keranjang, lalu klik biasa untuk lanjut. "
             "Lewati jika langsung masuk halaman checkout.", optional=True, url_key="cart_pattern"),
@@ -122,7 +125,8 @@ INIT_JS = r"""
     const own = Array.from(el.childNodes).filter((n) => n.nodeType === 3).map((n) => n.textContent)
       .join(' ').replace(/\s+/g, ' ').trim();
     return {tag: el.tagName.toLowerCase(), role: implicitRole(el), name: accName(el), own,
-            text: (el.innerText || '').trim(), attrs, css: cssPath(el), url: location.href};
+            text: (el.innerText || '').trim(), attrs, classes: Array.from(el.classList),
+            css: cssPath(el), url: location.href};
   };
   const swallow = (ev) => { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); };
   let seq = 0;
@@ -212,11 +216,28 @@ def _stable_id(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][\w-]*", value)) and not re.search(r"\d{3,}", value)
 
 
-def candidates_from(desc: dict, variant_template: bool = False) -> list[dict]:
+def _stable_class(value: str) -> bool:
+    # kelas hasil hash/obfuscation (mis. "a1b2c3d", "css-8x7k2") dianggap tidak stabil
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z_-]{2,}\d{0,2}", value))
+
+
+def candidates_from(desc: dict, variant_template: bool = False, css_only: bool = False) -> list[dict]:
     role = desc.get("role")
     name = (desc.get("name") or "").strip()
     first_line = (desc.get("text") or "").split("\n")[0].strip()
     out: list[dict] = []
+    if css_only:
+        attrs = desc.get("attrs") or {}
+        for key in ("data-testid", "data-test", "data-qa"):
+            if attrs.get(key):
+                out.append({"css": f'[{key}="{attrs[key]}"]'})
+        if attrs.get("id") and _stable_id(attrs["id"]):
+            out.append({"css": f'[id="{attrs["id"]}"]'})
+        tag = desc.get("tag") or ""
+        out += [{"css": f"{tag}.{c}"} for c in desc.get("classes") or [] if _stable_class(c)]
+        if desc.get("css"):
+            out.append({"css": desc["css"]})
+        return out
     if variant_template:
         if role:
             out.append({"role": role, "name": "{variant}", "exact": True})
@@ -337,7 +358,7 @@ class WebCalibrator:
                     res.skipped.append(step.key)
                     self.console.print("  [yellow]dilewati[/]")
                     break
-                cands = candidates_from(data, step.variant_template)
+                cands = candidates_from(data, step.variant_template, step.css_only)
                 variant = data.get("name") if step.variant_template else None
                 verified = await verify_candidates(self.page, cands, data, variant)
                 if verified:
