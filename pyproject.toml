@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashbuy"
+version = "0.1.0"
+description = "Otomasi checkout flash sale Shopee untuk 1 akun pribadi (web + Android, lewat UI)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "rich>=13.7",
+    "playwright>=1.45",
+    "uiautomator2>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["flashbuy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

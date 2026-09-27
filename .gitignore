@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+logs/
+chrome-profile/
+selectors.json
+target.yaml
+!target.example.yaml
