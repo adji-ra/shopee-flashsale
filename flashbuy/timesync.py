@@ -30,7 +30,7 @@ import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Protocol
 from urllib.parse import unquote, urlsplit
@@ -134,6 +134,14 @@ class ServerClock:
         while (now := self.now()) < deadline:
             self.clock.sleep(0)
         return (now - deadline) * 1000.0
+
+
+def sleep_until(clock: Clock, wall_target: float, spin_threshold_s: float = 0.015) -> None:
+    """Tidur sampai jam dinding lokal = target; ~15 ms terakhir busy-wait."""
+    while (remaining := wall_target - clock.time()) > spin_threshold_s:
+        clock.sleep(remaining - spin_threshold_s)
+    while clock.time() < wall_target:
+        clock.sleep(0)
 
 
 def format_ts(epoch_s: float, tz: timezone | None = None) -> str:
@@ -302,16 +310,21 @@ class HttpDateProbe:
 
     def __init__(self, url: str = DEFAULT_HTTP_URL, timeout: float = 5.0):
         parts = urlsplit(url)
-        if parts.scheme != "https" or not parts.hostname:
-            raise ValueError(f"URL harus https: {url}")
+        if parts.scheme not in ("https", "http") or not parts.hostname:
+            raise ValueError(f"URL harus http(s): {url}")
+        self.https = parts.scheme == "https"
         self.host = parts.hostname
-        self.port = parts.port or 443
+        self.port = parts.port or (443 if self.https else 80)
         self.path = parts.path or "/"
         self.timeout = timeout
         self.method = "HEAD"
-        self._conn: http.client.HTTPSConnection | None = None
+        self._conn: http.client.HTTPConnection | None = None
 
-    def _connect(self) -> http.client.HTTPSConnection:
+    def _connect(self) -> http.client.HTTPConnection:
+        if not self.https:  # hanya untuk mock lokal di tes
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            conn.connect()
+            return conn
         ctx = ssl.create_default_context()
         proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy and not _bypass_proxy(self.host):
@@ -375,7 +388,7 @@ def _bypass_proxy(host: str) -> bool:
 def parse_http_date(value: str) -> int:
     dt = parsedate_to_datetime(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return int(dt.timestamp())
 
 
@@ -414,7 +427,7 @@ def measure_http_date(url: str = DEFAULT_HTTP_URL, samples: int = DEFAULT_SAMPLE
         rtt = statistics.median(rtts)
         mid = (lo + hi) / 2
         k = math.ceil(clock.time() + mid + rtt / 2 - phase + 0.05)
-        clock.sleep(max(0.0, k + phase - mid - rtt / 2 - clock.time()))
+        sleep_until(clock, k + phase - mid - rtt / 2)
 
     try:
         # Handshake TCP/TLS di luar pengukuran. Urutan: 1 sampel kasar, `samples` sampel

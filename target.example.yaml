@@ -7,6 +7,8 @@ lead_ms: 150                  # opsional, bisa di-override --lead-ms
 web:
   enabled: true
   profile_dir: "C:/flashbuy/chrome-profile"   # profil terpisah, login manual sekali
+  channel: "chrome"           # Chrome terpasang; null = Chromium bawaan Playwright
+  block_media: false          # true = blokir gambar/video/font agar lebih cepat
 android:
   enabled: true
   serial: ""                  # kosong = device pertama
