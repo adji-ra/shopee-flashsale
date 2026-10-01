@@ -141,9 +141,10 @@ KNOWN_SYSTEM_PACKAGES = frozenset({
     "android", "com.android.systemui", "com.android.permissioncontroller", "com.google.android.permissioncontroller",
     "com.android.packageinstaller", "com.google.android.packageinstaller", "com.android.incallui",
     "com.android.server.telecom", "com.android.phone", "com.android.dialer", "com.google.android.dialer",
-    "com.android.settings", "com.transsion.phonemaster",
+    "com.android.settings",
 })
-_SYSTEM_PACKAGE_RE = re.compile(r"inputmethod|keyboard|launcher|\.home$", re.I)  # keyboard & launcher (home)
+# keyboard, launcher (home), dan aplikasi sistem HiOS/Transsion (Phone Master, pop-up asisten, ...)
+_SYSTEM_PACKAGE_RE = re.compile(r"inputmethod|keyboard|launcher|\.home$|^com\.transsion\.", re.I)
 FOREGROUND_CACHE_S = 0.5  # aplikasi/activity di depan (adb dumpsys, mahal) dibaca ulang paling cepat tiap 0,5 s
 
 DANGER = ("captcha", "verification", "pin")
