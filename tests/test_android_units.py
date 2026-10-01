@@ -1199,7 +1199,7 @@ def test_runner_marker_ignores_long_description(runner):
     assert runner._marker("sold_out", [long_node]) is None
     buy = _n("Beli Sekarang", (360, 1500, 720, 1612), clickable=True)
     seen = runner._classify_nodes([long_node, buy], "after_buy")
-    assert seen.screen == Screen.PRODUCT
+    assert seen.screen == Screen.PRODUCT_ACTIVE
     toast = _n("Stok habis", (160, 1300, 560, 1350))
     assert runner._classify_nodes([long_node, toast, buy], "after_buy").screen == Screen.SOLD_OUT
 
@@ -1257,17 +1257,17 @@ TOAST_MESSAGES = [("Stok habis", Screen.SOLD_OUT),
 @pytest.mark.parametrize("message, screen", TOAST_MESSAGES)
 def test_classify_after_buy_reads_android_toast_channel(tmp_path, message, screen):
     runner, app, driver, log = _prepared(tmp_path)  # toast_mode default "toast"
-    assert runner._classify("after_buy").screen == Screen.PRODUCT
+    assert runner._classify("after_buy").screen == Screen.PRODUCT_ACTIVE
     app._show_toast(message)
     assert not driver.exists(Sel("text", message))  # Toast Android: tidak ada di pohon node
     seen = runner._classify("after_buy")
     assert (seen.screen, seen.evidence) == (screen, f"toast {message!r}")
     n_calls = len(driver.calls)
-    assert runner._classify("product").screen == Screen.PRODUCT  # polling tidak membaca toast (bisa basi)
+    assert runner._classify("product").screen == Screen.PRODUCT_ACTIVE  # polling tidak membaca toast (bisa basi)
     assert ("last_toast", "") not in driver.calls[n_calls:]
     runner.d.clear_toast()  # dipanggil runner tepat setelah klik: toast lama tidak dianggap reaksi
     assert app.last_toast is None
-    assert runner._classify("after_buy").screen == Screen.PRODUCT
+    assert runner._classify("after_buy").screen == Screen.PRODUCT_ACTIVE
     assert app.events == []  # last_toast/clear_toast hanya operasi agent, tidak menyentuh aplikasi
     log.close()
 
@@ -1286,7 +1286,7 @@ def test_classify_after_buy_reads_in_app_message_nodes(tmp_path, message, screen
 def test_classify_message_has_priority_over_open_sheet(tmp_path, mode):
     runner, app, _driver, log = _prepared(tmp_path, toast_mode=mode, variants=["Hitam", "Putih"])
     app.screen = "sheet"
-    assert runner._classify("after_buy").screen == Screen.SHEET
+    assert runner._classify("after_buy").screen == Screen.VARIANT_SHEET
     app._show_toast("Silakan pilih variasi terlebih dahulu")
     assert runner._classify("after_buy").screen == Screen.VARIANT_REQUIRED  # bukan SHEET
     log.close()

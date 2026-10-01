@@ -53,7 +53,13 @@ class AppScenario:
     strike_in_checkout: bool = True  # harga coret (lebih kecil) sebaris dengan harga jual & "x1"
     loading_after_buy_ms: int = 0  # spinner tanpa teks setelah klik Beli (server lambat)
     unknown_after_buy: bool = False
-    other_app_after_buy: bool = False
+    other_app_after_buy: bool = False  # launcher di depan (Shopee keluar dari foreground)
+    # "package/activity" aplikasi asing yang tampil setelah klik Beli (mis. verifikasi Play Services)
+    foreign_after_buy: str | None = None
+    verify_activity_after_buy: str | None = None  # activity Shopee bernama verifikasi, tanpa elemen dikenal
+    crash_after_buy: bool = False  # Shopee crash: launcher di depan + dialog sistem "Shopee telah berhenti"
+    # dialog ANR sistem di atas Shopee: (mulai, selesai) detik relatif open_at; elemen Shopee tetap terbaca
+    anr_dialog: tuple[float, float] | None = None
     unknown_after_order: bool = False
     no_response_clicks: int = 0  # N klik Beli pertama tidak bereaksi
     flash_banner: bool = True  # "Flash Sale dimulai dalam .." / "Flash Sale berakhir dalam .."
@@ -64,6 +70,7 @@ class AppScenario:
     screen_on: bool = True
     locked: bool = False
     stay_on: str = "3"
+    app_version: str = "3.40.21"
     pin_title: str | None = "Masukkan PIN ShopeePay"  # None: layar PIN tanpa teks (hanya resource-id)
     # "toast": pesan = Toast Android (jendela terpisah, hanya terbaca lewat getLastToast);
     # "node": pesan in-app (overlay React Native) yang ada di pohon node; "lost": tidak terbaca sama sekali
@@ -126,13 +133,41 @@ class FakeShopeeApp:
 
     @property
     def package(self) -> str:
-        return "com.android.launcher3" if self.screen == "other_app" else PACKAGE
+        if self.screen in ("other_app", "crashed"):
+            return "com.android.launcher3"
+        if self.screen == "foreign":
+            return self.sc.foreign_after_buy.split("/")[0]
+        return PACKAGE
 
     def activity(self) -> str:
-        return {"other_app": ".Launcher"}.get(self.screen, f"com.shopee.app.ui.{self.screen}.Activity")
+        if self.screen == "foreign":
+            return self.sc.foreign_after_buy.split("/", 1)[1]
+        if self.screen == "verify_activity":
+            return self.sc.verify_activity_after_buy
+        return {"other_app": ".Launcher", "crashed": ".Launcher"}.get(self.screen,
+                                                                       f"com.shopee.app.ui.{self.screen}.Activity")
+
+    def anr_active(self) -> bool:
+        if self.sc.anr_dialog is None:
+            return False
+        start, end = self.sc.anr_dialog
+        return self.sc.open_at + start <= self.now() < self.sc.open_at + end
+
+    def system_nodes(self) -> list[Node]:
+        """Jendela milik package lain (tidak terlihat oleh query yang dibatasi ke com.shopee.id)."""
+        if self.screen == "crashed":
+            return [_n("Shopee telah berhenti", (60, 700, 660, 760)),
+                    _n("Tutup aplikasi", (60, 800, 660, 860), clickable=True)]
+        if self.screen == "foreign":
+            return [_n("Saya bukan robot", (60, 700, 660, 760)), _n("Verifikasi", (60, 800, 660, 860), clickable=True)]
+        if self.anr_active():
+            return [_n("Shopee tidak merespons", (60, 1300, 660, 1360)),
+                    _n("Tutup aplikasi", (60, 1400, 360, 1460), clickable=True),
+                    _n("Tunggu", (360, 1400, 660, 1460), clickable=True)]
+        return []
 
     def webview(self) -> bool:
-        return self.screen == "webview"
+        return self.screen in ("webview", "verify_activity")
 
     def nodes(self) -> list[Node]:
         """Semua jendela (jalur A: exists/info)."""
@@ -178,6 +213,11 @@ class FakeShopeeApp:
                        "cart": "product"}.get(self.screen, self.screen)
 
     def on_tap(self, x: int, y: int) -> None:
+        for n in self.system_nodes():  # jendela sistem/aplikasi lain di atas Shopee menerima tap lebih dulu
+            left, top, right, bottom = n.bounds
+            if left <= x <= right and top <= y <= bottom:
+                self._event("tap", f"system:{n.label}")
+                return
         for key, n in reversed(self._render()):
             left, top, right, bottom = n.bounds
             if key and left <= x <= right and top <= y <= bottom:
@@ -191,7 +231,7 @@ class FakeShopeeApp:
         if line.startswith("pm path"):
             return f"package:/data/app/{PACKAGE}/base.apk\n" if self.sc.installed else ""
         if line.startswith("dumpsys package"):
-            return "    versionName=3.40.21\n" if self.sc.installed else ""
+            return f"    versionName={self.sc.app_version}\n" if self.sc.installed else ""
         if line.startswith("dumpsys power"):
             return f"  mWakefulness={'Awake' if self.sc.screen_on else 'Asleep'}\n"
         if line.startswith("dumpsys window"):
@@ -200,6 +240,14 @@ class FakeShopeeApp:
             return self.sc.stay_on + "\n"
         if line == "settings get system screen_off_timeout":
             return "60000\n"
+        if line.startswith("cmd package resolve-activity"):
+            return "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\n" \
+                   "com.android.launcher3/.Launcher\n"
+        if line in ("svc power stayon usb", "svc power stayon false") or \
+                line.startswith("settings put global stay_on_while_plugged_in "):
+            self._event("settings", line)
+            self.sc.stay_on = {"svc power stayon usb": "2", "svc power stayon false": "0"}.get(line, line.split()[-1])
+            return ""
         return ""
 
     # ------------------------------------------------------------------ aksi
@@ -259,6 +307,12 @@ class FakeShopeeApp:
             nxt = "unknown"
         elif self.sc.other_app_after_buy:
             nxt = "other_app"
+        elif self.sc.foreign_after_buy:
+            nxt = "foreign"
+        elif self.sc.verify_activity_after_buy:
+            nxt = "verify_activity"
+        elif self.sc.crash_after_buy:
+            nxt = "crashed"
         if nxt is None and not self.sc.sheet:
             self._confirm()
             return
@@ -471,6 +525,15 @@ class FakeShopeeApp:
 
     def _r_order_unknown(self):
         return [("", _n("Terima kasih!", (100, 500, 620, 560)))]
+
+    def _r_foreign(self):
+        return []  # milik package lain: hanya terlihat lewat system_nodes (info_any)
+
+    def _r_crashed(self):
+        return []
+
+    def _r_verify_activity(self):
+        return [("", _n("", (0, 0, W, H), cls="android.webkit.WebView"))]
 
     def _r_other_app(self):
         return [("", _n("Telepon", (40, 1500, 160, 1560))), ("", _n("Pesan", (200, 1500, 320, 1560)))]

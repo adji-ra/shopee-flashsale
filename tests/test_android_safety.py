@@ -38,7 +38,7 @@ MANDATORY = "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"
 # Operasi driver yang mengubah layar aplikasi; selain ini hanya membaca/diagnosa.
 ACTION_OPS = {"click", "start_url", "swipe_refresh", "press_back", "restart_agent"}
 # last_toast/clear_toast: status Toast di agent uiautomator2 (tidak menyentuh aplikasi/Shopee).
-READ_OPS = {"exists", "info", "find_all", "current_app", "webview", "screenshot", "dump", "agent_alive",
+READ_OPS = {"exists", "info", "info_any", "find_all", "current_app", "webview", "screenshot", "dump", "agent_alive",
             "last_toast", "clear_toast"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (PIN tidak boleh diketik alat).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
@@ -633,16 +633,18 @@ def test_captcha_on_refresh_stops_right_after_reload(tmp_path, reload):
 
 
 @BOTH
-def test_webview_without_text_after_buy_is_unknown_state(tmp_path, live):
+def test_webview_without_known_elements_after_buy_is_verification(tmp_path, live):
+    """Spesifikasi F: WebView Shopee tanpa elemen yang dikenali (tanpa teks captcha yang terbaca) = halaman
+    verifikasi -> VERIFICATION segera (stop semua + alarm, tanpa retry), bukan menunggu jaring UNKNOWN 1,5 s."""
     attrs = _stop()
     out = run_android(tmp_path, live=live, webview_after_buy=True, runner_attrs=attrs)
-    assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
-    assert "WebView" in out.result.message
+    assert out.result.status == RunStatus.VERIFICATION, out.result.message
+    assert out.result.message.startswith("WebView tanpa elemen Shopee yang dikenal (com.shopee.id/")
     buy = _one_buy(out)
     dt = _step_t(out, "result") - buy["t_server_ms"]
-    assert 1500 <= dt <= 2500, f"UNKNOWN_STATE setelah {dt} ms (batas default 1,5 s)"
+    assert dt < 800, f"VERIFICATION setelah {dt} ms (tanpa menunggu 1,5 s)"
     assert attrs["stop_event"].is_set()
-    _alarmed(out, RunStatus.UNKNOWN_STATE)
+    _alarmed(out, RunStatus.VERIFICATION)
     assert out.app.screen == "webview"
     _left_as_is(out, buy)
     _no_order(out)
@@ -661,12 +663,14 @@ def test_unknown_screen_after_buy_within_unknown_limit(tmp_path, live, flag, scr
     assert evidence in out.result.message
     buy = _one_buy(out)
     dt = _step_t(out, "result") - buy["t_server_ms"]
-    # batas + paling lama ~2 iterasi klasifikasi UNKNOWN (10 query satu objek @20 ms) + diagnosa sekali
-    assert 500 <= dt <= 1000, f"UNKNOWN_STATE harus ~0,5 s setelah klik, dapat {dt} ms"
+    # batas + paling lama ~2 iterasi klasifikasi UNKNOWN (~12 query @20 ms, termasuk aplikasi di depan tiap
+    # 0,5 s) + diagnosa sekali
+    assert 500 <= dt <= 1200, f"UNKNOWN_STATE harus ~0,5 s setelah klik, dapat {dt} ms"
     assert "no_response" not in out.step_names(), "layar tak dikenal bukan 'tidak ada reaksi' (tanpa klik ulang)"
-    # diagnosa (aplikasi aktif, WebView, content-desc) hanya sekali saat eskalasi
+    # aplikasi/activity di depan dibaca paling cepat tiap 0,5 s; diagnosa content-desc hanya sekali saat eskalasi
     after = _ops(out)[_ops(out).index("click"):]
-    assert after.count("webview") == 1 and after.count("current_app") == 2, after  # diagnosa + layar akhir
+    assert after.count("webview") <= 3 and 2 <= after.count("current_app") <= 4, after
+    assert sum(1 for op, t in out.driver.calls if op == "find_all" and t.startswith("descriptionMatches")) == 1
     assert attrs["stop_event"].is_set()
     _alarmed(out, RunStatus.UNKNOWN_STATE)
     assert out.app.screen == screen, "aplikasi lain/layar asing dibiarkan (Shopee tidak dibuka ulang)"
@@ -882,8 +886,8 @@ def test_flash_sale_banner_classification_all_contexts(tmp_path):
     assert BANNER_LIVE in [n.text for n in nodes]
     for context in ("product", "after_buy", "any"):
         # bacaan langkah maju (node hasil find_all) dan rantai info/exists hot path
-        assert runner._classify_nodes(nodes, context).screen == Screen.PRODUCT, context
-        assert runner._classify(context).screen == Screen.PRODUCT, context
+        assert runner._classify_nodes(nodes, context).screen == Screen.PRODUCT_ACTIVE, context
+        assert runner._classify(context).screen == Screen.PRODUCT_ACTIVE, context
     sold = android_selectors.defaults().marker_re("sold_out")
     for text in (BANNER_LIVE, "FLASH SALE BERAKHIR DALAM 00:10:00", "Flash Sale dimulai dalam 00:00:05"):
         assert sold.fullmatch(text) is None, text
@@ -1029,7 +1033,7 @@ def test_precheck_logs_device_props_and_hios(tmp_path):
     assert "device wm density = Physical density: 320" in log
     assert "HiOS/Transsion terdeteksi" in log
     assert "precheck device: OK - TECNO TECNO BG6 Android 13 (SDK 33), Physical size: 1080x2460" in log
-    assert "precheck agent uiautomator2: OK - hidup" in log
+    assert "precheck agent uiautomator2: OK - menjawab 3 query: " in log
     shells = [t for op, t in out.driver.calls if op == "shell"]
     assert "getprop ro.tranos.version" in shells and "wm size" in shells
     assert out.runner.device_info["ro.tranos.version"] == "hios13.6.0"
@@ -1052,7 +1056,8 @@ def test_agent_dead_at_precheck_is_restarted_with_warning(tmp_path):
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
     assert out.driver.restarts == 1
     log = _log_text(out)
-    assert "precheck agent uiautomator2: PERINGATAN - mati lalu dihidupkan ulang - kemungkinan dibunuh HiOS" in log
+    assert "precheck agent uiautomator2: PERINGATAN - mati, dihidupkan ulang -> menjawab 3 query" in log
+    assert "kemungkinan dibunuh HiOS" in log
     _one_buy(out)
 
 
@@ -1075,7 +1080,7 @@ def test_agent_killed_before_arm_is_restarted_and_run_ok(tmp_path, monkeypatch):
     assert out.driver.restarts == 1
     assert [steps[-1] for steps in out.driver._restart_log] == ["arm"], "restart terjadi saat arm, sebelum buka produk"
     log = _log_text(out)
-    assert "precheck agent uiautomator2: OK - hidup" in log
+    assert "precheck agent uiautomator2: OK - menjawab 3 query: " in log
     assert "arm: agent uiautomator2 mati (HiOS?), menghidupkan ulang" in log
     assert "arm: agent hidup lagi (True)" in log
     _one_buy(out)
@@ -1157,7 +1162,9 @@ def test_driver_error_before_attempt_is_error_result_not_crash(tmp_path, monkeyp
 
     def setup(runner, app, driver):
         runners.append(runner)
-        _inject(phase, kill=kill, ops=("info", "exists", "find_all"))(runner, app, driver)
+        # precheck: lewati 3 ping agent (exists) - kegagalan di sana memicu restart + cek ulang (spesifikasi G)
+        ops = ("info", "find_all") if phase == "precheck" else ("info", "exists", "find_all")
+        _inject(phase, kill=kill, ops=ops)(runner, app, driver)
 
     try:
         out = _run(tmp_path, monkeypatch, setup=setup, live=True, runner_attrs=_stop())
@@ -1210,14 +1217,17 @@ def test_spinner_forever_after_order_is_maybe_ordered(tmp_path, monkeypatch):
     assert out.app.screen == "loading"
 
 
-def test_spinner_forever_after_order_default_flow_timeout_30_s(tmp_path, monkeypatch):
+def test_spinner_forever_after_order_stops_at_loading_limit_10_s(tmp_path, monkeypatch):
+    """Batas bawaan: indikator loading tanpa layar dikenali > 10 s -> UNKNOWN_STATE (sebelum batas alur 30 s),
+    pesan wajib 'Pesanan MUNGKIN sudah terbuat', alarm, tanpa retry."""
     attrs = _stop()
     out = _run(tmp_path, monkeypatch, app_cls=_after_order_app("loading"), live=True, runner_attrs=attrs)
     assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
-    assert out.result.detail.startswith("TIMEOUT:")
-    _after_order_common(out, attrs)
-    dt = _step_t(out, "result") - _step_t(out, "buy_ok")
-    assert 29_900 <= dt <= 30_500, dt
+    assert out.result.detail.startswith("UNKNOWN_STATE: indikator loading > 10 s (indikator loading, aplikasi aktif "
+                                        "com.shopee.id/"), out.result.detail
+    order = _after_order_common(out, attrs)
+    dt = _step_t(out, "result") - order["t_server_ms"]
+    assert 10_000 <= dt <= 11_000, dt
 
 
 @pytest.mark.parametrize("screen, status, evidence", [

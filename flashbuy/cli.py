@@ -227,12 +227,15 @@ def calibrate_android(cfg: TargetConfig, driver, selectors_path: Path, *, prompt
     from flashbuy import android_selectors
     from flashbuy.android_calibrate import AndroidCalibrator
 
-    result = AndroidCalibrator(driver, android_selectors.load(selectors_path), variant=cfg.variant,
-                               prompt=prompt, say=lambda s: console.print(s, highlight=False)).run()
-    meta = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device": driver.serial,
+    cal = AndroidCalibrator(driver, android_selectors.load(selectors_path), variant=cfg.variant,
+                            prompt=prompt, say=lambda s: console.print(Text(s), highlight=False))
+    result = cal.run()
+    # versi Shopee & resolusi disimpan: precheck memberi PERINGATAN KERAS bila versi aplikasi berubah
+    meta = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device": driver.serial, **cal.device_meta(),
             "skipped": result.skipped}
     backup = android_selectors.save(selectors_path, result.steps, meta)
-    console.print(f"Tersimpan: [bold]{selectors_path}[/] (bagian android)" + (f" (backup: {backup})" if backup else ""))
+    console.print(f"Tersimpan: [bold]{selectors_path}[/] (bagian android; Shopee {meta['app_version'] or '?'}, "
+                  f"{meta['wm_size'] or 'resolusi ?'})" + (f" (backup: {backup})" if backup else ""))
     for w in result.warnings:
         console.print(f"[yellow]! {w}[/]")
     return 0
@@ -344,6 +347,7 @@ async def run_android(cfg: TargetConfig, sel, driver, *, live: bool, lead_ms: in
     log = RunLog(run_dir, clock, "android", console)
     notifier = Notifier(cfg.notify_webhook)
     runner = AndroidRunner(cfg, sel, log=log, notifier=notifier, driver=driver)
+    runner.hold_screen_on = True  # svc power stayon usb selama run; dikembalikan di runner.close()
 
     def sync_fn() -> timesync.SyncReport:
         return timesync.sync(samples=samples, http_url=cfg.origin + "/")

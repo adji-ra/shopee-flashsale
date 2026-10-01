@@ -36,8 +36,8 @@ BUY_SEL = "text='Beli Sekarang'"  # str(Sel) kandidat pertama buy_button (defaul
 # Operasi agent saja (getLastToast / clearLastToast): tidak menyentuh aplikasi maupun server Shopee.
 AGENT_OPS = {"last_toast", "clear_toast"}
 # Operasi driver yang sah dipakai runner (tidak ada input teks: PIN tidak mungkin diketik alat).
-ALLOWED_OPS = {"exists", "info", "find_all", "click", "current_app", "start_url", "swipe_refresh", "press_back",
-               "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
+ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
+               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
 # Kueri satu objek (jalur A) - satu-satunya kueri yang boleh dipakai di hot path polling.
 SINGLE_OBJECT_OPS = {"info", "exists"}
 # Klik yang tepat didahului clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
@@ -393,14 +393,16 @@ def test_polling_hot_path_uses_single_object_queries_only(tmp_path, scenario):
     clears = [i for i, (_, op, _) in enumerate(window) if op == "clear_toast"]
     assert clears == ([len(window) - 1] if click is not None else []), clears  # hanya tepat sebelum klik
     queries = [(op, target) for _, op, target in window if op not in ("swipe_refresh", "start_url", "clear_toast")]
-    assert {op for op, _ in queries} <= SINGLE_OBJECT_OPS, {op for op, _ in queries} - SINGLE_OBJECT_OPS
+    one_object = SINGLE_OBJECT_OPS | {"info_any"}  # info_any = satu objek tanpa batas package (dialog crash/ANR)
+    assert {op for op, _ in queries} <= one_object, {op for op, _ in queries} - one_object
     # setiap iterasi diawali info tombol Beli, diikuti paling banyak 3 kueri satu objek (bahaya, harga, sheet);
-    # iterasi dengan cek pra-klik +2 (content-desc bahaya, sheet), dan cek itu berjarak >= 0,5 s
+    # iterasi dengan cek pra-klik +3 (content-desc bahaya, dialog sistem, sheet), dan cek itu berjarak >= 0,5 s
     starts = [i for i, (_, target) in enumerate(queries) if target == BUY_SEL]
     assert len(starts) >= 3, queries[:6]
     for a, b in zip(starts, starts[1:], strict=False):
         guard = any(t.startswith("descriptionMatches") for _, t in queries[a:b])
-        assert b - a - 1 <= (5 if guard else 3), queries[a:b]
+        assert b - a - 1 <= (6 if guard else 3), queries[a:b]
+        assert guard == any(op == "info_any" for op, _ in queries[a:b]), queries[a:b]
     guards = [t for t, op, target in window if target.startswith("descriptionMatches")]
     assert guards and all(b - a >= 500 for a, b in zip(guards, guards[1:], strict=False)), guards
     if click is None:
@@ -728,18 +730,25 @@ def test_never_responding_buy_stops_at_window_end(tmp_path):
     _no_order(out)
 
 
-@pytest.mark.parametrize("flag, evidence", [
-    ("unknown_after_buy", "aplikasi aktif com.shopee.id/com.shopee.app.ui.unknown.Activity"),
-    ("other_app_after_buy", "aplikasi aktif com.android.launcher3/.Launcher, (aplikasi lain di depan)"),
-    ("webview_after_buy", "aplikasi aktif com.shopee.id/com.shopee.app.ui.webview.Activity, WebView"),
-], ids=["unknown", "other_app", "webview"])
-def test_unknown_screen_after_buy_diagnosed_once_without_reclick(tmp_path, flag, evidence):
-    """UNKNOWN / aplikasi lain tidak pernah memicu 'tidak ada reaksi', klik ulang, atau reload: hanya jaring
-    UNKNOWN_STATE yang memutuskan; diagnosa mahal hanya sekali, saat eskalasi."""
+LAUNCHER = "Shopee keluar dari foreground: com.android.launcher3/.Launcher"
+
+
+@pytest.mark.parametrize("flag, cause, evidence", [
+    ("unknown_after_buy", "tidak ada elemen yang dikenali",
+     "aplikasi aktif com.shopee.id/com.shopee.app.ui.unknown.Activity"),
+    ("other_app_after_buy", LAUNCHER, "aplikasi aktif com.android.launcher3/.Launcher, (aplikasi lain di depan)"),
+    # crash: dialog sistem "Shopee telah berhenti" (jendela package lain) terbaca lewat info_any
+    ("crash_after_buy", "dialog sistem 'Shopee telah berhenti' (crash/ANR)",
+     "aplikasi aktif com.android.launcher3/.Launcher, (aplikasi lain di depan)"),
+], ids=["unknown", "other_app", "crash"])
+def test_unknown_screen_after_buy_diagnosed_once_without_reclick(tmp_path, flag, cause, evidence):
+    """Layar tak dikenal / Shopee keluar dari foreground (launcher, crash) tidak pernah memicu 'tidak ada reaksi',
+    klik ulang, atau reload: hanya jaring UNKNOWN_STATE (1,5 s) yang memutuskan. Aplikasi/activity di depan
+    dibaca paling cepat tiap 0,5 s; diagnosa mahal (content-desc semua elemen) hanya sekali, saat eskalasi."""
     stop = threading.Event()
     out = run_android(tmp_path, runner_attrs={"stop_event": stop}, **{flag: True})
     assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
-    assert out.result.message.startswith("layar tidak dikenali > 1.5 s (tidak ada elemen yang dikenali, ")
+    assert out.result.message.startswith(f"layar tidak dikenali > 1.5 s ({cause}, "), out.result.message
     assert evidence in out.result.message
     names = out.step_names()
     assert "no_response" not in names and "reload" not in names and names.count("click_buy") == 1
@@ -749,7 +758,8 @@ def test_unknown_screen_after_buy_diagnosed_once_without_reclick(tmp_path, flag,
     dt = out.result.step("result").t_server_ms - buys[0]["t_server_ms"]
     assert 1500 <= dt <= 2200, f"UNKNOWN_STATE {dt} ms setelah klik (batas 1,5 s sejak pengamatan)"
     ops = _ops(out)
-    assert ops.count("webview") == 1
+    after = ops[ops.index("click"):]
+    assert 1 <= after.count("webview") <= 5 and 1 <= after.count("current_app") <= 6, after
     assert sum(1 for op, t in out.driver.calls if op == "find_all" and t.startswith("descriptionMatches")) == 1
     assert stop.is_set()
     _alarmed(out, RunStatus.UNKNOWN_STATE)

@@ -18,6 +18,13 @@ dibuka, memakai **1 akun milik sendiri**, lewat UI seperti manusia. Ada dua jalu
 
 ## Batasan keras (tertanam di kode, bukan opsi)
 
+- Android: **hanya interaksi UI lewat uiautomator2** (query elemen, tap koordinat elemen, swipe, back,
+  intent VIEW `am start`). Tidak ada modifikasi/patch/dekompilasi APK Shopee (jadx/apktool), Frida/hook,
+  root, bypass captcha, atau API privat. Perintah shell adb yang dipakai hanya membaca status device
+  (`getprop`, `wm`, `dumpsys`, `settings get`, `pm path`, `ps`, `cmd package resolve-activity`), membuka
+  intent VIEW, dan `svc power stayon` / `settings put global stay_on_while_plugged_in` (layar tetap menyala
+  selama run, dikembalikan setelahnya). Alat tidak pernah mengetik apa pun (tidak ada `input text`).
+
 - 1 akun, login manual. Tidak ada multi-akun.
 - Tidak ada captcha solver, bypass/evasion anti-bot, spoof fingerprint/device, stealth plugin,
   patch `navigator.webdriver`, atau pemanggilan API privat Shopee. Semua interaksi lewat UI.
@@ -254,11 +261,23 @@ Skenario yang tersedia:
    python -m uiautomator2 init      # pasang agent u2.jar (+ IME, tidak dipakai alat)
    python -m uiautomator2 doctor    # "uiautomator2 is OK"
    ```
-4. HiOS agresif mematikan proses latar. Matikan optimasi baterai/aktifkan *Auto-start* untuk
-   Shopee, kunci aplikasi Shopee di daftar aplikasi terbaru, dan jangan biarkan layar terkunci.
-   Agent uiautomator2 yang mati dideteksi saat precheck, saat arm, dan tiap 2 s sampai T-3 s,
-   lalu dihidupkan ulang otomatis (dicatat di log). Saat polling, query yang gagal karena agent
-   mati memicu restart (maks 2×).
+4. **Checklist HiOS** (HiOS agresif mematikan proses latar):
+   - [ ] **Optimasi baterai OFF** untuk aplikasi uiautomator2 (*ATX* / `com.github.uiautomator`) dan
+         Shopee: Setelan → Baterai → Optimasi baterai / Manajemen aplikasi → "Tidak dibatasi".
+   - [ ] **Auto-start ON** untuk ATX/uiautomator2 dan Shopee (Phone Master → Manajemen auto-start).
+   - [ ] **Kunci di recent apps**: buka daftar aplikasi terbaru, tahan/ketuk ikon gembok di kartu ATX
+         dan Shopee agar tidak ikut dibersihkan.
+   - [ ] **Pembersihan otomatis Phone Master OFF** (pembersih memori/akselerasi terjadwal, "Bersihkan
+         saat layar terkunci").
+   - [ ] **Auto-update Shopee di Play Store OFF sampai 10.10** (Play Store → Shopee → ⋮ → matikan
+         *Aktifkan pembaruan otomatis*): versi aplikasi yang berubah membuat hasil kalibrasi bisa tidak
+         cocok; precheck memberi **PERINGATAN KERAS** + alarm bila versi berbeda dari saat kalibrasi.
+   - [ ] Layar tidak dikunci selama run. *Tetap aktif* tidak wajib: saat `run` alat memasang
+         `svc power stayon usb` dan mengembalikan nilai lamanya setelah selesai.
+
+   Agent uiautomator2 yang mati atau lambat (3 query berturut-turut harus masing-masing < 1 s) dideteksi
+   saat precheck dan dihidupkan ulang; saat arm dan tiap 2 s sampai T-3 s juga dicek. Saat polling, query
+   yang gagal karena agent mati memicu restart (maks 2×). Semua restart dicatat di log.
 
 ### 1. Login manual di aplikasi
 
@@ -275,14 +294,25 @@ tidak mengetik dan tidak menyimpan apa pun.
 python -m flashbuy calibrate --platform android --config target.yaml
 ```
 
-**Anda yang men-tap HP; alat hanya membaca layar** (dump hierarki, khusus kalibrasi) sehingga
-"Buat Pesanan" tidak mungkin ditekan alat. Tiap langkah: buka layar yang diminta, tekan Enter.
-Alat mengenali elemen lewat teks default; bila tidak dikenali, ketik teks yang terlihat. Urutan:
-Beli Sekarang → harga (opsional, hanya resourceId/desc) → bottom sheet (penanda "Jumlah",
-variasi, tombol konfirmasi) → checkout ("Buat Pesanan", JANGAN ditekan; baris "Metode
-Pembayaran") → daftar metode (ShopeePay, Konfirmasi). Kandidat disimpan terurut
-`resourceId → text → textContains → description` setelah diverifikasi di device, ke bagian
-`android` di `selectors.json` (bagian `web` tidak disentuh, versi lama di-backup).
+**Anda yang men-tap HP; alat hanya membaca layar** (dump hierarki + query baca). Selama kalibrasi alat
+tidak pernah mengklik, menekan tombol, atau membuka intent, jadi "Buat Pesanan" tidak mungkin ditekan alat.
+
+Tiap langkah:
+1. Buka layar yang diminta di HP, tekan Enter di terminal.
+2. Alat mengambil dump dan menampilkan **kandidat bernomor** yang cocok dengan kata kunci langkah
+   (teks / content-desc / resourceId / bounds), elemen di jendela aktif lebih dulu, mis.
+   `1. teks='Beli Sekarang' id=com.shopee.id:id/buy bounds=[360,1500][720,1612] klik`.
+3. Ketik nomornya (Enter = 1; teks lain = cari elemen bertulisan itu; `u` = baca ulang layar;
+   `lewati` untuk langkah opsional).
+4. Alat menyusun selector (`resourceId → text → textContains → description`) dan **hanya menyimpan
+   yang unik**: tepat satu elemen cocok di dump (semua jendela) dan di device, dan itu elemen yang
+   dipilih. "Buat Pesanan" diverifikasi dari dump saja.
+
+Urutan: Beli Sekarang → harga (opsional, hanya resourceId/desc) → bottom sheet (penanda "Jumlah",
+variasi, tombol konfirmasi) → checkout ("Buat Pesanan", JANGAN ditekan; baris "Metode Pembayaran") →
+daftar metode (ShopeePay, Konfirmasi). Hasil disimpan ke bagian `android` di `selectors.json` bersama
+**versi aplikasi Shopee dan resolusi layar** (`calibrated.app_version`, `calibrated.wm_size`); bagian
+`web` tidak disentuh, versi lama di-backup.
 
 Default tanpa kalibrasi (teks Bahasa Indonesia) ada di `flashbuy/android_selectors.py`, termasuk
 penanda status (`markers`: captcha, verifikasi, login, PIN, habis, belum mulai) yang bisa ditambah
@@ -296,13 +326,17 @@ python -m flashbuy precheck --config target.yaml --only android
 
 - Membaca dan mencatat info device: `getprop` (merek, model, versi Android, SDK, build, versi
   HiOS) dan `wm size`/`wm density`. Tidak ada asumsi versi atau resolusi.
-- Agent uiautomator2 hidup (mati → dihidupkan ulang + peringatan).
-- Layar menyala dan tidak terkunci; peringatan bila *Tetap aktif* mati.
-- Aplikasi Shopee terpasang (versi dicatat).
+- Agent uiautomator2 hidup **dan responsif**: 3 query berturut-turut masing-masing < 1 s. Mati atau
+  lambat → dihidupkan ulang sekali (peringatan); masih gagal → `ERROR`, run berhenti.
+- Layar menyala dan tidak terkunci. Saat `run`: `svc power stayon usb` selama run, nilai
+  `stay_on_while_plugged_in` lama dikembalikan setelah run selesai (apa pun hasilnya).
+- Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi →
+  **PERINGATAN KERAS** + alarm (run tidak dihentikan; kalibrasi ulang + dry-run dulu).
 - Halaman produk terbuka lewat intent tanpa diminta login, tombol Beli ditemukan, harga terbaca.
 - Latensi query: 10× `exists` + 3× `info`; peringatan bila p95 > 100 ms. Semua sampel ada di
   `logs/<run>/android-queries-precheck.csv`.
-- Alamat default ("Utama") dan saldo ShopeePay dibaca dari UI. Tidak terbaca = peringatan saja.
+- Alamat default ("Utama") dan saldo ShopeePay dibaca dari UI. Tidak terbaca / tidak ada / saldo
+  kurang → **alarm saja** (PERINGATAN), run tidak dihentikan.
 
 ### 4. Dry-run lalu live
 
@@ -320,12 +354,24 @@ Jadwal sama dengan web: pre-check T-10 mnt, resync T-2 mnt, arm T-60 s, polling 
 |---|---|
 | T-60 s | buka produk lewat intent VIEW (`am start -a VIEW -d <url> -p com.shopee.id`), tunggu halaman produk, pilih variasi lebih awal bila opsinya tampil di halaman |
 | T-lead | polling: tombol Beli aktif **dan** harga ≤ `max_item_price` (lapis 1) → klik, lewat RateLimiter (≥ 425 ms) di jendela T-1 s..T+8 s |
-| T+0,5 s | belum siap → reload (`android.reload`), lalu tiap 2 s; terhitung aksi polling |
+| T+0,5 s | belum siap → reload (`android.reload`: swipe-down atau buka ulang intent), lalu tiap 2 s (dihitung dari awal reload); aksi polling. Variasi yang dipilih di halaman produk diperiksa lagi dan dipilih ulang lewat gate bila terlepas |
 | setelah Beli | bottom sheet variasi/jumlah: pilih variasi, konfirmasi (sekali) → checkout, atau keranjang (lapis 2 hanya bila layar keranjang muncul) |
 | checkout | pastikan ShopeePay (ganti lewat "Metode Pembayaran" bila perlu) → lapis 3 → DRY-RUN berhenti / LIVE klik "Buat Pesanan" → layar PIN → alarm |
 
-Setiap iterasi **mengklasifikasi layar dulu, lalu bertindak** (produk, bottom sheet,
-keranjang, checkout, PIN, habis, captcha/verifikasi, login, loading, aplikasi lain, tak dikenal).
+Setiap iterasi **mengklasifikasi layar dulu, lalu bertindak**. Status: `PRODUCT_WAITING`,
+`PRODUCT_ACTIVE`, `VARIANT_SHEET`, `CART`, `CHECKOUT`, `PIN_SCREEN`, `NOT_STARTED`, `SOLD_OUT`, `CAPTCHA`,
+`VERIFICATION`, `LOGIN_REQUIRED`, `UNKNOWN` (+ sub-status sementara: pesan "pilih variasi"/error di
+halaman produk, dan `LOADING`). Ditentukan dari elemen; bila tidak ada elemen yang dikenali, dari
+package/activity di depan:
+- **CAPTCHA/VERIFICATION** (stop semua runner, alarm, tanpa retry): teks verifikasi pendek di
+  dialog/bottom sheet/toast (teks panjang = deskripsi produk diabaikan), juga di content-desc; WebView
+  Shopee tanpa elemen yang dikenali; activity Shopee bernama captcha/verifikasi; aplikasi/activity asing
+  selain `com.shopee.id` dan dialog sistem yang dikenal.
+- **UNKNOWN**: Shopee keluar dari foreground (launcher), crash, dialog ANR/crash di atas Shopee (dicek tanpa
+  batas package; selama dialog tampil tidak ada klik), telepon/keyboard/Phone Master di depan, atau
+  layar tak dikenal. UNKNOWN > 1,5 s → `UNKNOWN_STATE`: dump + screenshot + activity disimpan, alarm,
+  tanpa retry. Indikator loading ditunggu, tetapi > 10 s → `UNKNOWN_STATE`. Setelah "Buat Pesanan"
+  pesannya "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual".
 
 Kecepatan:
 - Hot path hanya memakai query satu-elemen di device (`info`/`exists`, satu pencarian pohon):

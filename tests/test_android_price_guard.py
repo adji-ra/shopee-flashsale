@@ -551,7 +551,7 @@ def test_l1_price_read_in_hot_path_is_single_info_query(tmp_path, monkeypatch):
     _passed(out, live=False)
     start, click = out.result.step("poll_start").t_server_ms, out.result.step("click_buy").t_server_ms
     hot = [(op, target) for t, op, target in out.driver.stamps if start <= t < click and op != "clear_toast"]
-    assert hot and {op for op, _ in hot} <= {"info", "exists"}, sorted({op for op, _ in hot})
+    assert hot and {op for op, _ in hot} <= {"info", "info_any", "exists"}, sorted({op for op, _ in hot})
     price_reads = hot.count(("info", str(Sel("textMatches", RP_SHORT_MATCH))))
     buy_reads = hot.count(("info", str(Sel("text", "Beli Sekarang"))))
     assert price_reads >= 3, hot[:12]

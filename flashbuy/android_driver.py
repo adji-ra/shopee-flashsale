@@ -121,6 +121,9 @@ class AndroidDriver(Protocol):
 
     def info(self, sel: Sel) -> Node | None: ...  # elemen pertama yang cocok, None bila tidak ada
 
+    # Seperti info, tetapi TANPA batas package aplikasi (dialog sistem crash/ANR, aplikasi lain di atas Shopee).
+    def info_any(self, sel: Sel) -> Node | None: ...
+
     def find_all(self, sel: Sel) -> list[Node]: ...  # semua elemen yang cocok (1 RPC)
 
     def click(self, target: Sel | Node) -> bool: ...  # Node -> tap tengah bounds (1 RPC)
@@ -246,20 +249,20 @@ class U2Driver:
         """Panggil jsonrpc agent dengan timeout per panggilan (bukan 300 s bawaan u2)."""
         return getattr(self.d.jsonrpc, method)(*params, http_timeout=self.rpc_timeout_s)
 
-    def _selector(self, sel: Sel) -> Any:
+    def _selector(self, sel: Sel, any_package: bool = False) -> Any:
         kw = sel.kwargs()
-        if self.package:
+        if self.package and not any_package:
             kw["packageName"] = self.package
         return self.d(**kw).selector
 
     def exists(self, sel: Sel) -> bool:
         return bool(self._call(f"exists {sel}", lambda: self._rpc("exist", self._selector(sel))))
 
-    def info(self, sel: Sel) -> Node | None:
+    def info(self, sel: Sel, any_package: bool = False) -> Node | None:
         def get() -> Node | None:
             for attempt in (1, 2):
                 try:
-                    node = Node.from_u2(self._rpc("objInfo", self._selector(sel)))
+                    node = Node.from_u2(self._rpc("objInfo", self._selector(sel, any_package)))
                     break
                 except Exception as e:  # noqa: BLE001
                     if type(e).__name__ == "UiObjectNotFoundError":
@@ -274,6 +277,9 @@ class U2Driver:
             return node if node_matches(node, sel) else None
 
         return self._call(f"info {sel}", get)
+
+    def info_any(self, sel: Sel) -> Node | None:
+        return self.info(sel, any_package=True)
 
     def find_all(self, sel: Sel) -> list[Node]:
         def get() -> list[Node]:
@@ -442,6 +448,9 @@ class TimedDriver:
     def info(self, sel: Sel) -> Node | None:
         return self._timed("info", sel, lambda: self.inner.info(sel))
 
+    def info_any(self, sel: Sel) -> Node | None:
+        return self._timed("info_any", sel, lambda: self.inner.info_any(sel))
+
     def find_all(self, sel: Sel) -> list[Node]:
         return self._timed("find_all", sel, lambda: self.inner.find_all(sel))
 
@@ -546,6 +555,9 @@ class FakeApp(Protocol):
 
     def webview(self) -> bool: ...
 
+    # opsional: node jendela milik package lain (dialog crash/ANR, overlay aplikasi lain); hanya info_any
+    # def system_nodes(self) -> list[Node]: ...
+
 
 class FakeDriver:
     """Driver palsu: mencocokkan selector ke node FakeApp dan mencatat setiap aksi.
@@ -586,6 +598,13 @@ class FakeDriver:
     def info(self, sel: Sel) -> Node | None:
         self._rpc("info", sel)
         found = self._match(sel)
+        return found[0] if found else None
+
+    def info_any(self, sel: Sel) -> Node | None:
+        """Tanpa batas package: node aplikasi + jendela sistem/aplikasi lain di atasnya (app.system_nodes)."""
+        self._rpc("info_any", sel)
+        system = getattr(self.app, "system_nodes", lambda: [])()
+        found = [n for n in [*system, *self.app.nodes()] if node_matches(n, sel)]
         return found[0] if found else None
 
     def find_all(self, sel: Sel) -> list[Node]:

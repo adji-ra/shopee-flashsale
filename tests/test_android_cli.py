@@ -50,13 +50,14 @@ PROPS = {"ro.product.brand": "TECNO", "ro.product.manufacturer": "TECNO", "ro.pr
          "ro.build.version.release": "13", "ro.build.version.sdk": "33", "ro.tranos.version": "hios13.6.0"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (termasuk PIN).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
-PRECHECK_ROWS = ["device", "agent uiautomator2", "layar", "aplikasi Shopee", "login", "tombol Beli",
-                 "harga produk", "latensi query", "alamat default", "saldo ShopeePay"]
+PRECHECK_ROWS = ["device", "agent uiautomator2", "layar", "layar tetap menyala", "aplikasi Shopee",
+                 "versi vs kalibrasi", "login", "tombol Beli", "harga produk", "latensi query", "alamat default",
+                 "saldo ShopeePay"]
 # last_toast/clear_toast: status Toast di agent uiautomator2 saja (tidak menyentuh aplikasi/Shopee).
 AGENT_OPS = {"last_toast", "clear_toast"}
 # Operasi driver yang sah dipakai CLI/runner. Tidak ada input teks (PIN tidak mungkin diketik alat).
-ALLOWED_OPS = {"exists", "info", "find_all", "click", "current_app", "start_url", "swipe_refresh", "press_back",
-               "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
+ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
+               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
 # Klik yang harus langsung diikuti clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
 TOAST_CLEARED_CLICKS = {"Beli Sekarang", "Buat Pesanan"}
 VARIANTS = ["128GB Hitam", "256GB Biru"]
@@ -265,7 +266,17 @@ def _subsequence(names: list[str], expected: list[str]) -> None:
 # ------------------------------------------------------------------ precheck --only android
 
 
-def run_precheck(tmp_path, device, **kw) -> tuple[int, Device]:
+def write_calibration(tmp_path: Path, app_version: str = "3.40.21", wm_size: str = WM_SIZE) -> Path:
+    """selectors.json dengan metadata kalibrasi Android (versi Shopee & resolusi saat kalibrasi)."""
+    path = tmp_path / "selectors.json"
+    android_selectors.save(path, {}, {"app_version": app_version, "wm_size": wm_size})
+    return path
+
+
+def run_precheck(tmp_path, device, calibrated: bool = True, **kw) -> tuple[int, Device]:
+    """precheck --only android. calibrated=True: selectors.json dari kalibrasi di versi Shopee yang sama."""
+    if calibrated:
+        write_calibration(tmp_path)
     dev = device(time.time() + 3600, **kw)
     rc = cli.main(["precheck", "--config", str(write_cfg(tmp_path, dev.app.sc.open_at)), "--only", "android"])
     return rc, dev
@@ -280,8 +291,11 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
     assert all(status == "OK" for status, _ in rows.values()), rows
     # versi Android & resolusi dibaca dari device (getprop, wm size), bukan diasumsikan
     assert rows["device"][1] == "TECNO TECNO BG6 Android 13 (SDK 33), Physical size: 1080x2460"
-    assert rows["agent uiautomator2"][1] == "hidup"
+    # agent responsif: 3 query berturut-turut masing-masing < 1 s
+    assert re.fullmatch(r"menjawab 3 query: \d+, \d+, \d+ ms", rows["agent uiautomator2"][1]), rows
+    assert rows["layar tetap menyala"][1] == "stay_on_while_plugged_in=3 (USB sudah termasuk)"
     assert rows["aplikasi Shopee"][1] == f"{PACKAGE} 3.40.21"
+    assert rows["versi vs kalibrasi"][1] == f"versi 3.40.21 = kalibrasi 3.40.21, {WM_SIZE}"
     assert "enabled=False" in rows["tombol Beli"][1]  # sebelum slot buka: tombol ada tapi belum aktif
     assert rows["harga produk"][1].startswith("harga Rp150.000 > maks Rp100.000")
     # hot path (info/exists, 10 probe + 3 info tombol Beli) dan find_all (lebih mahal) diukur terpisah
@@ -299,7 +313,8 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
                  "device ro.build.version.release = 13", "device ro.build.version.sdk = 33",
                  "device ro.tranos.version = hios13.6.0", f"device wm size = {WM_SIZE}",
                  "device wm density = Physical density: 320", "HiOS/Transsion terdeteksi",
-                 "latensi query precheck: info/exists median", "latensi precheck exists: n=10",
+                 "latensi query precheck: info/exists median",
+                 "latensi precheck exists: n=13",  # 10 probe + 3 ping agent
                  "latensi precheck find_all: n="):
         assert line in log, line
     with (log_dir / "android-queries-precheck.csv").open(encoding="utf-8") as f:
@@ -321,7 +336,7 @@ def test_precheck_agent_dead_at_start_is_restarted_with_warning(tmp_path, device
     assert rc == 0, text  # peringatan saja
     status, detail = table_rows(text)["agent uiautomator2"]
     assert status == "PERINGATAN"
-    assert detail.startswith("mati lalu dihidupkan ulang - kemungkinan dibunuh HiOS")
+    assert detail.startswith("mati, dihidupkan ulang -> menjawab 3 query") and "kemungkinan dibunuh HiOS" in detail
     assert dev.driver.restarts == 1
     assert [i.name for i in prechecks[0].warnings] == ["agent uiautomator2"]
     log = (only_log("logs/*-precheck") / "android.log").read_text(encoding="utf-8")
@@ -332,7 +347,8 @@ def test_precheck_agent_cannot_restart_fails(tmp_path, device, term, prechecks):
     rc, dev = run_precheck(tmp_path, device, driver_cls=AgentWontRestartDriver, driver_kw={"alive": False})
     text = term.getvalue()
     assert rc == 1, text
-    assert table_rows(text)["agent uiautomator2"] == ("GAGAL", "mati lalu dihidupkan ulang - gagal dihidupkan")
+    status, detail = table_rows(text)["agent uiautomator2"]
+    assert status == "GAGAL" and detail.startswith("mati, dihidupkan ulang -> tetap gagal"), detail
     assert prechecks[0].status == RunStatus.ERROR
     assert dev.app.kind("intent") == [], "berhenti sebelum membuka aplikasi"
 
@@ -369,7 +385,7 @@ def test_precheck_slow_queries_warn_latency(tmp_path, device, term, prechecks):
     assert [i.name for i in prechecks[0].warnings] == ["latensi query"]
     log = (only_log("logs/*-precheck") / "android.log").read_text(encoding="utf-8")
     assert re.search(r"WARN \d+ query melewati target \(info/exists/klik 100 ms, find_all 300 ms\); "
-                     r"terlama exists text='__flashbuy_probe__'", log), log
+                     r"terlama exists text='__flashbuy_(probe|ping)__'", log), log  # probe latensi / ping agent
 
 
 def test_precheck_slow_find_all_warns_with_its_own_budget(tmp_path, device, term, prechecks):
@@ -408,8 +424,10 @@ def test_precheck_agent_death_mid_precheck_is_reported_not_raised(tmp_path, devi
 
 
 @pytest.mark.parametrize(("scenario", "row", "detail"), [
-    ({"wallet_unsupported": True}, "saldo ShopeePay", "halaman tidak bisa dibuka di aplikasi (am start gagal"),
-    ({"stay_on": "0"}, "layar tetap menyala", "'Tetap aktif' mati dan timeout layar 60000 ms"),
+    ({"wallet_unsupported": True}, "saldo ShopeePay", "ALARM: halaman tidak bisa dibuka di aplikasi (am start gagal"),
+    # perintah precheck saja: hanya dilaporkan (run yang memasang svc power stayon usb)
+    ({"stay_on": "0"}, "layar tetap menyala", "stay_on_while_plugged_in=0, timeout layar 60000 ms; saat run alat "
+                                              "memasang `svc power stayon usb`"),
 ], ids=["wallet_unsupported", "stay_on_off"])
 def test_precheck_warnings_do_not_fail(tmp_path, device, term, prechecks, scenario, row, detail):
     rc, _ = run_precheck(tmp_path, device, **scenario)
@@ -427,21 +445,22 @@ def test_precheck_balance_enough_for_flash_price_is_not_failure(tmp_path, device
     text = term.getvalue()
     rows = table_rows(text)
     assert "saldo vs max_total" not in rows, "saldo vs max_total = bagian baris 'saldo ShopeePay'"
-    assert rows["saldo ShopeePay"] == ("PERINGATAN", "saldo Rp110.000 >= harga Rp100.000 tetapi < max_total "
+    assert rows["saldo ShopeePay"] == ("PERINGATAN", "ALARM: saldo Rp110.000 >= harga Rp100.000 tetapi < max_total "
                                                      "Rp120.000 (ongkir/biaya bisa membuatnya kurang)")
     assert [i.name for i in prechecks[0].warnings] == ["saldo ShopeePay"]
     assert rc == 0, text
 
 
 @pytest.mark.parametrize(("normal_price", "balance", "status", "detail"), [
-    (150_000, 99_999, "GAGAL", "saldo Rp99.999 < harga Rp100.000"),  # acuan = max_item_price
+    (150_000, 99_999, "PERINGATAN", "ALARM: saldo Rp99.999 < harga Rp100.000"),  # acuan = max_item_price
     (150_000, 120_000, "OK", "saldo Rp120.000 >= max_total Rp120.000"),
-    (80_000, 79_999, "GAGAL", "saldo Rp79.999 < harga Rp80.000"),  # harga tampil < max_item_price = acuan
-    (80_000, 80_000, "PERINGATAN", "saldo Rp80.000 >= harga Rp80.000 tetapi < max_total Rp120.000"),
+    (80_000, 79_999, "PERINGATAN", "ALARM: saldo Rp79.999 < harga Rp80.000"),  # harga tampil < max_item_price
+    (80_000, 80_000, "PERINGATAN", "ALARM: saldo Rp80.000 >= harga Rp80.000 tetapi < max_total Rp120.000"),
 ], ids=["kurang_dari_maks_item", "cukup_maks_total", "kurang_dari_harga_tampil", "sama_harga_tampil"])
-def test_precheck_balance_vs_min_displayed_price_and_max_item(tmp_path, device, term, prechecks, normal_price,
-                                                               balance, status, detail):
-    """Android: saldo < min(harga tampil, max_item_price) -> GAGAL (exit 1); < max_total -> PERINGATAN; else OK.
+def test_precheck_balance_vs_min_displayed_price_and_max_item(tmp_path, device, term, prechecks, alarms,
+                                                               normal_price, balance, status, detail):
+    """Android: saldo < min(harga tampil, max_item_price) atau < max_total -> ALARM + PERINGATAN (run tidak
+    dihentikan, exit 0); else OK tanpa alarm.
 
     (PERINGATAN = penilai halaman saldo mengembalikan None -> halaman dibaca ulang sampai 5 s jam nyata; kasus
     PERINGATAN sengaja sedikit supaya tes tetap cepat.)"""
@@ -449,8 +468,9 @@ def test_precheck_balance_vs_min_displayed_price_and_max_item(tmp_path, device, 
     text = term.getvalue()
     got_status, got_detail = table_rows(text)["saldo ShopeePay"]
     assert got_status == status and got_detail.startswith(detail), (got_status, got_detail)
-    assert rc == (1 if status == "GAGAL" else 0), text
-    assert prechecks[0].status is None, "saldo kurang = item GAGAL, bukan status fatal"
+    assert rc == 0, text  # spesifikasi G: alamat/saldo hanya alarm, run tidak dihentikan
+    assert prechecks[0].status is None, "saldo kurang = alarm, bukan status fatal"
+    assert alarms == (["precheck_saldo ShopeePay"] if status != "OK" else []), alarms
     assert dev.app.kind("tap") == [] and dev.app.kind("order") == [], "precheck hanya membaca"
 
 
@@ -620,11 +640,11 @@ def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
     assert alarms == []
     # klik Beli & konfirmasi sheet tepat didahului clear_toast (operasi agent, tidak menyentuh aplikasi)
     assert assert_toast_cleared_before_clicks(out.dev) == 2
-    # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists) + clear_toast sebelum klik,
-    # tanpa find_all/baca toast/dump
+    # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists; info_any = cek dialog sistem
+    # crash/ANR tiap <= 0,5 s) + clear_toast sebelum klik, tanpa find_all/baca toast/dump
     t_poll, t_click = out.step("poll_start")["t_server_ms"], out.step("click_buy")["t_server_ms"]
     hot = {r["op"] for r in run_csv(out) if t_poll <= int(r["t_server_ms"]) <= t_click}
-    assert hot and hot <= {"info", "exists", "clear_toast"}, hot
+    assert hot and hot <= {"info", "info_any", "exists", "clear_toast"}, hot
     # log run: device props, latensi query precheck & run, screenshot + dump status akhir
     log = (out.run_dir / "android.log").read_text(encoding="utf-8")
     assert "device ro.product.model = TECNO BG6" in log and f"device wm size = {WM_SIZE}" in log
@@ -667,9 +687,11 @@ def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, dev
     assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
     assert len(out.dev.app.kind("order")) == 1 and out.dev.app.screen == "order_unknown"
     assert alarms == ["UNKNOWN_STATE"]
-    # diagnosa mahal hanya SEKALI, saat naik ke UNKNOWN_STATE (bukan di setiap iterasi UNKNOWN)
+    # aplikasi/activity & WebView (klasifikasi spesifikasi F) dibaca ulang paling cepat tiap 0,5 s selama UNKNOWN;
+    # diagnosa mahal (content-desc semua elemen) hanya SEKALI, saat naik ke UNKNOWN_STATE
     calls = out.dev.driver.calls
-    assert [op for op, _ in calls].count("webview") == 1
+    after_order = [op for op, _ in calls[calls.index(("click", "Buat Pesanan")):]]
+    assert 1 <= after_order.count("webview") <= 5 and after_order.count("current_app") <= 6, after_order
     assert len([1 for op, t in calls if op == "find_all" and t.startswith("descriptionMatches")]) == 1
     after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
     assert not {"click", "press_back", "start_url", "swipe_refresh"} & {op for op, _ in after}, "tanpa retry"
@@ -765,7 +787,7 @@ def test_run_android_precheck_error_stops_before_opening_product(tmp_path, devic
     out = run_cli(tmp_path, device, term, driver_cls=AgentWontRestartDriver, driver_kw={"alive": False})
     assert out.rc == 1, out.text
     assert out.result["status"] == "ERROR"
-    assert out.result["message"] == "pre-check: agent uiautomator2: mati lalu dihidupkan ulang - gagal dihidupkan"
+    assert out.result["message"].startswith("pre-check: agent uiautomator2: mati, dihidupkan ulang -> tetap gagal")
     assert "arm" not in out.step_names() and out.dev.app.kind("intent") == []
     assert out.buys() == [] and "click" not in out.dev.ops()
     assert alarms == ["precheck"]
@@ -1046,15 +1068,19 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
     app = dev.app
     user = ScriptedUser([
         ("[buy_button]", goto(app, "product"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[product_price]", None, ""),
-        ("Elemen product_price tidak dikenali", None, "Rp150.000"),  # harga: tidak ada default -> diketik
+        ("Nomor elemen", None, "Rp150.000"),  # harga: tidak ada default -> cari teks yang diketik
+        ("Nomor elemen", None, "1"),
         ("[sheet_marker]", goto(app, "sheet"), ""),
-        # konfirmasi sheet bertulisan sama dengan tombol Beli di belakang sheet: tidak bisa dikalibrasi
-        # (lihat test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet) -> dilewati
-        ("[sheet_confirm]", None, "lewati"),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
+        ("[sheet_confirm]", None, "lewati"),  # dikalibrasi di tes ..._same_text_as_buy_button_behind_sheet
         ("[place_order]", goto(app, "checkout"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[payment_change]", None, ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[payment_shopeepay]", goto(app, "payment_list"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[payment_confirm]", None, "lewati"),
     ])
     cfg = cli._load(cli.build_parser().parse_args(
@@ -1068,7 +1094,9 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
     assert data["web"] == WEB_SECTION and data["version"] == 1, "bagian web dipertahankan"
     backups = list(tmp_path.glob("selectors.json.bak-*"))
     assert len(backups) == 1 and json.loads(backups[0].read_text(encoding="utf-8")) == original
-    assert f"Tersimpan: {sel_path} (bagian android) (backup: {backups[0]})" in text
+    assert f"Tersimpan: {sel_path} (bagian android; Shopee 3.40.21, {WM_SIZE}) (backup: {backups[0]})" in text
+    # daftar kandidat bernomor: teks / resourceId / bounds
+    assert f"1. teks='Beli Sekarang' desc='Beli Sekarang' id={BUY_RID} bounds=[360,1500][720,1612] klik" in text
 
     section = data["android"]
     steps = section["steps"]
@@ -1084,12 +1112,17 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
     assert steps["payment_shopeepay"] == [{"resourceId": SHOPEEPAY_RID}, {"text": "ShopeePay"},
                                           {"description": "ShopeePay"}]
     assert section["calibrated"]["device"] == SERIAL
+    # versi Shopee & resolusi saat kalibrasi (precheck: PERINGATAN KERAS bila versi berubah)
+    assert section["calibrated"]["app_version"] == "3.40.21" and section["calibrated"]["wm_size"] == WM_SIZE
     assert section["calibrated"]["skipped"] == ["variant_option", "sheet_confirm", "payment_confirm"]
     assert section["markers"] == {} and section["urls"] == {}
 
-    # kalibrasi tidak pernah men-tap / membuka / menekan apa pun: hanya membaca layar
+    # kalibrasi tidak pernah men-tap / membuka / menekan apa pun: hanya membaca layar (+ versi app & resolusi)
     assert app.kind("tap") == [] and app.kind("intent") == [] and app.kind("order") == []
-    assert set(dev.ops()) <= {"dump", "find_all"}, dev.ops()
+    assert set(dev.ops()) <= {"dump", "find_all", "shell"}, dev.ops()
+    assert dev.shell_cmds() == [f"dumpsys package {PACKAGE}", "wm size"]
+    # "Buat Pesanan" hanya dari dump: tidak ada query device ke elemen itu
+    assert not [t for op, t in dev.driver.calls if op == "find_all" and ("Buat" in t or PLACE_ORDER_RID in t)]
 
     # dimuat ulang: hasil kalibrasi di depan default sejenis, default teks tetap jadi cadangan
     loaded = android_selectors.load(sel_path)
@@ -1108,9 +1141,12 @@ def test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet(tm
     app = dev.app
     user = ScriptedUser([
         ("[buy_button]", goto(app, "product"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[product_price]", None, "lewati"),
         ("[sheet_marker]", goto(app, "sheet"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[sheet_confirm]", None, ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[place_order]", goto(app, "checkout"), "lewati"),
         ("[payment_change]", None, "lewati"),
         ("[payment_shopeepay]", None, "lewati"),
@@ -1121,10 +1157,12 @@ def test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet(tm
     rc = cli.calibrate_android(cfg, dev.driver, sel_path, prompt=user)
     assert rc == 0 and user.script == []
     steps = json.loads(sel_path.read_text(encoding="utf-8"))["android"]["steps"]
-    # yang direkam = tombol konfirmasi DI sheet (jendela aktif), bukan tombol Beli di belakangnya
-    assert steps["sheet_confirm"] == [{"resourceId": CONFIRM_RID}, {"text": "Beli Sekarang"},
-                                      {"textContains": "Beli Sekaran"}]
-    assert app.kind("tap") == [] and set(dev.ops()) <= {"dump", "find_all"}
+    # yang direkam = tombol konfirmasi DI sheet (jendela aktif, nomor 1 di daftar), bukan tombol Beli di
+    # belakangnya; teks 'Beli Sekarang' tidak unik di semua jendela -> hanya resource-id yang unik disimpan
+    assert steps["sheet_confirm"] == [{"resourceId": CONFIRM_RID}]
+    assert "1. teks='Beli Sekarang' id=" + CONFIRM_RID in term.getvalue()
+    assert "sheet_confirm: text='Beli Sekarang' tidak unik (2 elemen di dump), dibuang" in term.getvalue()
+    assert app.kind("tap") == [] and set(dev.ops()) <= {"dump", "find_all", "shell"}
 
 
 def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monkeypatch, device, term):
@@ -1133,13 +1171,18 @@ def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monke
     app = dev.app
     user = ScriptedUser([
         ("[buy_button]", goto(app, "product"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[product_price]", None, "lewati"),
         ("[sheet_marker]", goto(app, "sheet"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[variant_option]", None, ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[sheet_confirm]", None, "skip"),
         ("[place_order]", goto(app, "checkout"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[payment_change]", None, "s"),
         ("[payment_shopeepay]", goto(app, "payment_list"), ""),
+        ("Nomor elemen", None, ""),  # Enter = kandidat no. 1
         ("[payment_confirm]", None, "LEWATI"),
     ])
     monkeypatch.setitem(cli.calibrate_android.__kwdefaults__, "prompt", user)  # ganti input()
@@ -1160,7 +1203,7 @@ def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monke
                                                          "payment_confirm"]
     assert_ordered(steps)
     assert app.kind("tap") == [] and app.kind("variant") == [], "variasi tidak dipilih oleh alat"
-    assert set(dev.ops()) <= {"dump", "find_all"}
+    assert set(dev.ops()) <= {"dump", "find_all", "shell"}
 
 
 # ------------------------------------------------------------------ ringkasan hasil di konsol
@@ -1195,11 +1238,11 @@ def test_run_android_price_guard_message_keeps_bracketed_product_names(tmp_path,
 
 
 def test_run_android_console_warn_lines_keep_platform_tag(tmp_path, device, term):
-    out = run_cli(tmp_path, device, term, stay_on="0")
+    out = run_cli(tmp_path, device, term)  # tanpa selectors.json kalibrasi -> peringatan "versi vs kalibrasi"
     assert out.rc == 0, out.text
     log = (out.run_dir / "android.log").read_text(encoding="utf-8")
-    assert "[android] WARN precheck layar tetap menyala: PERINGATAN" in log
-    warn_lines = [line for line in out.text.splitlines() if "WARN precheck layar tetap menyala" in line]
+    assert "[android] WARN precheck versi vs kalibrasi: PERINGATAN" in log
+    warn_lines = [line for line in out.text.splitlines() if "WARN precheck versi vs kalibrasi" in line]
     assert warn_lines and all("[android] WARN" in line for line in warn_lines), warn_lines
     # semua baris RunLog di konsol (STEP/INFO/WARN) mempertahankan awalan [android]
     step_lines = [line for line in out.text.splitlines() if " STEP " in line]
