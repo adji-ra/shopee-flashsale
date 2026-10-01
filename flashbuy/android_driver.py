@@ -8,7 +8,12 @@ Semantik selector mengikuti UiSelector uiautomator:
   textContains / ...Contains  substring (case-sensitive)
   textStartsWith              awalan (case-sensitive)
   textMatches / ...Matches    regex Java, harus cocok SELURUH teks (Pattern.matches)
-  resourceId / className      sama persis
+  resourceId / className      sama persis; resourceIdMatches = regex seluruh resource-id
+
+Dua jalur pencarian di server uiautomator2 (dari source u2.jar):
+  exists / info (jalur A)     semua jendela interaktif (urutan antarjendela tidak tentu)
+  find_all = info_list (B)    hanya jendela AKTIF, cache aksesibilitas dibersihkan (SDK >= 34)
+Karena itu elemen di dalam bottom sheet/dialog diambil dari find_all, bukan info.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-SEL_KINDS = ("resourceId", "text", "textContains", "textStartsWith", "textMatches",
+SEL_KINDS = ("resourceId", "resourceIdMatches", "text", "textContains", "textStartsWith", "textMatches",
              "description", "descriptionContains", "descriptionMatches", "className")
 
 
@@ -114,7 +119,7 @@ class AndroidDriver(Protocol):
 
     def current_app(self) -> AppInfo: ...
 
-    def start_url(self, url: str, package: str) -> None: ...  # intent VIEW ke package tertentu
+    def start_url(self, url: str, package: str, wait: bool = True) -> None: ...  # intent VIEW ke package
 
     def swipe_refresh(self) -> None: ...  # tarik-untuk-muat-ulang
 
@@ -138,19 +143,74 @@ class AndroidDriver(Protocol):
 # --------------------------------------------------------------------------- uiautomator2
 
 
+RPC_TIMEOUT_S = 5.0  # batas satu query/klik ke agent (default u2: 300 s, dan timeout socket tidak dipasang)
+SLOW_RPC_TIMEOUT_S = 30.0  # dump/screenshot/shell
+
+
+def _patch_u2_transport() -> None:
+    """Pasang timeout socket per request + TCP_NODELAY pada koneksi HTTP-over-adb uiautomator2.
+
+    u2 3.x menyetel `conn.timeout` tetapi `AdbHTTPConnection.connect` tidak pernah menerapkannya
+    ke socket (default adbutils 600 s), jadi satu RPC yang macet bisa menggantung run.
+    """
+    import socket
+
+    from uiautomator2 import core
+
+    cls = core.AdbHTTPConnection
+    if getattr(cls, "_flashbuy_patched", False):
+        return
+    original = cls.connect
+
+    def connect(self) -> None:
+        original(self)
+        try:
+            if isinstance(self.timeout, (int, float)):
+                self.sock.settimeout(self.timeout)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
+
+    cls.connect = connect
+    cls._flashbuy_patched = True
+
+
+def _disable_implicit_restart(d: Any) -> bool:
+    """u2 me-restart server diam-diam (berdetik-detik) bila RPC gagal; di hot path itu menyembunyikan
+    agent yang dibunuh HiOS. Ganti dengan panggilan langsung: error naik ke runner yang me-restart
+    secara eksplisit dan mencatatnya."""
+    try:
+        from uiautomator2 import core
+
+        dev, port, debug = d._dev, d._device_server_port, d._debug
+    except (ImportError, AttributeError):
+        return False
+
+    def jsonrpc_call(method: str, params: Any = None, timeout: float = RPC_TIMEOUT_S) -> Any:
+        return core._jsonrpc_call(dev, port, method, params, timeout, debug)
+
+    d.jsonrpc_call = jsonrpc_call
+    return True
+
+
 class U2Driver:
     """Implementasi nyata di atas uiautomator2 3.x (tanpa atx-agent)."""
 
-    def __init__(self, serial: str = "", device: Any = None):
+    def __init__(self, serial: str = "", device: Any = None, rpc_timeout_s: float = RPC_TIMEOUT_S):
         if device is None:
             import uiautomator2 as u2
 
             try:
+                _patch_u2_transport()
                 device = u2.connect(serial or None)
             except Exception as e:  # noqa: BLE001 - pesan apa pun dari adb/u2
                 raise DriverError(f"gagal konek ke device {serial or '(pertama)'}: {e}") from e
+            self.no_implicit_restart = _disable_implicit_restart(device)
+        else:
+            self.no_implicit_restart = False
         self.d = device
         self.serial = serial or getattr(device, "serial", "") or ""
+        self.rpc_timeout_s = rpc_timeout_s
         self._size: tuple[int, int] | None = None
 
     def _call(self, what: str, fn: Callable[[], Any]) -> Any:
@@ -163,28 +223,38 @@ class U2Driver:
                 raise
             raise DriverError(f"{what}: {type(e).__name__}: {e}") from e
 
+    def _rpc(self, method: str, *params: Any) -> Any:
+        """Panggil jsonrpc agent dengan timeout per panggilan (bukan 300 s bawaan u2)."""
+        return getattr(self.d.jsonrpc, method)(*params, http_timeout=self.rpc_timeout_s)
+
+    def _selector(self, sel: Sel) -> Any:
+        return self.d(**sel.kwargs()).selector
+
     def exists(self, sel: Sel) -> bool:
-        return bool(self._call(f"exists {sel}", lambda: bool(self.d(**sel.kwargs()).exists)))
+        return bool(self._call(f"exists {sel}", lambda: self._rpc("exist", self._selector(sel))))
 
     def info(self, sel: Sel) -> Node | None:
         def get() -> Node | None:
             try:
-                return Node.from_u2(self.d(**sel.kwargs()).info)
+                node = Node.from_u2(self._rpc("objInfo", self._selector(sel)))
             except Exception as e:  # noqa: BLE001
                 if type(e).__name__ == "UiObjectNotFoundError":
                     return None
                 raise
+            # objInfo bisa jatuh ke jalur B (contains/startsWith tidak peka huruf): cek ulang di klien
+            return node if node_matches(node, sel) else None
 
         return self._call(f"info {sel}", get)
 
     def find_all(self, sel: Sel) -> list[Node]:
         def get() -> list[Node]:
             try:
-                return [Node.from_u2(i) for i in self.d(**sel.kwargs()).info_list()]
+                infos = self._rpc("objInfoOfAllInstances", self._selector(sel)) or []
             except Exception as e:  # noqa: BLE001
                 if type(e).__name__ == "UiObjectNotFoundError":
                     return []
                 raise
+            return [n for n in (Node.from_u2(i) for i in infos) if node_matches(n, sel)]
 
         return self._call(f"find_all {sel}", get)
 
@@ -193,7 +263,7 @@ class U2Driver:
         if node is None:
             return False
         x, y = node.center
-        self._call(f"click {x},{y}", lambda: self.d.click(x, y))
+        self._call(f"click {x},{y}", lambda: self._rpc("click", x, y))
         return True
 
     def get_text(self, sel: Sel) -> str | None:
@@ -204,8 +274,11 @@ class U2Driver:
         info = self._call("app_current", self.d.app_current)
         return AppInfo(info.get("package", ""), info.get("activity", ""))
 
-    def start_url(self, url: str, package: str) -> None:
-        cmd = ["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", url, "-p", package]
+    def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        # -W menunggu activity selesai diluncurkan (boleh saat T-60 s; jangan saat reload polling).
+        # "Warning: Activity not started, ... delivered to currently running top-most instance" bukan error.
+        cmd = ["am", "start", *(["-W"] if wait else []), "-a", "android.intent.action.VIEW", "-d", url,
+               "-p", package]
         out = self.shell(cmd)
         if re.search(r"^Error|unable to resolve|Exception", out, re.M | re.I):
             raise DriverError(f"am start gagal: {out.strip()[:200]}")
@@ -217,7 +290,9 @@ class U2Driver:
 
     def swipe_refresh(self) -> None:
         w, h = self.window_size()
-        self._call("swipe_refresh", lambda: self.d.swipe(w * 0.5, h * 0.30, w * 0.5, h * 0.75, duration=0.12))
+        # tarik pelan (bukan fling) dari 30% ke 75% tinggi layar; koordinat piksel bulat
+        self._call("swipe_refresh", lambda: self.d.swipe(int(w * 0.5), int(h * 0.30), int(w * 0.5), int(h * 0.75),
+                                                         duration=0.3))
 
     def press_back(self) -> None:
         self._call("press back", lambda: self.d.press("back"))
@@ -230,23 +305,33 @@ class U2Driver:
         return Path(path).exists()
 
     def dump(self) -> str:
-        return self._call("dump_hierarchy", self.d.dump_hierarchy)
+        return self._call("dump_hierarchy", self.d.dump_hierarchy)  # hanya kalibrasi/diagnosa/status akhir
 
     def shell(self, cmd: list[str]) -> str:
         res = self._call(f"shell {' '.join(cmd[:3])}", lambda: self.d.shell(cmd, timeout=30))
         return getattr(res, "output", res if isinstance(res, str) else "")
 
     def agent_alive(self) -> bool | None:
+        """/ping hanya membuktikan transport; UiAutomation harus dibuktikan dengan RPC sungguhan."""
         check = getattr(self.d, "_check_alive", None)
         if check is None:
             return None
         try:
-            return bool(check())
+            if not check():
+                return False
+            self._rpc("deviceInfo")
+            return True
         except Exception:  # noqa: BLE001
             return False
 
     def restart_agent(self) -> None:
         def restart() -> None:
+            try:  # server yang bukan milik sesi ini tidak dimatikan stop_uiautomator: minta berhenti via HTTP
+                from uiautomator2 import core
+
+                core._http_request(self.d._dev, self.d._device_server_port, "GET", "/stop", timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
             self.d.stop_uiautomator()
             self.d.start_uiautomator()
 
@@ -333,8 +418,8 @@ class TimedDriver:
     def current_app(self) -> AppInfo:
         return self._timed("current_app", "", self.inner.current_app)
 
-    def start_url(self, url: str, package: str) -> None:
-        return self._timed("start_url", url, lambda: self.inner.start_url(url, package))
+    def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        return self._timed("start_url", url, lambda: self.inner.start_url(url, package, wait))
 
     def swipe_refresh(self) -> None:
         return self._timed("swipe_refresh", "", self.inner.swipe_refresh)
@@ -372,6 +457,8 @@ def node_matches(node: Node, sel: Sel) -> bool:
     by, v = sel.by, sel.value
     if by == "resourceId":
         return node.rid == v
+    if by == "resourceIdMatches":
+        return re.fullmatch(v, node.rid) is not None
     if by == "className":
         return node.cls == v
     if by.startswith("text"):
@@ -395,7 +482,9 @@ class FakeApp(Protocol):
 
     package: str
 
-    def nodes(self) -> list[Node]: ...  # node layar saat ini, urutan dokumen
+    def nodes(self) -> list[Node]: ...  # node semua jendela (jalur A: exists/info), urutan dokumen
+
+    def active_nodes(self) -> list[Node]: ...  # node jendela aktif saja (jalur B: find_all)
 
     def activity(self) -> str: ...
 
@@ -451,7 +540,8 @@ class FakeDriver:
 
     def find_all(self, sel: Sel) -> list[Node]:
         self._rpc("find_all", sel)
-        return self._match(sel)
+        active = getattr(self.app, "active_nodes", self.app.nodes)
+        return [n for n in active() if node_matches(n, sel)]
 
     def click(self, target: Sel | Node) -> bool:
         node = self.info(target) if isinstance(target, Sel) else target
@@ -469,8 +559,8 @@ class FakeDriver:
         self._rpc("current_app")
         return AppInfo(self.app.package, self.app.activity())
 
-    def start_url(self, url: str, package: str) -> None:
-        self._rpc("start_url", url, latency=0.3)
+    def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        self._rpc("start_url", url, latency=0.3 if wait else 0.05)
         self.app.on_intent(url, package)
 
     def swipe_refresh(self) -> None:

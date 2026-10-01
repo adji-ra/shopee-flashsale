@@ -30,21 +30,23 @@ from flashbuy.android_driver import SEL_KINDS, Sel
 PLATFORM = "android"
 
 # Urutan prioritas jenis selector (angka kecil dicoba dulu).
-KIND_RANK = {"resourceId": 0, "text": 1, "textContains": 2, "textStartsWith": 2, "textMatches": 2,
-             "description": 3, "descriptionContains": 4, "descriptionMatches": 4, "className": 5}
+KIND_RANK = {"resourceId": 0, "resourceIdMatches": 0, "text": 1, "textContains": 2, "textStartsWith": 2,
+             "textMatches": 2, "description": 3, "descriptionContains": 4, "descriptionMatches": 4, "className": 5}
 
+# testID React Native di aplikasi Shopee ID muncul sebagai resource-id mentah (tanpa "com.shopee.id:id/").
+# Hanya testID yang terverifikasi di app ID yang jadi default (labelTotalPayment, labelShippingFinalPrice,
+# labelButtonCheckout); testID dari app TH (buttonProductBuyNow, buttonPlaceOrder, buttonCartPanelSubmit)
+# dibiarkan untuk kalibrasi. Teks dicocokkan PERSIS: substring "Beli" tidak aman.
 ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
     # Harga utama di halaman produk. Kosong = heuristik (nominal Rp terlihat dengan tinggi teks terbesar).
     "product_price": [],
     "buy_button": [
         {"text": "Beli Sekarang"},
-        {"textContains": "Beli Sekarang"},
         {"description": "Beli Sekarang"},
     ],
-    # Opsi variasi (di halaman produk atau bottom sheet).
+    # Opsi variasi (di halaman produk atau bottom sheet). Persis: textContains bisa kena judul produk.
     "variant_option": [
         {"text": "{variant}"},
-        {"textContains": "{variant}"},
         {"description": "{variant}"},
     ],
     # Penanda bottom sheet variasi/kuantitas yang muncul setelah klik Beli.
@@ -63,6 +65,7 @@ ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
         {"textStartsWith": "Keranjang Saya"},
     ],
     "cart_checkout": [
+        {"resourceIdMatches": "(.*:id/)?labelButtonCheckout"},
         {"textMatches": "Checkout(\\s*\\(\\d+\\))?"},
         {"textStartsWith": "Checkout"},
         {"description": "Checkout"},
@@ -86,6 +89,18 @@ ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
         {"text": "Buat Pesanan"},
         {"description": "Buat Pesanan"},
     ],
+    # Nilai "Total Pembayaran" & ongkir di checkout (dibaca langsung bila ada; selain itu dipasangkan
+    # dari label di layar).
+    "checkout_total": [
+        {"resourceIdMatches": "(.*:id/)?labelTotalPayment"},
+    ],
+    "checkout_shipping": [
+        {"resourceIdMatches": "(.*:id/)?labelShippingFinalPrice"},
+    ],
+    # Layar PIN ShopeePay (id native terverifikasi di app TH; teks Indonesia belum terverifikasi).
+    "pin_screen": [
+        {"resourceIdMatches": ".*:id/(payment_password_field|keyboard_number_view)"},
+    ],
 }
 
 # Regex penanda status layar (dicocokkan ke SELURUH teks satu elemen: textMatches/descriptionMatches).
@@ -93,11 +108,11 @@ ANDROID_DEFAULT_MARKERS: dict[str, list[str]] = {
     "captcha": [
         r"(?is).*\bcaptcha\b.*",
         r"(?is).*geser untuk (menyelesaikan|verifikasi|melanjutkan).*",
-        r"(?is).*(bukan robot|selesaikan puzzle|verifikasi keamanan).*",
+        r"(?is).*(bukan robot|puzzle|verifikasi keamanan).*",
     ],
     "verification": [
-        r"(?is).*aktivitas (yang )?(tidak biasa|mencurigakan).*",
-        r"(?is).*(kode verifikasi|masukkan (kode )?otp|verifikasi (akun|identitas|diperlukan)).*",
+        r"(?is).*aktivitas (yang )?(tidak biasa|tidak wajar|mencurigakan).*",
+        r"(?is).*(kode verifikasi|\botp\b|verifikasi (akun|identitas|diperlukan)).*",
     ],
     "login": [
         r"(?is)(log ?in|masuk)( dengan .*)?",
@@ -105,7 +120,7 @@ ANDROID_DEFAULT_MARKERS: dict[str, list[str]] = {
     ],
     "pin": [
         r"(?is).*masukkan pin.*",
-        r"(?is).*pin shopeepay.*",
+        r"(?is).*(pin shopeepay|shopeepay pin).*",
     ],
     "sold_out": [
         r"(?is)(stok )?habis",
@@ -168,6 +183,20 @@ def scoped(pattern: str) -> str:
 
 def union(patterns: list[str]) -> str:
     return "|".join(scoped(p) for p in patterns)
+
+
+def text_regex(sel: Sel) -> str | None:
+    """Selector jenis teks -> regex `textMatches` setara (untuk digabung jadi satu query). Lainnya None."""
+    v = sel.value
+    if sel.by == "text":
+        return re.escape(v)
+    if sel.by == "textContains":
+        return f"(?s:.*{re.escape(v)}.*)"
+    if sel.by == "textStartsWith":
+        return f"(?s:{re.escape(v)}.*)"
+    if sel.by == "textMatches":
+        return v
+    return None
 
 
 def to_sel(cand: dict, variant: str | None = None) -> Sel | None:
