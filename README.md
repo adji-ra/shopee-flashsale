@@ -13,7 +13,7 @@ dibuka, memakai **1 akun milik sendiri**, lewat UI seperti manusia. Ada dua jalu
 | 1 | `timesync`, `config`, CLI `timesync` | ✅ |
 | 2 | `web_runner` (dry-run & live), `guards`, `notifier`, `calibrate`/`login`/`precheck`/`run` web, mock Shopee | ✅ |
 | 2.1 | `pricing` (pengaman harga 3 lapis), deteksi captcha non-dialog, `UNKNOWN_STATE`, reload T+0,5 s | ✅ |
-| 3 | `android_runner`, kalibrasi Android | ⏳ |
+| 3 | `android_runner` (dry-run & live) di atas device palsu, kalibrasi/precheck/run Android, koreksi live web | ✅ (perlu kalibrasi di HP asli) |
 | 4 | `orchestrator` (paralel + lock pemenang) | ⏳ |
 
 ## Batasan keras (tertanam di kode, bukan opsi)
@@ -22,7 +22,14 @@ dibuka, memakai **1 akun milik sendiri**, lewat UI seperti manusia. Ada dua jalu
 - Tidak ada captcha solver, bypass/evasion anti-bot, spoof fingerprint/device, stealth plugin,
   patch `navigator.webdriver`, atau pemanggilan API privat Shopee. Semua interaksi lewat UI.
 - Captcha / verifikasi / OTP / slider / "aktivitas tidak biasa": **semua runner STOP**,
-  alarm berbunyi, tidak ada retry otomatis. Browser dibiarkan terbuka.
+  alarm berbunyi, tidak ada retry otomatis. Halaman/layar captcha dibiarkan apa adanya untuk
+  diselesaikan manual.
+- Mode **live**: browser **tidak pernah ditutup otomatis**, apa pun hasilnya (termasuk error);
+  Anda yang menutupnya. Aplikasi Android **tidak pernah** ditutup/di-force-stop alat. Dry-run boleh
+  menutup browser (kecuali captcha/verifikasi/login).
+- `--live` **wajib** `expected_name` (ditolak CLI & runner bila kosong).
+- Setelah "Buat Pesanan" diklik tetapi layar PIN tidak muncul: `UNKNOWN_STATE` (semua runner
+  stop, alarm) dengan pesan **"Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"**.
 - PIN ShopeePay tidak disimpan dan tidak diketik alat. Config menolak kunci tak dikenal (mis. `pin:`).
 - Rate limit **polling & retry** (klik ulang Beli, reload): maks 1 aksi / 400 ms (dipakai 425 ms
   untuk menyerap jitter), hanya di jendela **T-1 s s.d. T+8 s**.
@@ -57,13 +64,18 @@ Batas harga wajib diisi (Rupiah bulat):
 |---|---|
 | `max_item_price` | harga satuan maksimum yang boleh dibeli (harga flash), > 0 |
 | `max_total` | "Total Pembayaran" maksimum termasuk ongkir & biaya layanan, ≥ `max_item_price` |
-| `expected_name` | opsional, potongan nama produk (tidak peka huruf besar/kecil) |
+| `expected_name` | potongan nama produk (tidak peka huruf besar/kecil); opsional untuk dry-run, **wajib untuk `--live`** |
+
+Bagian `android`: `serial` (kosong = device pertama), `package` (default `com.shopee.id`), dan
+`reload` = `swipe` (tarik-untuk-muat-ulang, default) atau `intent` (buka ulang URL produk lewat
+intent VIEW) untuk reload halaman produk saat polling. Pilih yang terbukti memuat ulang harga
+saat dry-run di HP Anda.
 
 ## Pengaman harga (3 lapis, fail-closed)
 
 Saat stok flash habis, atau saat klik terjadi sebelum slot dibuka, Shopee menampilkan harga
 normal dengan tombol "Beli Sekarang" tetap aktif. Alat tidak boleh lanjut dengan harga itu.
-Keputusan ada di `flashbuy/pricing.py`, modul bersama yang nanti dipakai juga oleh Android.
+Keputusan ada di `flashbuy/pricing.py`, modul bersama jalur web dan Android.
 Nilai yang tidak terbaca dengan yakin dianggap **gagal**, bukan 0. Harga coret selalu diabaikan.
 
 1. **Halaman produk** (di loop polling). Klik Beli hanya jika tombol aktif **dan** harga tampil
@@ -227,6 +239,109 @@ Skenario yang tersedia:
 - `static_ui`
 - `cart_other_checked`
 - `unknown_page`
+
+## Alur pemakaian Android (aplikasi Shopee, uiautomator2)
+
+### 0. Siapkan HP (Tecno Spark / HiOS)
+
+1. **Aktifkan Opsi Pengembang**: Setelan → Tentang ponsel → ketuk *Nomor build* 7×.
+2. Di Opsi Pengembang aktifkan **USB debugging** dan **Tetap aktif** (layar tidak mati saat diisi
+   daya). Bila ada, aktifkan juga *USB debugging (Setelan keamanan)* / *Nonaktifkan pemantauan izin*.
+3. Hubungkan USB ke laptop, terima dialog sidik jari RSA di HP, lalu cek:
+   ```powershell
+   adb devices                      # serial harus berstatus "device"
+   python -m uiautomator2 init      # pasang agent u2.jar (+ IME, tidak dipakai alat)
+   python -m uiautomator2 doctor    # "uiautomator2 is OK"
+   ```
+4. HiOS agresif mematikan proses latar. Matikan optimasi baterai/aktifkan *Auto-start* untuk
+   Shopee, kunci aplikasi Shopee di daftar aplikasi terbaru, dan jangan biarkan layar terkunci.
+   Agent uiautomator2 yang mati dideteksi saat precheck, saat arm, dan tiap 2 s sampai T-3 s,
+   lalu dihidupkan ulang otomatis (dicatat di log). Saat polling, query yang gagal karena agent
+   mati memicu restart (maks 2×).
+
+### 1. Login manual di aplikasi
+
+```powershell
+python -m flashbuy login --platform android --config target.yaml
+```
+
+Aplikasi Shopee dibuka di HP. Login sendiri (termasuk OTP) dan pastikan ShopeePay aktif. Alat
+tidak mengetik dan tidak menyimpan apa pun.
+
+### 2. Kalibrasi (produk biasa yang murah)
+
+```powershell
+python -m flashbuy calibrate --platform android --config target.yaml
+```
+
+**Anda yang men-tap HP; alat hanya membaca layar** (dump hierarki, khusus kalibrasi) sehingga
+"Buat Pesanan" tidak mungkin ditekan alat. Tiap langkah: buka layar yang diminta, tekan Enter.
+Alat mengenali elemen lewat teks default; bila tidak dikenali, ketik teks yang terlihat. Urutan:
+Beli Sekarang → harga (opsional, hanya resourceId/desc) → bottom sheet (penanda "Jumlah",
+variasi, tombol konfirmasi) → checkout ("Buat Pesanan", JANGAN ditekan; baris "Metode
+Pembayaran") → daftar metode (ShopeePay, Konfirmasi). Kandidat disimpan terurut
+`resourceId → text → textContains → description` setelah diverifikasi di device, ke bagian
+`android` di `selectors.json` (bagian `web` tidak disentuh, versi lama di-backup).
+
+Default tanpa kalibrasi (teks Bahasa Indonesia) ada di `flashbuy/android_selectors.py`, termasuk
+penanda status (`markers`: captcha, verifikasi, login, PIN, habis, belum mulai) yang bisa ditambah
+lewat `selectors.json` → `android.markers` (regex, cocok seluruh teks satu elemen).
+
+### 3. Pre-check
+
+```powershell
+python -m flashbuy precheck --config target.yaml --only android
+```
+
+- Membaca dan mencatat info device: `getprop` (merek, model, versi Android, SDK, build, versi
+  HiOS) dan `wm size`/`wm density`. Tidak ada asumsi versi atau resolusi.
+- Agent uiautomator2 hidup (mati → dihidupkan ulang + peringatan).
+- Layar menyala dan tidak terkunci; peringatan bila *Tetap aktif* mati.
+- Aplikasi Shopee terpasang (versi dicatat).
+- Halaman produk terbuka lewat intent tanpa diminta login, tombol Beli ditemukan, harga terbaca.
+- Latensi query: 10× `exists` + 3× `info`; peringatan bila p95 > 100 ms. Semua sampel ada di
+  `logs/<run>/android-queries-precheck.csv`.
+- Alamat default ("Utama") dan saldo ShopeePay dibaca dari UI. Tidak terbaca = peringatan saja.
+
+### 4. Dry-run lalu live
+
+```powershell
+python -m flashbuy run --config target.yaml --only android            # DRY-RUN
+python -m flashbuy run --config target.yaml --only android --live     # pesanan sungguhan
+```
+
+Jadwal sama dengan web: pre-check T-10 mnt, resync T-2 mnt, arm T-60 s, polling dari T-lead.
+
+| Waktu | Aksi |
+|---|---|
+| T-60 s | buka produk lewat intent VIEW (`am start -a VIEW -d <url> -p com.shopee.id`), tunggu halaman produk, pilih variasi lebih awal bila opsinya tampil di halaman |
+| T-lead | polling: tombol Beli aktif **dan** harga ≤ `max_item_price` (lapis 1) → klik, lewat RateLimiter (≥ 425 ms) di jendela T-1 s..T+8 s |
+| T+0,5 s | belum siap → reload (`android.reload`), lalu tiap 2 s; terhitung aksi polling |
+| setelah Beli | bottom sheet variasi/jumlah: pilih variasi, konfirmasi (sekali) → checkout, atau keranjang (lapis 2 hanya bila layar keranjang muncul) |
+| checkout | pastikan ShopeePay (ganti lewat "Metode Pembayaran" bila perlu) → lapis 3 → DRY-RUN berhenti / LIVE klik "Buat Pesanan" → layar PIN → alarm |
+
+Setiap iterasi **mengklasifikasi layar dulu, lalu bertindak** (produk, bottom sheet,
+keranjang, checkout, PIN, habis, captcha/verifikasi, login, loading, aplikasi lain, tak dikenal).
+
+Kecepatan:
+- Hot path memakai query selector di device (`d(...).info`, satu query gabungan `textMatches`
+  untuk harga + penanda status, klik koordinat), **bukan** `dump_hierarchy`. Dump hanya untuk
+  kalibrasi, diagnosa layar tak dikenal, dan status akhir (`android-<ts>-<status>.xml`).
+- Latensi tiap query diukur dan ditulis setelah run ke log (ringkasan median/p95/maks) dan
+  `android-queries-run.csv`. Query > 100 ms diberi peringatan.
+- Tidak ada sleep tetap; semua penantian berbasis kondisi + timeout. Indikator loading
+  (ProgressBar) setelah klik ditunggu sampai batas 30 s, tidak dianggap "tak dikenal".
+
+Pembacaan harga di aplikasi (aksesibilitas Android tidak memberi tahu teks yang dicoret):
+- harga produk: nominal Rp dengan tinggi teks terbesar (harga flash biasanya paling besar);
+- checkout: harga pada baris yang sama dengan penanda "x1" (harga coret sebaris yang lebih kecil
+  diabaikan; bila seri, diambil yang terbesar), label "Total Pembayaran"/"Subtotal Pengiriman"
+  dipasangkan dengan nilai di kanannya atau tepat di bawahnya;
+- keranjang: baris per checkbox.
+Bila tampilan asli berbeda, hasilnya `PRICE_GUARD` (aman). Kalibrasi `product_price` dengan
+resourceId bila heuristik salah memilih.
+
+Aplikasi tidak pernah ditutup alat. Captcha/verifikasi/PIN dibiarkan di layar untuk Anda.
 
 ## Sinkronisasi waktu
 
