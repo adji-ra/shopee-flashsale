@@ -397,17 +397,25 @@ def test_polling_hot_path_uses_single_object_queries_only(tmp_path, scenario):
     assert clears == ([len(window) - 2] if click is not None else []), clears
     if click is not None:
         assert window[-1][1] == "info_any", window[-3:]
-    queries = [(op, target) for _, op, target in window if op not in ("swipe_refresh", "start_url", "clear_toast")]
-    one_object = SINGLE_OBJECT_OPS | {"info_any"}  # info_any = satu objek tanpa batas package (dialog crash/ANR)
+    # reload ditandai (bukan kueri): tepat sebelum reload ada satu cek dialog crash/ANR (info_any)
+    queries = [("reload", "") if op in ("swipe_refresh", "start_url") else (op, target)
+               for _, op, target in window if op != "clear_toast"]
+    one_object = SINGLE_OBJECT_OPS | {"info_any", "reload"}  # info_any = satu objek tanpa batas package
     assert {op for op, _ in queries} <= one_object, {op for op, _ in queries} - one_object
     # setiap iterasi diawali info tombol Beli, diikuti paling banyak 3 kueri satu objek (bahaya, harga, sheet);
-    # iterasi dengan cek pra-klik +3 (content-desc bahaya, dialog sistem, sheet), dan cek itu berjarak >= 0,5 s
+    # iterasi dengan cek pra-klik +3 (content-desc bahaya, dialog sistem, sheet), dan cek itu berjarak >= 0,5 s;
+    # iterasi yang diakhiri reload +1 (cek dialog sebelum reload)
     starts = [i for i, (_, target) in enumerate(queries) if target == BUY_SEL]
     assert len(starts) >= 3, queries[:6]
     for a, b in zip(starts, starts[1:], strict=False):
-        guard = any(t.startswith("descriptionMatches") for _, t in queries[a:b])
-        assert b - a - 1 <= (6 if guard else 3), queries[a:b]
-        assert guard == any(op == "info_any" for op, _ in queries[a:b]), queries[a:b]
+        it = queries[a:b]
+        guard = any(t.startswith("descriptionMatches") for _, t in it)
+        reload = [i for i, (op, _) in enumerate(it) if op == "reload"]
+        assert len(reload) <= 1, it
+        if reload:
+            assert it[reload[0] - 1][0] == "info_any", it
+        assert len(it) - 1 - 2 * len(reload) <= (6 if guard else 3), it
+        assert sum(op == "info_any" for op, _ in it) == int(guard) + len(reload), it
     guards = [t for t, op, target in window if target.startswith("descriptionMatches")]
     assert guards and all(b - a >= 500 for a, b in zip(guards, guards[1:], strict=False)), guards
     if click is None:

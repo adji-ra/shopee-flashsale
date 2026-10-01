@@ -302,8 +302,9 @@ Tiap langkah:
 2. Alat mengambil dump dan menampilkan **kandidat bernomor** yang cocok dengan kata kunci langkah
    (teks / content-desc / resourceId / bounds), elemen di jendela aktif lebih dulu, mis.
    `1. teks='Beli Sekarang' id=com.shopee.id:id/buy bounds=[360,1500][720,1612] klik`.
-3. Ketik nomornya (Enter = 1; teks lain = cari elemen bertulisan itu; `u` = baca ulang layar;
-   `lewati` untuk langkah opsional).
+3. Ketik nomornya (Enter = 1; teks lain, termasuk teks pendek seperti variasi `S`, = cari elemen
+   bertulisan itu; `u` = baca ulang layar; `lewati` untuk langkah opsional). Kata kunci variasi dicocokkan
+   per kata dan tidak ke awalan resourceId `com.shopee.id:id/`.
 4. Alat menyusun selector (`resourceId → text → textContains → description`) dan **hanya menyimpan
    yang unik**: tepat satu elemen cocok di dump (semua jendela) dan di device, dan itu elemen yang
    dipilih. "Buat Pesanan" diverifikasi dari dump saja.
@@ -312,7 +313,8 @@ Urutan: Beli Sekarang → harga (opsional, hanya resourceId/desc) → bottom she
 variasi, tombol konfirmasi) → checkout ("Buat Pesanan", JANGAN ditekan; baris "Metode Pembayaran") →
 daftar metode (ShopeePay, Konfirmasi). Hasil disimpan ke bagian `android` di `selectors.json` bersama
 **versi aplikasi Shopee dan resolusi layar** (`calibrated.app_version`, `calibrated.wm_size`); bagian
-`web` tidak disentuh, versi lama di-backup.
+`web` tidak disentuh, versi lama di-backup. Versi/resolusi yang gagal dibaca (adb putus sesaat) disimpan
+kosong dengan peringatan; hasil kalibrasi tetap tersimpan.
 
 Default tanpa kalibrasi (teks Bahasa Indonesia) ada di `flashbuy/android_selectors.py`, termasuk
 penanda status (`markers`: captcha, verifikasi, login, PIN, habis, belum mulai) yang bisa ditambah
@@ -329,15 +331,17 @@ python -m flashbuy precheck --config target.yaml --only android
 - Agent uiautomator2 hidup **dan responsif**: 3 query berturut-turut masing-masing < 1 s. Mati atau
   lambat → dihidupkan ulang sekali (peringatan); masih gagal → `ERROR`, run berhenti.
 - Layar menyala dan tidak terkunci. Saat `run`: `svc power stayon usb` selama run, nilai
-  `stay_on_while_plugged_in` lama dikembalikan setelah run selesai (apa pun hasilnya).
-- Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi, atau tidak terbaca
-  sehingga tidak bisa dibandingkan → **PERINGATAN KERAS** + alarm (run tidak dihentikan; kalibrasi ulang +
-  dry-run dulu).
+  `stay_on_while_plugged_in` lama dikembalikan setelah run selesai (apa pun hasilnya, juga saat Ctrl+C di
+  tengah precheck). Gagal dikembalikan → alarm + petunjuk mengembalikan manual.
+- Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi, tidak terbaca, atau
+  kalibrasi lama tanpa versi tercatat, sehingga tidak bisa dibandingkan → **PERINGATAN KERAS** + alarm (run
+  tidak dihentikan; kalibrasi ulang + dry-run dulu).
 - Halaman produk terbuka lewat intent tanpa diminta login, tombol Beli ditemukan, harga terbaca.
 - Latensi query: 10× `exists` + 3× `info`; peringatan bila p95 > 100 ms. Semua sampel ada di
   `logs/<run>/android-queries-precheck.csv`.
 - Alamat default ("Utama") dan saldo ShopeePay dibaca dari UI. Tidak terbaca / tidak ada / saldo
-  kurang → **alarm saja** (PERINGATAN), run tidak dihentikan.
+  kurang → **alarm saja** (PERINGATAN), run tidak dihentikan. Captcha/verifikasi di halaman itu (teks,
+  content-desc, activity verifikasi, aplikasi asing di depan) → stop.
 
 ### 4. Dry-run lalu live
 
@@ -355,7 +359,7 @@ Jadwal sama dengan web: pre-check T-10 mnt, resync T-2 mnt, arm T-60 s, polling 
 |---|---|
 | T-60 s | buka produk lewat intent VIEW (`am start -a VIEW -d <url> -p com.shopee.id`), tunggu halaman produk, pilih variasi lebih awal bila opsinya tampil di halaman |
 | T-lead | polling: tombol Beli aktif **dan** harga ≤ `max_item_price` (lapis 1) → klik, lewat RateLimiter (≥ 425 ms) di jendela T-1 s..T+8 s |
-| T+0,5 s | belum siap → reload (`android.reload`: swipe-down atau buka ulang intent), lalu tiap 2 s (dihitung dari awal reload); aksi polling. Variasi yang dipilih di halaman produk diperiksa lagi dan dipilih ulang lewat gate bila terlepas |
+| T+0,5 s | belum siap (termasuk halaman galat "Gagal memuat" tanpa tombol Beli) → reload (`android.reload`: swipe-down atau buka ulang intent), lalu tiap 2 s (dihitung dari awal reload); aksi polling, tidak dikirim selama dialog ANR tampil. Variasi yang dipilih di halaman produk diperiksa lagi dan dipilih ulang lewat gate bila terlepas |
 | setelah Beli | bottom sheet variasi/jumlah: pilih variasi, konfirmasi (sekali) → checkout, atau keranjang (lapis 2 hanya bila layar keranjang muncul) |
 | checkout | pastikan ShopeePay (ganti lewat "Metode Pembayaran" bila perlu) → lapis 3 → DRY-RUN berhenti / LIVE klik "Buat Pesanan" → layar PIN → alarm |
 
@@ -367,14 +371,19 @@ package/activity di depan:
 - **CAPTCHA/VERIFICATION** (stop semua runner, alarm, tanpa retry): teks verifikasi pendek di
   dialog/bottom sheet/toast (teks panjang = deskripsi produk diabaikan), juga di content-desc; WebView
   Shopee tanpa elemen yang dikenali; activity Shopee bernama captcha/verifikasi; aplikasi/activity asing
-  selain `com.shopee.id` dan dialog sistem yang dikenal.
-- **UNKNOWN**: Shopee keluar dari foreground (launcher), crash, dialog ANR/crash di atas Shopee (dicek tanpa
-  batas package, berkala tiap ≤ 0,5 s dan **tepat sebelum setiap tap yang mengikat**: Beli, pilih ulang
-  variasi, Checkout keranjang, konfirmasi sheet, "Buat Pesanan"; selama dialog tampil tidak ada tap, juga saat
-  menunggu layar PIN), telepon/keyboard/Phone Master di depan, atau
-  layar tak dikenal. UNKNOWN > 1,5 s → `UNKNOWN_STATE`: dump + screenshot + activity disimpan, alarm,
-  tanpa retry. Indikator loading ditunggu, tetapi > 10 s → `UNKNOWN_STATE`. Setelah "Buat Pesanan"
-  pesannya "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual".
+  selain `com.shopee.id` dan dialog sistem yang dikenal. Setelah klik, halaman Shopee yang tidak berubah
+  atau spinner > 0,5 s juga dicek package di depan: jendela asing berbentuk dialog (halaman di bawahnya
+  tetap terbaca) → VERIFICATION, tanpa klik ulang di atasnya.
+- **UNKNOWN**: Shopee keluar dari foreground (launcher), crash, dialog ANR/crash di atas Shopee (dicari di
+  luar package Shopee dan SystemUI, jadi judul produk/ulasan "tidak merespons" dan notifikasi bukan dialog;
+  berkala tiap ≤ 0,5 s dan **tepat sebelum setiap tap**: Beli, reload, pilih/pilih ulang variasi, konfirmasi
+  sheet, centang keranjang, Checkout keranjang, metode bayar, "Buat Pesanan"; selama dialog tampil tidak ada
+  tap, juga saat menunggu layar PIN), telepon/keyboard/Phone Master di depan, atau layar tak dikenal.
+  UNKNOWN > 1,5 s → `UNKNOWN_STATE`: dump + screenshot + activity disimpan, alarm, tanpa retry. Bacaan
+  langkah maju yang mengenali layarnya mereset jaring ini (dialog yang sudah hilang tidak ikut dihitung).
+  Indikator loading ditunggu, tetapi > 10 s (juga bila berselang-seling dengan layar kosong/tombol Beli)
+  → `UNKNOWN_STATE`. Setelah "Buat Pesanan" pesannya "Pesanan MUNGKIN sudah terbuat — cek status pesanan
+  manual"; layar PIN yang judulnya hanya content-desc tetap dikenali sebagai layar PIN.
 
 Kecepatan:
 - Hot path hanya memakai query satu-elemen di device (`info`/`exists`, satu pencarian pohon):
@@ -395,12 +404,13 @@ Kecepatan:
   agent implisit u2 dimatikan: agent yang dibunuh HiOS terlihat sebagai error, lalu di-restart
   eksplisit (tercatat, maks 2× saat polling). Query dibatasi ke package `com.shopee.id`.
 - Tidak ada sleep tetap; semua penantian berbasis kondisi + timeout. Indikator loading
-  (ProgressBar) setelah klik ditunggu sampai batas 30 s; layar tak dikenal tidak pernah memicu
+  (ProgressBar) setelah klik ditunggu sampai batas 10 s; layar tak dikenal tidak pernah memicu
   klik ulang/reload, hanya jaring `UNKNOWN_STATE` (1,5 s).
 
 Keamanan klik:
 - Klik ulang Beli, konfirmasi ulang di bottom sheet, dan reload = aksi polling (≥ 425 ms, jendela
-  T-1..T+8 s). Reload dihitung dari saat gestur/intent **selesai**.
+  T-1..T+8 s, dicek lagi tepat sebelum tap). Jarak dihitung dari saat tap/gestur/intent **selesai**, jadi
+  RPC lambat sebelum tap tidak memperpendeknya. Konfirmasi ulang yang ditahan dialog tidak dihitung klik.
 - Bila sempat menunggu slot, tombol Beli dibaca ulang tepat sebelum diklik (layar bisa sudah
   berganti ke checkout; koordinat lama tidak pernah dipakai).
 - Toast lama dibersihkan (`clearLastToast`) **sebelum** klik Beli/konfirmasi/"Buat Pesanan", jadi toast
@@ -412,7 +422,7 @@ Keamanan klik:
   ulang sekali lewat gate (aksi polling; chip dibaca ulang setelah slot, bottom sheet yang ikut terbuka
   ditutup) sebelum harga lapis 1 dibaca. Lapis 3 tetap memverifikasi variasi di checkout.
 - Sebelum konfirmasi bottom sheet: cek captcha/verifikasi (content-desc selalu, teks bila sempat memilih
-  variasi).
+  variasi atau konfirmasi ulang setelah menunggu slot).
 - Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"
   (`UNKNOWN_STATE` + pesan wajib + alarm).
 
@@ -452,13 +462,13 @@ python -m flashbuy timesync [--samples 5] [--ntp-host id.pool.ntp.org] [--url ht
 
 ## Tes
 
-`python -m pytest -q` menjalankan 1186 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
+`python -m pytest -q` menjalankan 1226 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
 headless, kalibrasi dengan Alt+klik yang disimulasikan, dan jalur Android di atas device palsu
 (`FakeDriver` + `tests/fake_android.py`, jam virtual) termasuk CLI, kalibrasi, pengaman harga, dan
 skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet, dialog ANR, aplikasi asing).
-Jumlahnya besar karena parametrisasi: 489 fungsi tes, 188 di antaranya `@pytest.mark.parametrize`
+Jumlahnya besar karena parametrisasi: 515 fungsi tes, 198 di antaranya `@pytest.mark.parametrize`
 (misalnya setiap skenario dijalankan dry-run dan live, serta untuk kedua mode refresh) yang
-menghasilkan 885 kasus. Setiap run Android juga memeriksa invarian otomatis (0 klik "Buat Pesanan"
+menghasilkan 909 kasus. Setiap run Android juga memeriksa invarian otomatis (0 klik "Buat Pesanan"
 saat dry-run, ≤ 1 pesanan saat live, polling di dalam jendela dan berjarak ≥ 400 ms).
 `FLASHBUY_HEADED=1` menjalankan browser headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`).
 Lint: `ruff check flashbuy tests`.

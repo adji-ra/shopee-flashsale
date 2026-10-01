@@ -15,11 +15,12 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from flashbuy.android_driver import AndroidDriver, Node, Sel, node_matches
+from flashbuy.android_driver import AndroidDriver, DriverError, Node, Sel, node_matches
 from flashbuy.android_screen import is_price, parse_dump
 from flashbuy.android_selectors import AndroidSelectors, order_candidates
 
 MAX_LISTED = 15  # kandidat yang ditampilkan per langkah
+SKIP_WORDS = ("lewati", "skip")
 
 
 @dataclass(frozen=True)
@@ -126,16 +127,25 @@ class AndroidCalibrator:
         return res
 
     def device_meta(self) -> dict[str, str]:
-        """Versi aplikasi Shopee & resolusi layar saat kalibrasi (dibandingkan saat precheck)."""
+        """Versi aplikasi Shopee & resolusi layar saat kalibrasi (dibandingkan saat precheck). Gagal dibaca (adb
+        putus sesaat) -> '' + peringatan: hasil kalibrasi tetap disimpan, precheck memberi PERINGATAN KERAS."""
         package = getattr(self.d, "package", None) or "com.shopee.id"
-        ver = re.search(r"versionName=(\S+)", self.d.shell(["dumpsys", "package", package]))
-        size = self.d.shell(["wm", "size"]).strip().replace("\n", "; ")
+
+        def read(cmd: list[str], what: str) -> str:
+            try:
+                return self.d.shell(cmd)
+            except DriverError as e:
+                self.say(f"  ! {what} tidak terbaca ({e}); disimpan kosong")
+                return ""
+
+        ver = re.search(r"versionName=(\S+)", read(["dumpsys", "package", package], "versi Shopee"))
+        size = read(["wm", "size"], "resolusi layar").strip().replace("\n", "; ")
         return {"app_version": ver.group(1) if ver else "", "wm_size": size}
 
     def _calibrate(self, step: CalStep, res: AndroidCalResult) -> list[dict]:
         while True:
             answer = self.prompt(f"[{step.key}] {step.instruction}\n  Enter bila siap (atau 'lewati'): ").strip()
-            if answer.lower() in ("lewati", "skip", "s"):
+            if answer.lower() in (*SKIP_WORDS, "s"):  # di sini tidak ada pencarian teks: "s" = lewati
                 return []
             nodes = parse_dump(self.d.dump())
             node = self._choose(step, nodes)
@@ -154,20 +164,22 @@ class AndroidCalibrator:
     def _listed(self, step: CalStep, nodes: list[Node], query: str | None = None) -> list[Node]:
         """Kandidat: cocok selector default langkah dulu, lalu kata kunci (atau teks ketikan) di teks/desc/id."""
         if query is not None:
-            keys = (query.lower(),)
-        else:
-            keys = tuple(k.replace("{variant}", (self.variant or "").lower()) for k in step.keywords)
+            keys = [re.compile(re.escape(query.lower()))]
+        else:  # variasi (mis. "S", "M") dicocokkan per kata, bukan potongan teks lain
+            keys = [re.compile(rf"\b{re.escape(self.variant.lower())}\b" if k == "{variant}" else re.escape(k))
+                    for k in step.keywords if k and (k != "{variant}" or self.variant)]
         out: list[Node] = []
         if query is None:
             for sel in self.sel.candidates(step.key, self.variant):
                 out += [n for n in nodes if node_matches(n, sel) and n not in out]
         for n in nodes:
-            hay = f"{n.text}\n{n.desc}\n{n.rid}".lower()
-            if n not in out and (n.text or n.desc or n.rid) and any(k and k in hay for k in keys):
+            # resourceId tanpa awalan package ("com.shopee.id:id/"): kata kunci pendek tidak cocok ke semua id
+            hay = f"{n.text}\n{n.desc}\n{n.rid.split(':id/')[-1]}".lower()
+            if n not in out and (n.text or n.desc or n.rid) and any(k.search(hay) for k in keys):
                 out.append(n)
         if step.dynamic_text and query is None:
             out = [n for n in out if n.rid or n.desc or is_price(n)]
-        return self._rank(step, out)[:MAX_LISTED]
+        return self._rank(step, out[:MAX_LISTED])  # query device untuk peringkat dibatasi MAX_LISTED elemen
 
     def _rank(self, step: CalStep, nodes: list[Node]) -> list[Node]:
         """Elemen di jendela AKTIF dulu (mis. konfirmasi bottom sheet, bukan tombol Beli halaman produk di
@@ -202,7 +214,7 @@ class AndroidCalibrator:
             answer = self.prompt("  Nomor elemen (Enter = 1; teks lain = cari teks itu; 'u' = baca ulang layar; "
                                  "'lewati'): ").strip()
             low = answer.lower()
-            if low in ("lewati", "skip", "s"):
+            if low in SKIP_WORDS:  # bukan "s": teks pendek (mis. variasi "S") = cari teks itu
                 return "skip"
             if low in ("u", "ulang"):
                 return None

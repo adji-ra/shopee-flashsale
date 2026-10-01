@@ -130,7 +130,8 @@ def _loose_match(text: str | None) -> str | None:
 
 
 # Dialog sistem saat aplikasi crash / tidak merespons (ANR): jendela package "android" di atas Shopee, jadi
-# dicari tanpa batas package (info_any). Teks Indonesia & Inggris.
+# dicari tanpa batas package (info_any) KECUALI node Shopee sendiri (judul produk/ulasan "penjual tidak
+# merespons") dan SystemUI (notifikasi heads-up). Teks Indonesia & Inggris.
 SYSTEM_DIALOG_MATCH = (r"(?is)(?=.{1,120}$).*(tidak merespons|tidak menanggapi|isn.t responding|not responding|"
                        r"telah berhenti|terus berhenti|berhenti bekerja|has stopped|keeps stopping).*")
 # Activity Shopee yang namanya menunjukkan verifikasi/captcha (bila tak ada elemen dikenal di layar).
@@ -246,7 +247,10 @@ class AndroidRunner:
         self._markers = {name: selectors.marker_re(name) for name in selectors.markers}
         self._ended = tuple(p for p in selectors.marker("sold_out") if "berakhir" in p.lower())
         self._guard_at = float("-inf")
-        self._fg: tuple[float, AppInfo | None, str, bool] | None = None  # (waktu, app di depan, error, WebView)
+        # (waktu, app di depan, error, WebView Shopee | None = belum dicek)
+        self._fg: tuple[float, AppInfo | None, str, bool | None] | None = None
+        self._stay_lock = threading.Lock()  # svc stayon (thread precheck) vs pengembalian di close()
+        self._front_blocked = False  # aplikasi lain di depan pada cek terakhir: cek berikutnya tanpa cache
         self._dialog_logged = ""
         self.hold_screen_on = False  # run: svc power stayon usb selama run (diset CLI), dikembalikan di close()
         self._stay_restore: str | None = None  # nilai stay_on_while_plugged_in sebelum run
@@ -322,8 +326,7 @@ class AndroidRunner:
     async def close(self) -> None:
         """Tidak menutup aplikasi apa pun; hanya menghentikan cek agent dan mengembalikan pengaturan layar."""
         self._stop_keepalive()
-        if self._stay_restore is not None:
-            await asyncio.to_thread(self._restore_stay_awake)
+        await asyncio.to_thread(self._restore_stay_awake)
 
     def _checkpoint(self) -> None:
         if self._abort_reason is None and self.stop_event is not None and self.stop_event.is_set():
@@ -560,17 +563,50 @@ class AndroidRunner:
         active = buy.enabled and not self._marker_of(buy, "not_started")
         return Seen(Screen.PRODUCT_ACTIVE if active else Screen.PRODUCT_WAITING, "tombol Beli", buy)
 
-    def _foreground(self) -> tuple[AppInfo | None, str, bool]:
-        """(aplikasi/activity di depan, error, ada WebView Shopee). Cache FOREGROUND_CACHE_S: adb dumpsys mahal;
-        hanya dipanggil di ujung rantai klasifikasi (layar tak dikenali), bukan di hot path."""
+    def _front_app(self, force: bool = False) -> tuple[AppInfo | None, str]:
+        """(aplikasi/activity di depan, error). Cache FOREGROUND_CACHE_S: adb dumpsys mahal; tidak dipakai sebelum
+        klik Beli pertama (hot path), hanya di ujung rantai klasifikasi dan saat menunggu reaksi klik."""
         now = self._mono()
-        if self._fg is None or now - self._fg[0] >= FOREGROUND_CACHE_S:
+        if force or self._fg is None or now - self._fg[0] >= FOREGROUND_CACHE_S:
             try:
-                app = self.d.current_app()
-                self._fg = (now, app, "", app.package == self.package and self.d.webview_present())
+                self._fg = (now, self.d.current_app(), "", None)
             except DriverError as e:
                 self._fg = (now, None, str(e), False)
-        return self._fg[1], self._fg[2], self._fg[3]
+        return self._fg[1], self._fg[2]
+
+    def _foreground(self) -> tuple[AppInfo | None, str, bool]:
+        """(aplikasi/activity di depan, error, ada WebView Shopee); ikut cache _front_app."""
+        app, err = self._front_app()
+        if self._fg[3] is None:
+            self._fg = (*self._fg[:3], app is not None and app.package == self.package and self.d.webview_present())
+        return app, err, bool(self._fg[3])
+
+    def _outside(self, app: AppInfo) -> Seen:
+        """Package lain di depan Shopee: sistem/launcher yang dikenal -> UNKNOWN; selain itu -> VERIFICATION."""
+        where = f"{app.package}/{app.activity}"
+        if app.package in KNOWN_SYSTEM_PACKAGES or app.package in self.home_packages or \
+                _SYSTEM_PACKAGE_RE.search(app.package):
+            return Seen(Screen.UNKNOWN, f"Shopee keluar dari foreground: {where}")
+        return Seen(Screen.VERIFICATION, f"aplikasi/activity asing di depan: {where}")
+
+    def _foreign_guard(self, force: bool = False) -> bool:
+        """Setelah klik: aplikasi/activity lain di depan Shopee. Query dibatasi ke package Shopee, jadi halaman di
+        bawah jendela berbentuk dialog (mis. verifikasi Play Services) tetap terbaca dan tap ulang akan mengenai
+        jendela itu. Asing -> VERIFICATION (stop); sistem/launcher -> UNKNOWN (jaring 1,5 s), tanpa tap.
+        True = jangan bertindak di iterasi ini."""
+        app, _ = self._front_app(force or self._front_blocked)
+        self._front_blocked = False
+        if app is None or not app.package or app.package == self.package:
+            return False
+        seen = self._outside(app)
+        if seen.screen in TERMINAL:
+            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._observe(seen)
+        if seen.evidence != self._dialog_logged:
+            self._dialog_logged = seen.evidence
+            self.log.warn(f"{seen.evidence}: tidak ada klik selama Shopee tidak di depan")
+        self._front_blocked = True  # dibaca ulang tiap iterasi sampai Shopee kembali di depan
+        return True
 
     def _foreground_screen(self) -> Seen | None:
         """Tidak ada elemen Shopee yang dikenali: putuskan dari package/activity di depan.
@@ -585,22 +621,25 @@ class AndroidRunner:
             return Seen(Screen.UNKNOWN, f"aplikasi di depan tidak terbaca ({err or 'kosong'})")
         where = f"{app.package}/{app.activity}"
         if app.package == self.package:
-            if VERIFY_ACTIVITY_RE.search(app.activity):
-                screen = Screen.CAPTCHA if "captcha" in app.activity.lower() else Screen.VERIFICATION
-                return Seen(screen, f"activity verifikasi {where}")
+            if (seen := self._verify_activity(app)) is not None:
+                return seen
             if webview:
                 return Seen(Screen.VERIFICATION, f"WebView tanpa elemen Shopee yang dikenal ({where}); "
                                                  "kemungkinan halaman verifikasi")
             return None
-        if app.package in KNOWN_SYSTEM_PACKAGES or app.package in self.home_packages or \
-                _SYSTEM_PACKAGE_RE.search(app.package):
-            return Seen(Screen.UNKNOWN, f"Shopee keluar dari foreground: {where}")
-        return Seen(Screen.VERIFICATION, f"aplikasi/activity asing di depan: {where}")
+        return self._outside(app)
+
+    @staticmethod
+    def _verify_activity(app: AppInfo) -> Seen | None:
+        if not VERIFY_ACTIVITY_RE.search(app.activity):
+            return None
+        screen = Screen.CAPTCHA if "captcha" in app.activity.lower() else Screen.VERIFICATION
+        return Seen(screen, f"activity verifikasi {app.package}/{app.activity}")
 
     def _system_dialog(self) -> Seen | None:
         """Dialog crash/ANR (jendela sistem) di atas Shopee: elemen Shopee masih terbaca di bawahnya, jadi tap
         akan mengenai dialog ('Tutup aplikasi'). -> UNKNOWN (tanpa klik)."""
-        n = self.d.info_any(Sel("textMatches", SYSTEM_DIALOG_MATCH))
+        n = self.d.info_any(Sel("textMatches", SYSTEM_DIALOG_MATCH), exclude=(self.package, "com.android.systemui"))
         return Seen(Screen.UNKNOWN, f"dialog sistem {n.label[:60]!r} (crash/ANR)", n) if n is not None else None
 
     def _anchor(self) -> Seen | None:
@@ -638,17 +677,19 @@ class AndroidRunner:
 
     def _observe(self, seen: Seen, t_obs: float | None = None) -> Seen:
         """Jaring pengaman: UNKNOWN berturut-turut > unknown_limit_s -> UNKNOWN_STATE (diukur dari waktu
-        pengamatan, bukan setelah diagnosa)."""
+        pengamatan, bukan setelah diagnosa). Rentang loading yang diselingi layar tak dikenal tetap dihitung
+        sebagai satu rentang loading (batas loading_limit_s): hanya layar yang dikenali yang mereset keduanya."""
         if not self._tracking:
             return seen
         now = self._mono() if t_obs is None else t_obs
-        if seen.screen != Screen.LOADING:
+        if seen.screen not in (Screen.LOADING, Screen.UNKNOWN):
             self._loading_since = None
-        elif self._loading_since is None:
-            self._loading_since = now
-        elif now - self._loading_since > self.loading_limit_s:  # server lambat ditunggu, tetapi tidak selamanya
-            raise _Stop(RunStatus.UNKNOWN_STATE,
-                        f"indikator loading > {self.loading_limit_s:.0f} s ({self._diagnose_unknown(seen)})")
+        elif seen.screen == Screen.LOADING:
+            if self._loading_since is None:
+                self._loading_since = now
+            elif now - self._loading_since > self.loading_limit_s:  # server lambat ditunggu, tidak selamanya
+                raise _Stop(RunStatus.UNKNOWN_STATE,
+                            f"indikator loading > {self.loading_limit_s:.0f} s ({self._diagnose_unknown(seen)})")
         if seen.screen != Screen.UNKNOWN:
             self._unknown_since = None
         elif self._unknown_since is None:
@@ -664,7 +705,7 @@ class AndroidRunner:
             self._checkpoint()
             # dialog crash/ANR di atas layar yang masih terbaca (mis. checkout setelah "Buat Pesanan") = UNKNOWN
             # (jaring 1,5 s), bukan layar di bawahnya
-            if not self._guard(1):
+            if not self._guard(1, allow=targets):
                 seen = self._classify(context)
                 if seen.screen in targets or seen.screen in TERMINAL:
                     return seen
@@ -696,6 +737,9 @@ class AndroidRunner:
         except DriverError as e:
             res.status = RunStatus.ERROR
             res.items.append(PrecheckItem("device", False, f"koneksi device/agent gagal: {e}"))
+        finally:
+            if self._abort_reason is not None:  # Ctrl+C: close() bisa sudah jalan sebelum thread ini selesai
+                self._restore_stay_awake()
         if res.status in STOP_ALL_STATUSES:
             self._signal_stop()
         if self.d is not None:
@@ -778,6 +822,7 @@ class AndroidRunner:
             self.home_packages.add(home[-1].split("/")[0].strip())
 
         # halaman produk: login, tombol Beli, harga, latensi query
+        self._checkpoint()
         try:
             self.d.start_url(self.cfg.product_url, self.package)
         except DriverError as e:
@@ -838,11 +883,13 @@ class AndroidRunner:
         teks/resourceId bisa berubah antarversi."""
         cal = self.sel.calibrated or {}
         cal_ver, cal_size = cal.get("app_version", ""), cal.get("wm_size", "")
-        if not cal_ver:
+        if not cal:
             return PrecheckItem("versi vs kalibrasi", None, "belum ada kalibrasi Android (memakai default teks); "
                                                           "jalankan calibrate --platform android")
-        if version != cal_ver:
-            what = (f"versi Shopee {version} berbeda dari saat kalibrasi ({cal_ver})" if version else
+        if not cal_ver or version != cal_ver:
+            what = (f"kalibrasi tanpa versi Shopee tercatat (versi sekarang {version or '?'}), tidak bisa dibandingkan"
+                    if not cal_ver else
+                    f"versi Shopee {version} berbeda dari saat kalibrasi ({cal_ver})" if version else
                     f"versi Shopee tidak terbaca, tidak bisa dibandingkan dengan kalibrasi ({cal_ver})")
             msg = (f"PERINGATAN KERAS: {what}; selector bisa tidak cocok - kalibrasi ulang lalu dry-run, atau matikan "
                    "auto-update Shopee")
@@ -868,25 +915,39 @@ class AndroidRunner:
             return PrecheckItem("layar tetap menyala", None if short else True,
                                 f"stay_on_while_plugged_in={stay or '?'}, timeout layar {timeout or '?'} ms; saat run "
                                 "alat memasang `svc power stayon usb` dan mengembalikannya setelah selesai")
-        self._shell("svc", "power", "stayon", "usb")
+        with self._stay_lock:  # close() (Ctrl+C) tidak boleh menyelip di antara cek batal & svc
+            self._checkpoint()
+            self._stay_restore = stay if stay.isdigit() else "0"  # dikembalikan begitu svc terkirim
+            self._shell("svc", "power", "stayon", "usb")
         now = self._shell("settings", "get", "global", "stay_on_while_plugged_in").strip()
-        if not (now.isdigit() and int(now) & 2):
+        if not now.isdigit():
             return PrecheckItem("layar tetap menyala", None,
-                                f"`svc power stayon usb` tidak berefek (nilai {now or '?'}); "
+                                f"`svc power stayon usb` dikirim, nilai sesudahnya tidak terbaca; dikembalikan ke "
+                                f"{self._stay_restore} setelah run")
+        if not int(now) & 2:
+            return PrecheckItem("layar tetap menyala", None,
+                                f"`svc power stayon usb` tidak berefek (nilai {now}); "
                                 "aktifkan Opsi Pengembang > Tetap aktif")
-        self._stay_restore = stay if stay.isdigit() else "0"
         self.log.info(f"svc power stayon usb (stay_on_while_plugged_in {stay or '?'} -> {now}); "
                       "dikembalikan setelah run")
         return PrecheckItem("layar tetap menyala", True, f"svc power stayon usb selama run (semula {stay or '?'})")
 
     def _restore_stay_awake(self) -> None:
-        prev, self._stay_restore = self._stay_restore, None
-        if prev is None or self.d is None:
-            return
-        cmd = ("svc", "power", "stayon", "false") if prev == "0" else \
-            ("settings", "put", "global", "stay_on_while_plugged_in", prev)
-        self._shell(*cmd)
-        self.log.info(f"layar tetap menyala dikembalikan: {' '.join(cmd)}")
+        with self._stay_lock:
+            prev, self._stay_restore = self._stay_restore, None
+            if prev is None or self.d is None:
+                return
+            cmd = ("svc", "power", "stayon", "false") if prev == "0" else \
+                ("settings", "put", "global", "stay_on_while_plugged_in", prev)
+            try:
+                self.d.shell(list(cmd))
+            except DriverError as e:
+                msg = (f"gagal mengembalikan stay_on_while_plugged_in={prev} ({e}); kembalikan manual: Opsi Pengembang "
+                       "> Tetap aktif, atau `adb shell settings put global stay_on_while_plugged_in " + prev + "`")
+                self.log.warn(msg)
+                self._alarm("stay_on_restore", msg)
+                return
+            self.log.info(f"layar tetap menyala dikembalikan: {' '.join(cmd)}")
 
     def _agent_healthy(self) -> tuple[bool, str]:
         """Agent hidup dan menjawab AGENT_PING_QUERIES query berturut-turut, masing-masing < AGENT_PING_MAX_S
@@ -955,8 +1016,24 @@ class AndroidRunner:
                 return PrecheckItem(name, None, "halaman meminta PIN; tidak dibaca (PIN tidak diketik alat)")
             text = "\n".join(n.label for n in sorted(nodes, key=lambda n: (n.bounds[1], n.bounds[0])))
             ok, detail = judge(text)
+            if ok is None and (seen := self._page_blocked()) is not None:
+                raise _Stop(TERMINAL[seen.screen], f"{seen.screen} di halaman {url_key}: {seen.evidence} - "
+                                                   "selesaikan manual")
             if ok is not None or self._mono() >= end:
                 return PrecheckItem(name, ok, detail)
+
+    def _page_blocked(self) -> Seen | None:
+        """Halaman precheck tak terbaca: captcha/verifikasi yang hanya ber-content-desc, activity verifikasi
+        Shopee, atau aplikasi asing di depan. (WebView polos tidak dianggap verifikasi: halaman ShopeePay bisa
+        WebView yang masih memuat.)"""
+        if (seen := self._danger(None, "any", by="descriptionMatches")) is not None and seen.screen in TERMINAL:
+            seen.evidence = f"content-desc {seen.evidence}"
+            return seen
+        app, _ = self._front_app()
+        if app is None or not app.package:
+            return None
+        seen = self._verify_activity(app) if app.package == self.package else self._outside(app)
+        return seen if seen is not None and seen.screen in TERMINAL else None
 
     # ------------------------------------------------------------------ arm (T-60 s)
 
@@ -977,6 +1054,8 @@ class AndroidRunner:
             self._arm_failure = (RunStatus.ERROR, f"saat membuka produk (T-60 s): {e}")
         if self._arm_failure is not None:
             self.log.warn(f"arm gagal: {self._arm_failure[0]} {self._arm_failure[1]}")
+            if self._arm_failure[0] in STOP_ALL_STATUSES:  # langsung, jangan tunggu sampai T-lead
+                self._signal_stop()
             self._alarm(str(self._arm_failure[0]), self._arm_failure[1])
 
     def _arm_sync(self) -> None:
@@ -1040,6 +1119,9 @@ class AndroidRunner:
             return
         if not opt.enabled:
             self.log.warn(f"variasi {self.variant!r} belum bisa dipilih")
+            return
+        if self._dialog_blocks_click():
+            self.log.warn(f"dialog sistem di atas halaman produk; variasi {self.variant!r} dipilih di bottom sheet")
             return
         self.d.click(opt)
         self.log.mark("variant_selected", self.variant)
@@ -1139,8 +1221,10 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 self._checkpoint()
+                if not self._handle_sheet(retry=True, gate=gate):
+                    continue  # ditahan (dialog sistem / jendela habis): tidak diklik, tidak dihitung
+                self.limiter.touch(clock.now())  # jarak >= 425 ms dihitung dari tap sebenarnya
                 clicks += 1
-                self._handle_sheet(retry=True)
                 outcome = self._after_buy(stale, confirm_done=True)
             else:
                 btn, price = info
@@ -1161,8 +1245,12 @@ class AndroidRunner:
                         continue
                 if self._dialog_blocks_click():
                     continue  # dialog crash/ANR di atas tombol: tap akan mengenai dialog ("Tutup aplikasi")
+                if gate.expired():
+                    return self._window_closed(clicks)
                 t_click = clock.now_ms()
                 self.d.click(btn)
+                # slot berikutnya dihitung dari tap sebenarnya (RPC sebelum tap bisa lambat): jarak tap >= 425 ms
+                self.limiter.touch(clock.now())
                 clicks += 1
                 if clicks == 1:
                     self.log.mark("buy_ready", price.describe(self.limits), t_ms=t_ready)
@@ -1173,6 +1261,8 @@ class AndroidRunner:
                 break
             if st in TERMINAL:
                 return TERMINAL[st], outcome.evidence
+            if st == Screen.UNKNOWN and outcome.evidence == "timeout":  # klik Beli sudah terkirim: bukan "slot"
+                return self._unexpected(outcome, "reaksi klik Beli")
             if st == Screen.PIN_SCREEN:
                 # PIN tanpa klik "Buat Pesanan" dari alat: pesanan mungkin sudah terbuat (mis. tap tak sengaja)
                 self.order_clicked = True
@@ -1295,10 +1385,14 @@ class AndroidRunner:
                 return "expired", None
             reloadable = True
             try:
+                if clicks and self._foreign_guard():
+                    continue  # aplikasi lain di depan setelah klik: jangan klik ulang di atasnya
                 btn = self._find("buy_button")
                 if btn is not None and clicks and self._has("sheet_marker") is not None:
                     return "sheet", None  # klik sebelumnya membuka sheet: konfirmasi lewat gate
                 if btn is None:
+                    if self._guard(clicks):
+                        continue  # dialog sistem: jangan klasifikasi "belum dimulai" (mereset jaring UNKNOWN)
                     seen = self._classify("product")
                     if seen.screen in TERMINAL:
                         return "stop", seen
@@ -1311,8 +1405,10 @@ class AndroidRunner:
                     if seen.screen == Screen.PIN_SCREEN:
                         self.order_clicked = True
                         raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
-                    # layar tak dikenal / aplikasi lain / loading: jangan reload/klik, biarkan jaring UNKNOWN
-                    reloadable = seen.screen in (*PRODUCT, Screen.NOT_STARTED)
+                    # layar tak dikenal / aplikasi lain / loading: jangan reload/klik, biarkan jaring UNKNOWN.
+                    # Halaman pesan tanpa tombol Beli ("Gagal memuat", "belum dimulai") = belum siap -> reload.
+                    reloadable = seen.screen in (*PRODUCT, Screen.NOT_STARTED, Screen.ERROR_TOAST,
+                                                 Screen.VARIANT_REQUIRED)
                     if seen.screen in PRODUCT:
                         btn = seen.node
                 if btn is not None:
@@ -1350,6 +1446,8 @@ class AndroidRunner:
             now = gate.clock.now()
             if reloadable and now >= gate.open_at + FIRST_RELOAD_S and (
                     last_reload is None or now - last_reload >= RELOAD_EVERY_S):
+                if self._dialog_blocks_click():
+                    continue  # dialog crash/ANR: gestur/intent reload tidak dikirim selama dialog tampil
                 return "reload", None
 
     def _no_pin(self, seen: Seen) -> Seen:
@@ -1359,17 +1457,20 @@ class AndroidRunner:
             raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
         return seen
 
-    def _guard(self, clicks: int) -> bool:
+    def _guard(self, clicks: int, allow: set[Screen] | frozenset[Screen] = frozenset()) -> bool:
         """Cek yang tidak perlu tiap iterasi (dijalankan bila hasil terakhir > GUARD_FRESH_S; dipaksa segera
         setelah klik Beli/konfirmasi, tepat sebelum konfirmasi sheet & "Buat Pesanan", dan di awal lapis 3):
         - penanda bahaya di content-desc (mis. captcha di WebView) -> stop;
         - dialog sistem crash/ANR di atas Shopee -> UNKNOWN (jaring 1,5 s), tanpa klik selama dialog tampil;
         - sebelum klik Beli pertama: bottom sheet yang sudah terbuka (info jalur A tetap menemukan 'Beli
           Sekarang' di belakang/di dalam sheet; klik akan mendarat di konfirmasi sheet tanpa pemilihan variasi).
+        `allow`: layar yang sedang ditunggu (mis. PIN setelah "Buat Pesanan") -> diserahkan ke klasifikasi.
         True = jangan bertindak di iterasi ini (dialog sistem tampil / sheet baru ditutup)."""
         if self._mono() - self._guard_at < GUARD_FRESH_S:
             return False
         if (seen := self._danger(None, "product", by="descriptionMatches")) is not None:
+            if seen.screen in allow:
+                return False
             seen = self._no_pin(seen)
             raise _Stop(TERMINAL[seen.screen], f"content-desc {seen.evidence}")
         if (seen := self._system_dialog()) is not None:
@@ -1397,6 +1498,20 @@ class AndroidRunner:
             self.log.warn(f"{seen.evidence}: tidak ada klik selama dialog tampil")
         self._guard_at = float("-inf")
         return True
+
+    def _forward_click(self, node: Node, refind: Callable[[], Node | None] | None = None) -> None:
+        """Tap langkah maju (sheet, keranjang, metode bayar): dialog crash/ANR di atasnya -> tunggu sampai hilang
+        (jaring UNKNOWN 1,5 s), lalu tap posisi terbaru. Tap tidak pernah mengenai dialog ("Tutup aplikasi")."""
+        while self._dialog_blocks_click():
+            self._checkpoint()
+            if refind is not None:
+                node = refind() or node
+        self.d.click(node)
+
+    def _recognized(self) -> None:
+        """Bacaan langkah maju mengenali layarnya: jaring UNKNOWN/loading mulai dari nol (dialog yang sudah hilang
+        tidak ikut dihitung)."""
+        self._unknown_since = self._loading_since = None
 
     def _close_sheet(self) -> None:
         """Tutup bottom sheet yang terbuka sebelum klik Beli pertama (back), lalu pastikan sudah hilang."""
@@ -1461,7 +1576,8 @@ class AndroidRunner:
         """Tunggu reaksi klik Beli/konfirmasi. 'Tidak bereaksi' hanya bila halaman produk TIDAK berubah
         selama NO_RESPONSE_S; layar tak dikenal/loading ditunggu (jaring UNKNOWN / batas 30 s), bukan diklik ulang."""
         t_click = self._mono()
-        t_ref = t_click
+        t_ref = t_act = t_click  # t_act: tap terakhir alat (klik / konfirmasi sheet)
+        first_loading: float | None = None
         seen_clear = not stale
         sheet_done = confirm_done
         self._guard_at = float("-inf")  # content-desc bahaya dicek segera setelah klik (bukan sebelum: kecepatan)
@@ -1469,6 +1585,8 @@ class AndroidRunner:
             self._checkpoint()
             if self._guard(1):
                 continue  # dialog sistem di atas aplikasi: tunggu (jaring UNKNOWN), jangan klasifikasi/tindak
+            if self._front_blocked and self._foreign_guard():
+                continue  # aplikasi sistem masih di depan: halaman di bawahnya tidak mereset jaring UNKNOWN
             seen = self._classify("after_buy")
             st = seen.screen
             now = self._mono()
@@ -1479,10 +1597,14 @@ class AndroidRunner:
                     if not self._handle_sheet():
                         continue  # konfirmasi ditahan dialog sistem: coba lagi saat dialog hilang
                     sheet_done = True
-                    t_ref = self._mono()
+                    t_ref = t_act = self._mono()
                     seen_clear = False  # toast lama di sheet diabaikan sebentar
                 elif now - t_ref > NO_RESPONSE_S:
+                    if self._foreign_guard(force=True):
+                        continue
                     return Seen(Screen.VARIANT_SHEET, "sheet tidak bereaksi")
+                elif now - t_act > FOREGROUND_CACHE_S:
+                    self._foreign_guard()
                 continue
             if st in (Screen.NOT_STARTED, Screen.ERROR_TOAST, Screen.VARIANT_REQUIRED):
                 if seen_clear or now - t_ref > STALE_TOAST_S:
@@ -1490,20 +1612,30 @@ class AndroidRunner:
                 continue
             if now - t_click > self.flow_timeout_s:
                 return Seen(Screen.UNKNOWN, "timeout")
+            # halaman tidak berubah / loading > 0,5 s setelah tap: jendela asing berbentuk dialog di atasnya?
+            # (query dibatasi package Shopee, jadi halaman di bawahnya tetap terbaca)
+            if st in (*PRODUCT, Screen.LOADING) and now - t_act > FOREGROUND_CACHE_S and self._foreign_guard():
+                continue
             if st == Screen.LOADING:  # server lambat saat flash sale: tunggu, bukan "tidak bereaksi"
+                first_loading = now if first_loading is None else first_loading
+                if now - first_loading > self.loading_limit_s:  # loading berselang-seling dengan halaman produk
+                    raise _Stop(RunStatus.UNKNOWN_STATE,
+                                f"indikator loading berselang > {self.loading_limit_s:.0f} s setelah klik")
                 t_ref = now
                 continue
             if st == Screen.UNKNOWN:
                 continue  # jaring UNKNOWN (_observe) yang memutuskan; jangan klik ulang di atasnya
             seen_clear = True
             if now - t_ref > NO_RESPONSE_S:
+                if self._foreign_guard(force=True):
+                    continue
                 return Seen(st, "tidak ada reaksi")
 
     def _sheet_nodes(self, step: str) -> list[Node]:
         sel = self._union((step,))
         return self.d.find_all(sel) if sel is not None else []
 
-    def _handle_sheet(self, retry: bool = False) -> bool:
+    def _handle_sheet(self, retry: bool = False, gate: PollingGate | None = None) -> bool:
         """Bottom sheet variasi/kuantitas: pilih variasi (diverifikasi), lalu konfirmasi sekali.
 
         Elemen diambil dari find_all sempit (jendela aktif = sheet) dan dipilih yang paling bawah, supaya
@@ -1518,6 +1650,8 @@ class AndroidRunner:
             if not (opt.selected or opt.checked):
                 if not opt.enabled:
                     raise _Stop(RunStatus.SOLD_OUT, f"variasi {self.variant!r} tidak bisa dipilih (habis?)")
+                if self._dialog_blocks_click() or (gate is not None and gate.expired()):
+                    return False  # dialog crash/ANR di atas chip / jendela polling habis: tidak di-tap
                 self.d.click(opt)
                 waited = True
                 self.log.mark("variant_selected", self.variant)
@@ -1534,14 +1668,16 @@ class AndroidRunner:
         confirm = self._pick("sheet_confirm", self._sheet_nodes("sheet_confirm")) or self._find("sheet_confirm")
         if confirm is None:
             raise _Stop(RunStatus.ERROR, "tombol konfirmasi di pilihan variasi tidak ditemukan")
-        # konfirmasi = langkah yang mengikat: captcha/verifikasi (teks bila sempat memilih variasi; content-desc
-        # selalu) dicek tepat sebelumnya
-        if waited and (seen := self._danger(None, "after_buy")) is not None:
+        # konfirmasi = langkah yang mengikat: captcha/verifikasi (teks bila sempat memilih variasi atau konfirmasi
+        # ulang setelah menunggu slot; content-desc selalu) dicek tepat sebelumnya
+        if (waited or retry) and (seen := self._danger(None, "after_buy")) is not None:
             seen = self._no_pin(seen)
             raise _Stop(TERMINAL[seen.screen], seen.evidence)
         self._guard_at = float("-inf")
         if self._guard(1):
             return False  # dialog sistem di atas sheet: konfirmasi ditahan
+        if gate is not None and gate.expired():
+            return False  # konfirmasi ulang = aksi polling: tidak setelah T+8 s
         self.d.clear_toast()
         t_click = self.clock.now_ms()
         self.d.click(confirm)
@@ -1555,6 +1691,7 @@ class AndroidRunner:
         foreground / dialog asing? Klasifikasi penuh (paket & activity di depan) + jaring UNKNOWN 1,5 s."""
         steps = (steps,) if isinstance(steps, str) else steps
         if any(self._local(step, nodes) is not None for step in steps):
+            self._recognized()
             return
         seen = self._classify("any")
         if seen.screen in TERMINAL:
@@ -1581,7 +1718,7 @@ class AndroidRunner:
             for i in verdict.to_uncheck:
                 self._checkpoint()
                 row, box = rows[i]
-                self.d.click(box)
+                self._forward_click(box)
                 self.log.mark("cart_uncheck", row.text.splitlines()[0][:50])
             changed = True
             end = self._mono() + CART_SETTLE_S
@@ -1633,7 +1770,7 @@ class AndroidRunner:
         if row is None:
             return False, f"baris 'Metode Pembayaran' tidak ditemukan (metode tampil: {value!r})", False
         t_click = self.clock.now_ms()
-        self.d.click(row)
+        self._forward_click(row, lambda: self._find("payment_change"))
         self.log.mark("payment_change", f"sebelumnya {value!r}", t_ms=t_click)
         end = min(deadline, self._mono() + SELECT_WAIT_S)
         opt = None
@@ -1646,11 +1783,12 @@ class AndroidRunner:
         if opt is None:
             return False, "opsi ShopeePay tidak ditemukan di daftar metode pembayaran", True
         t_click = self.clock.now_ms()
-        self.d.click(opt)
+        self._forward_click(opt, lambda: (n if (n := self._find("payment_shopeepay")) is not None and
+                                          is_shopeepay(n.label) else None))
         self.log.mark("select_shopeepay", t_ms=t_click)
         confirm = self._find("payment_confirm")
         if confirm is not None:
-            self.d.click(confirm)
+            self._forward_click(confirm, lambda: self._find("payment_confirm"))
             self.log.mark("payment_confirm")
         while self._mono() < end:
             self._checkpoint()

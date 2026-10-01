@@ -353,11 +353,12 @@ def test_stay_on_restores_original_value_or_leaves_it(tmp_path, stay, settings, 
     _safe(out)
 
 
-def test_stay_on_command_without_effect_is_warning_and_not_restored(tmp_path, monkeypatch):
+def test_stay_on_command_without_effect_is_warning_and_original_value_restored(tmp_path, monkeypatch):
+    """svc sudah terkirim: nilai semula selalu dikembalikan (idempoten bila svc memang tidak berefek)."""
     _use(monkeypatch, app_cls=NoStayOnEffectApp)
     out = run_android(tmp_path, stay_on="0", runner_attrs={"hold_screen_on": True})
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
-    assert [e["detail"] for e in out.kind("svc_ignored")] == ["svc power stayon usb"], "tidak ada 'restore'"
+    assert [e["detail"] for e in out.kind("svc_ignored")] == ["svc power stayon usb", "svc power stayon false"]
     assert _settings(out) == [], "juga tidak lewat `settings put`"
     assert "precheck layar tetap menyala: PERINGATAN - `svc power stayon usb` tidak berefek (nilai 0)" in _log(out)
     assert out.events() == []

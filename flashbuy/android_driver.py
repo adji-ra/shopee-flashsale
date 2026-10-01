@@ -122,7 +122,8 @@ class AndroidDriver(Protocol):
     def info(self, sel: Sel) -> Node | None: ...  # elemen pertama yang cocok, None bila tidak ada
 
     # Seperti info, tetapi TANPA batas package aplikasi (dialog sistem crash/ANR, aplikasi lain di atas Shopee).
-    def info_any(self, sel: Sel) -> Node | None: ...
+    # tanpa batas package (dialog sistem di atas aplikasi); `exclude` = package yang tidak ikut dicari
+    def info_any(self, sel: Sel, exclude: tuple[str, ...] = ()) -> Node | None: ...
 
     def find_all(self, sel: Sel) -> list[Node]: ...  # semua elemen yang cocok (1 RPC)
 
@@ -170,7 +171,7 @@ SHELL_ALLOWED = re.compile("|".join([
     r"ps -A",
     r"dumpsys (power|window|package [\w.]+)",
     r"settings get (global|system) \w+",
-    r"settings put global stay_on_while_plugged_in \d",
+    r"settings put global stay_on_while_plugged_in \d+",
     r"svc power stayon (usb|false)",
     r"pm path [\w.]+",
     r"cmd package resolve-activity --brief -a android\.intent\.action\.MAIN -c android\.intent\.category\.HOME",
@@ -274,20 +275,22 @@ class U2Driver:
         """Panggil jsonrpc agent dengan timeout per panggilan (bukan 300 s bawaan u2)."""
         return getattr(self.d.jsonrpc, method)(*params, http_timeout=self.rpc_timeout_s)
 
-    def _selector(self, sel: Sel, any_package: bool = False) -> Any:
+    def _selector(self, sel: Sel, any_package: bool = False, exclude: tuple[str, ...] = ()) -> Any:
         kw = sel.kwargs()
         if self.package and not any_package:
             kw["packageName"] = self.package
+        elif exclude:  # regex Java: package node BUKAN salah satu ini
+            kw["packageNameMatches"] = rf"^(?!(?:{'|'.join(map(re.escape, exclude))})$).*$"
         return self.d(**kw).selector
 
     def exists(self, sel: Sel) -> bool:
         return bool(self._call(f"exists {sel}", lambda: self._rpc("exist", self._selector(sel))))
 
-    def info(self, sel: Sel, any_package: bool = False) -> Node | None:
+    def info(self, sel: Sel, any_package: bool = False, exclude: tuple[str, ...] = ()) -> Node | None:
         def get() -> Node | None:
             for attempt in (1, 2):
                 try:
-                    node = Node.from_u2(self._rpc("objInfo", self._selector(sel, any_package)))
+                    node = Node.from_u2(self._rpc("objInfo", self._selector(sel, any_package, exclude)))
                     break
                 except Exception as e:  # noqa: BLE001
                     if type(e).__name__ == "UiObjectNotFoundError":
@@ -303,8 +306,8 @@ class U2Driver:
 
         return self._call(f"info {sel}", get)
 
-    def info_any(self, sel: Sel) -> Node | None:
-        return self.info(sel, any_package=True)
+    def info_any(self, sel: Sel, exclude: tuple[str, ...] = ()) -> Node | None:
+        return self.info(sel, any_package=True, exclude=exclude)
 
     def find_all(self, sel: Sel) -> list[Node]:
         def get() -> list[Node]:
@@ -474,8 +477,8 @@ class TimedDriver:
     def info(self, sel: Sel) -> Node | None:
         return self._timed("info", sel, lambda: self.inner.info(sel))
 
-    def info_any(self, sel: Sel) -> Node | None:
-        return self._timed("info_any", sel, lambda: self.inner.info_any(sel))
+    def info_any(self, sel: Sel, exclude: tuple[str, ...] = ()) -> Node | None:
+        return self._timed("info_any", sel, lambda: self.inner.info_any(sel, exclude))
 
     def find_all(self, sel: Sel) -> list[Node]:
         return self._timed("find_all", sel, lambda: self.inner.find_all(sel))
@@ -626,11 +629,13 @@ class FakeDriver:
         found = self._match(sel)
         return found[0] if found else None
 
-    def info_any(self, sel: Sel) -> Node | None:
-        """Tanpa batas package: node aplikasi + jendela sistem/aplikasi lain di atasnya (app.system_nodes)."""
+    def info_any(self, sel: Sel, exclude: tuple[str, ...] = ()) -> Node | None:
+        """Tanpa batas package: node aplikasi + jendela sistem/aplikasi lain di atasnya (app.system_nodes, package
+        sistem). `exclude` memuat package aplikasi -> node aplikasi tidak ikut dicari."""
         self._rpc("info_any", sel)
         system = getattr(self.app, "system_nodes", lambda: [])()
-        found = [n for n in [*system, *self.app.nodes()] if node_matches(n, sel)]
+        own = [] if self.app.package in exclude else self.app.nodes()
+        found = [n for n in [*system, *own] if node_matches(n, sel)]
         return found[0] if found else None
 
     def find_all(self, sel: Sel) -> list[Node]:

@@ -31,9 +31,10 @@ import yaml
 from rich.console import Console
 
 from flashbuy import android_selectors, cli, notifier, timesync
+from flashbuy.android_calibrate import ANDROID_CAL_STEPS, AndroidCalibrator
 from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Sel, U2Driver
 from flashbuy.android_runner import AndroidRunner
-from flashbuy.android_screen import RP_ANY_MATCH
+from flashbuy.android_screen import RP_ANY_MATCH, parse_dump
 from flashbuy.android_selectors import KIND_RANK
 from flashbuy.runner_base import MAYBE_ORDERED_MSG, RunStatus
 from flashbuy.timesync import WIB, OffsetResult, SyncReport
@@ -1222,6 +1223,64 @@ def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monke
     assert_ordered(steps)
     assert app.kind("tap") == [] and app.kind("variant") == [], "variasi tidak dipilih oleh alat"
     assert set(dev.ops()) <= {"dump", "find_all", "shell"}
+
+
+class MetaFailsDriver(FakeDriver):
+    """`dumpsys package` gagal (adb putus sesaat) tepat setelah pengguna menyelesaikan semua langkah kalibrasi."""
+
+    def shell(self, cmd: list[str]) -> str:
+        if cmd[:2] == ["dumpsys", "package"]:
+            raise DriverError("adb: device offline")
+        return super().shell(cmd)
+
+
+def test_calibrate_android_keeps_results_when_app_version_unreadable(tmp_path, device, term):
+    """Regresi: galat adb saat membaca versi Shopee/resolusi (sesudah semua langkah) tidak membuang hasil
+    kalibrasi; versi disimpan kosong + peringatan (precheck lalu memberi PERINGATAN KERAS)."""
+    sel_path = tmp_path / "selectors.json"
+    dev = device(time.time() + 3600, driver_cls=MetaFailsDriver)
+    app = dev.app
+    user = ScriptedUser([
+        ("[buy_button]", goto(app, "product"), ""),
+        ("Nomor elemen", None, ""),
+        *[(f"[{key}]", None, "lewati") for key in ("product_price", "sheet_marker", "sheet_confirm", "place_order",
+                                                   "payment_change", "payment_shopeepay", "payment_confirm")],
+    ])
+    cfg = cli._load(cli.build_parser().parse_args(
+        ["calibrate", "--config", str(write_cfg(tmp_path, app.sc.open_at)), "--platform", "android"]))
+    rc = cli.calibrate_android(cfg, dev.driver, sel_path, prompt=user)
+    text = term.getvalue()
+    assert rc == 0 and user.script == [], text
+    assert "! versi Shopee tidak terbaca (adb: device offline); disimpan kosong" in text
+    assert f"Tersimpan: {sel_path} (bagian android; Shopee ?, {WM_SIZE})" in text
+    section = json.loads(sel_path.read_text(encoding="utf-8"))["android"]
+    assert section["steps"]["buy_button"][0] == {"text": "Beli Sekarang"}
+    assert section["calibrated"]["app_version"] == "" and section["calibrated"]["wm_size"] == WM_SIZE
+
+
+def test_calibrate_variant_s_lists_only_its_chip_and_typing_s_searches_not_skips(tmp_path, device, term):
+    """Variasi 'S' (ukuran): kata kunci dicocokkan per kata dan tidak ke awalan resourceId 'com.shopee.id:id/'
+    (dulu: hampir semua elemen terdaftar + 15 query peringkat). Mengetik 'S' di prompt nomor = cari teks itu,
+    bukan 'lewati'."""
+    class RidApp(FakeShopeeApp):
+        def _render(self):  # setiap elemen punya resourceId (ber-awalan package)
+            return [(k, replace(n, rid=n.rid or f"{PACKAGE}:id/n{i}")) for i, (k, n) in enumerate(super()._render())]
+
+    dev = device(time.time() + 3600, app_cls=RidApp, variants=["S", "M", "L"])
+    dev.app.screen = "sheet"
+    answers = iter(["S", "1"])
+    said: list[str] = []
+    cal = AndroidCalibrator(dev.driver, android_selectors.defaults(), variant="S", prompt=lambda m: next(answers),
+                            say=said.append)
+    step = next(s for s in ANDROID_CAL_STEPS if s.key == "variant_option")
+    nodes = parse_dump(dev.driver.dump())
+    before = len(dev.driver.calls)
+    listed = cal._listed(step, nodes)
+    assert [n.text for n in listed] == ["S"], [n.text for n in listed]
+    assert [op for op, _ in dev.driver.calls[before:]] == [], "satu kandidat: tanpa query peringkat"
+    chosen = cal._choose(step, nodes)
+    assert chosen is not None and chosen != "skip" and "S" in chosen.text.upper(), chosen
+    assert next(answers, None) is None, "kedua jawaban dipakai ('S' = cari, '1' = pilih)"
 
 
 # ------------------------------------------------------------------ ringkasan hasil di konsol
