@@ -937,6 +937,32 @@ def test_desc_only_captcha_overlay_on_product_page_stops_quickly(tmp_path, monke
     _no_order(out)
 
 
+class DescCaptchaOnSheetApp(FakeShopeeApp):
+    """Captcha ber-content-desc saja yang muncul DI ATAS bottom sheet 50 ms setelah sheet terbuka (setelah cek
+    paksa di awal reaksi klik Beli)."""
+
+    sheet_t: float | None = None
+
+    def _r_sheet(self):
+        out = super()._r_sheet()
+        self.sheet_t = self.sheet_t if self.sheet_t is not None else self.now()
+        if self.now() >= self.sheet_t + 0.05:
+            out.append(("", Node(desc="Geser untuk verifikasi", bounds=(100, 1000, 620, 1060))))
+        return out
+
+
+def test_desc_only_captcha_over_sheet_blocks_confirm(tmp_path, monkeypatch):
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=DescCaptchaOnSheetApp, live=True, runner_attrs=attrs)
+    assert out.result.status == RunStatus.CAPTCHA, out.result.message
+    assert "content-desc" in out.result.message
+    _one_buy(out)
+    assert out.kind("confirm") == [] and out.kind("checkout") == [], "konfirmasi sheet tidak boleh di bawah captcha"
+    assert attrs["stop_event"].is_set()
+    _alarmed(out, RunStatus.CAPTCHA)
+    _no_order(out)
+
+
 def test_long_description_with_marker_words_is_not_a_challenge(tmp_path, monkeypatch):
     """Kontrol: teks panjang (> 120 karakter, mis. deskripsi produk) yang menyebut 'kode OTP' bukan penanda
     verifikasi (tidak stop palsu)."""

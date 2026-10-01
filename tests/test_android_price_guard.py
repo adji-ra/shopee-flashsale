@@ -816,6 +816,21 @@ def test_l3_shop_header_does_not_satisfy_expected_name(tmp_path, live):
 
 
 @BOTH
+@pytest.mark.parametrize("variant", [None, "256GB Biru"], ids=["no_variant", "variant"])
+def test_l3_name_left_of_indented_price_is_kept(tmp_path, live, variant):
+    """Tanpa harga coret, harga jual menjorok ke kanan nama (nama x=140, harga x=320). Bacaan sempit tidak memuat
+    header toko, jadi kolom produk diambil dari harga/"Variasi"; tanpa baris "Variasi" nama terbuang -> nama
+    dibaca ulang SEKALI dari semua teks layar (header toko terbedakan) -> lolos; bukan PRICE_GUARD palsu."""
+    extra = {"variants": ["128GB Hitam", variant], "cfg": {"variant": variant}} if variant else {"cfg": {}}
+    extra["cfg"]["expected_name"] = "Uji Coba"
+    out = run_android(tmp_path, live=live, strike_in_checkout=False, **extra)
+    _passed(out, live)
+    # dengan baris "Variasi" kolom produk sudah benar dari bacaan sempit; tanpa itu perlu bacaan ulang sekali
+    reread = "dibaca ulang dari semua teks layar" in (out.log_dir / "android.log").read_text(encoding="utf-8")
+    assert reread is (variant is None)
+
+
+@BOTH
 def test_l3_variant_must_be_visible_in_product_row(tmp_path, monkeypatch, live):
     # variasi dipilih di sheet, tetapi checkout menampilkan variasi lain -> PRICE_GUARD (cfg.variant wajib terlihat)
     out = _run(tmp_path, monkeypatch, _variant_shown_app("Variasi: 128GB Hitam"), live=live, variants=VARIANTS,

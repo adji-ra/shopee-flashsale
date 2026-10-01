@@ -337,7 +337,8 @@ Kecepatan:
   tombol "Habis" dicari terpisah), supaya elemen cocok pertama tidak menutupi penanda sesungguhnya. **Bukan** `dump_hierarchy`
   (dump hanya untuk kalibrasi, diagnosa, dan status akhir `android-<ts>-<status>.xml`), dan bukan
   `info_list`, yang di u2.jar melakukan ~16 pencarian pohon per elemen cocok. `find_all` hanya dipakai
-  untuk bacaan sempit di langkah maju (sheet, checkout, keranjang).
+  untuk bacaan sempit di langkah maju (sheet, checkout, keranjang) dan untuk menilai tombol "Habis" polos
+  setelah `exists`-nya kena (tidak di iterasi polling).
 - Toast Android (jendela terpisah, tidak ada di pohon node) dibaca lewat `getLastToast`.
 - Latensi tiap query diukur dan ditulis setelah run ke log (ringkasan median/p95/maks) dan
   `android-queries-run.csv`. Target info/exists < 100 ms, find_all < 300 ms; lebih = peringatan.
@@ -357,8 +358,11 @@ Keamanan klik:
   reaksi klik itu sendiri tetap terbaca.
 - Bottom sheet yang sudah terbuka sebelum klik Beli pertama ditutup dengan back (sekali; tidak tertutup →
   `ERROR`), tidak pernah dikonfirmasi tanpa pemilihan variasi.
-- Variasi yang dipilih di halaman produk saat arm diperiksa lagi setelah setiap reload; terlepas →
-  dipilih ulang sekali lewat gate (aksi polling) sebelum harga lapis 1 dibaca.
+- Variasi yang dipilih di halaman produk saat arm diperiksa lagi setelah setiap reload (hanya bila status
+  terpilih chip terbaca); terlepas → dipilih ulang sekali lewat gate (aksi polling; chip dibaca ulang
+  setelah slot, bottom sheet yang ikut terbuka ditutup) sebelum harga lapis 1 dibaca.
+- Sebelum konfirmasi bottom sheet: cek captcha/verifikasi (content-desc selalu, teks bila sempat memilih
+  variasi).
 - Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"
   (`UNKNOWN_STATE` + pesan wajib + alarm).
 
@@ -371,7 +375,8 @@ Pembacaan harga di aplikasi (aksesibilitas Android tidak memberi tahu teks yang 
 - checkout (lapis 3): harga pada baris yang sama dengan penanda "x1" (harga coret sebaris yang lebih
   kecil diabaikan; seri → diambil yang terbesar); nama dicocokkan di kartu produk tanpa header toko;
   `variant` dari config harus terlihat di baris "Variasi" (bukan di nama produk; tanda baca/spasi
-  bebas); "Total Pembayaran"/ongkir dari testID
+  bebas). Bacaan checkout sempit (hanya teks yang cocok pola); bila nama/variasi tidak terlihat, semua teks
+  layar dibaca ulang SEKALI sebelum memutuskan. "Total Pembayaran"/ongkir dari testID
   (`labelTotalPayment`, `labelShippingFinalPrice`) **dan** label baris (harus diawali label, jadi badge
   "Gratis Ongkir" diabaikan), semua harus sama; stabil ≥ 100 ms, atau ≥ 1 s setelah ganti metode
   bayar/uncheck keranjang (server menghitung ulang total & promo);
@@ -397,8 +402,10 @@ python -m flashbuy timesync [--samples 5] [--ntp-host id.pool.ntp.org] [--url ht
 
 ## Tes
 
-`python -m pytest -q` menjalankan 222 tes: unit, mock end-to-end dengan Chromium headless,
-dan kalibrasi dengan Alt+klik yang disimulasikan. `FLASHBUY_HEADED=1` menjalankan browser
+`python -m pytest -q` menjalankan 1000 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
+headless, kalibrasi dengan Alt+klik yang disimulasikan, dan jalur Android di atas device palsu
+(`FakeDriver` + `tests/fake_android.py`, jam virtual) termasuk CLI, kalibrasi, pengaman harga, dan
+skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet). `FLASHBUY_HEADED=1` menjalankan browser
 headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`). Lint: `ruff check flashbuy tests`.
 
 ## Risiko
@@ -415,5 +422,6 @@ headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`). Lint: `ruff check
   dialog/toast agar deskripsi penjual tidak memicu stop palsu, sehingga captcha yang tampil
   tanpa dialog bisa terlewat. Karena itu tetap awasi layar.
 - Android: captcha yang hanya punya content-desc (tanpa teks) dicek paling sering tiap 0,5 s demi
-  kecepatan klik di T, jadi bisa ada satu klik Beli sebelum terdeteksi (berhenti sebelum konfirmasi).
+  kecepatan klik di T, jadi bisa ada satu klik Beli sebelum terdeteksi; dicek lagi segera setelah klik dan
+  tepat sebelum konfirmasi bottom sheet.
 - Checkout `--live` memotong saldo ShopeePay sungguhan setelah Anda memasukkan PIN.

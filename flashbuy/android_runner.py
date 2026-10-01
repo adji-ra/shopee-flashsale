@@ -9,14 +9,16 @@ Alur berbasis status: di setiap iterasi layar diklasifikasi, lalu aksi yang sesu
 
 Kecepatan (lihat android_driver): hot path hanya memakai `info`/`exists` (satu pencarian pohon di device),
 klasifikasi = rantai `exists` berprioritas dengan regex gabungan; `find_all` (info_list: ~16 pencarian
-per elemen cocok) hanya untuk bacaan sempit di langkah maju (sheet, checkout, keranjang). Latensi tiap
+per elemen cocok) hanya untuk bacaan sempit di langkah maju (sheet, checkout, keranjang) dan untuk menilai
+tombol "Habis" polos setelah `exists`-nya kena (bukan di iterasi polling). Latensi tiap
 query diukur (TimedDriver) dan ditulis ke log setelah run. Tidak ada sleep tetap: kondisi + timeout.
 Semua waktu dari ServerClock (jam yang sama dengan jendela polling), jadi tes memakai jam palsu.
 
-Keamanan klik: setiap aksi polling (Beli, konfirmasi ulang di sheet, reload) lewat PollingGate (>= 425 ms,
-T-1..T+8 s); reload menggeser slot berikutnya dari saat reload SELESAI; tombol diverifikasi ulang tepat
-sebelum diklik bila sempat menunggu slot. Aplikasi TIDAK pernah ditutup/di-force-stop; captcha,
-verifikasi, dan layar PIN dibiarkan apa adanya.
+Keamanan klik: setiap aksi polling (Beli, konfirmasi ulang di sheet, reload, pilih ulang variasi setelah
+reload) lewat PollingGate (>= 425 ms, T-1..T+8 s); reload menggeser slot berikutnya dari saat reload SELESAI;
+tombol Beli diverifikasi ulang tepat sebelum diklik bila sempat menunggu slot, chip variasi selalu dibaca
+ulang setelah slot. Captcha/verifikasi (teks & content-desc) dicek sebelum konfirmasi sheet. Aplikasi TIDAK
+pernah ditutup/di-force-stop; captcha, verifikasi, dan layar PIN dibiarkan apa adanya.
 """
 
 from __future__ import annotations
@@ -377,9 +379,12 @@ class AndroidRunner:
         return seen
 
     def _bare_sold_out(self, context: str) -> Seen | None:
-        """Tombol "Habis" polos (bukan lencana chip variasi lain). find_all: semua kecocokan dinilai."""
-        pat = rf"(?i){SP}*(?:{'|'.join(map(re.escape, BARE_SOLD_OUT))}){SP}*"
-        for n in self.d.find_all(Sel("textMatches", pat)):
+        """Tombol "Habis" polos (bukan lencana chip variasi lain). exists dulu (murah); bila ada, find_all menilai
+        semua kecocokan."""
+        sel = Sel("textMatches", rf"(?i){SP}*(?:{'|'.join(map(re.escape, BARE_SOLD_OUT))}){SP}*")
+        if not self.d.exists(sel):
+            return None
+        for n in self.d.find_all(sel):
             if self._sold_counts(n, None, context):
                 return Seen(Screen.SOLD_OUT, f"tombol {n.label!r}", n)
         return None
@@ -502,13 +507,12 @@ class AndroidRunner:
         if (seen := self._danger(None, context, by="descriptionMatches")) is not None:  # mis. captcha WebView
             seen.evidence = f"content-desc {seen.evidence}"
             return self._observe(seen, t_obs)
-        if self.d.exists(Sel("className", "android.widget.ProgressBar")):
-            return self._observe(Seen(Screen.LOADING, "indikator loading"), t_obs)
-        # layar jarang (habis, login, PIN tanpa teks): sesudah LOADING agar iterasi menunggu loading tetap murah
-        if (seen := self._bare_sold_out(context)) is not None:
-            return self._observe(seen, t_obs)
         if (n := self._first(markers=("login",))) is not None:
             return self._observe(Seen(Screen.LOGIN_REQUIRED, f"teks {n.label[:40]!r}", n), t_obs)
+        if (seen := self._bare_sold_out(context)) is not None:
+            return self._observe(seen, t_obs)
+        if self.d.exists(Sel("className", "android.widget.ProgressBar")):
+            return self._observe(Seen(Screen.LOADING, "indikator loading"), t_obs)
         if context != "after_order" and (n := self._has("pin_screen")) is not None:  # PIN tanpa teks
             return self._observe(Seen(Screen.PIN_SCREEN, f"resourceId {n.rid}", n), t_obs)
         return self._observe(Seen(Screen.UNKNOWN, "tidak ada elemen yang dikenali"), t_obs)
@@ -847,8 +851,9 @@ class AndroidRunner:
             self._keepalive = None
 
     def _preselect_variant(self) -> None:
-        """Pilih variasi lebih awal (T-60 s) bila opsinya tampil langsung di halaman produk. Tidak dilakukan
-        saat polling: di sana variasi dipilih di bottom sheet setelah klik Beli."""
+        """Pilih variasi lebih awal (T-60 s) bila opsinya tampil langsung di halaman produk. Saat polling hanya
+        dipilih ulang setelah reload yang melepasnya (_reselect_variant, lewat gate); selain itu variasi dipilih
+        di bottom sheet setelah klik Beli."""
         if not self.variant:
             return
         opt = self._find("variant_option", sticky=False)
@@ -867,8 +872,15 @@ class AndroidRunner:
         if self._has("sheet_marker") is not None:  # opsi membuka bottom sheet -> tutup, pilih ulang setelah Beli
             self.d.press_back()
             self.log.info("pilih variasi membuka bottom sheet; ditutup, dipilih ulang setelah klik Beli")
-        else:
-            self._variant_on_page = True  # dicek ulang setelah tiap reload saat polling
+            return
+        # dicek ulang setelah tiap reload saat polling, HANYA bila status terpilih chip terbaca (chip yang
+        # statusnya tak terbaca tidak di-tap ulang: bisa jadi toggle yang melepas pilihan; lapis 3 penentu)
+        end = self._mono() + VARIANT_VERIFY_S
+        while not self._variant_on_page and self._mono() < end:
+            chip = self._find("variant_option", sticky=False)
+            self._variant_on_page = chip is not None and (chip.selected or chip.checked)
+        if not self._variant_on_page:
+            self.log.info(f"status terpilih variasi {self.variant!r} tidak terbaca; tidak dicek ulang setelah reload")
 
     # ------------------------------------------------------------------ attempt
 
@@ -941,8 +953,8 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 self._checkpoint()
-                self.d.click(info)
-                self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
+                self._reselect_variant()
+                self.limiter.touch(clock.now())  # seperti reload: slot berikutnya dihitung dari akhir aksi ini
                 continue
             stale = outcome.screen in (Screen.NOT_STARTED, Screen.ERROR_TOAST, Screen.VARIANT_REQUIRED)
             if kind in ("sheet", "progress"):  # sheet masih terbuka: konfirmasi ulang = aksi polling
@@ -958,11 +970,12 @@ class AndroidRunner:
                 t_wait = self._mono()
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
+                waited = self._mono() - t_wait > REVERIFY_AFTER_WAIT_S
                 self._checkpoint()
                 # toast lama bukan reaksi klik ini: dibersihkan SEBELUM klik (toast reaksi klik tetap terbaca) dan
                 # sebelum cek ulang tombol, supaya jarak cek ulang -> klik sesingkat mungkin
                 self.d.clear_toast()
-                if self._mono() - t_wait > REVERIFY_AFTER_WAIT_S:
+                if waited:
                     # sempat menunggu slot: layar bisa sudah berubah (mis. checkout) -> cek ulang tombolnya
                     fresh = self._find("buy_button")
                     if fresh is None or fresh.bounds != btn.bounds:
@@ -1184,6 +1197,23 @@ class AndroidRunner:
                 raise _Stop(RunStatus.ERROR, "bottom sheet terbuka sebelum klik Beli dan tidak tertutup dengan back")
         self._guard_at = float("-inf")
 
+    def _reselect_variant(self) -> None:
+        """Klik ulang chip variasi (slot gate sudah dipakai). Chip dibaca ulang (koordinat lama tidak dipakai),
+        bahaya dicek dulu; bila chip ternyata membuka bottom sheet, sheet ditutup dan variasi dipilih di sheet
+        setelah klik Beli (tidak dicek ulang lagi)."""
+        if (seen := self._danger(None, "product")) is not None:
+            seen = self._no_pin(seen)
+            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        opt = self._find("variant_option", sticky=False)
+        if opt is None or opt.selected or opt.checked or not opt.enabled:
+            return
+        self.d.click(opt)
+        self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
+        if self._has("sheet_marker") is not None:
+            self._variant_on_page = False
+            self._close_sheet()
+        self._guard_at = float("-inf")
+
     def _variant_after_reload(self) -> Node | None:
         """Reload bisa mengembalikan halaman ke variasi bawaan: harga lapis 1 lalu milik variasi lain. Variasi
         yang dipilih di halaman produk saat arm diperiksa sekali per reload; belum terpilih -> dipilih ulang
@@ -1252,6 +1282,7 @@ class AndroidRunner:
 
         Elemen diambil dari find_all sempit (jendela aktif = sheet) dan dipilih yang paling bawah, supaya
         tidak men-tap elemen halaman produk di belakang sheet (tap di luar sheet bisa menutupnya)."""
+        waited = False  # sempat memilih variasi: layar bisa berubah sejak klasifikasi terakhir
         if self.variant:
             opt = self._pick("variant_option", self._sheet_nodes("variant_option")) \
                 or self._find("variant_option", sticky=False)
@@ -1262,6 +1293,7 @@ class AndroidRunner:
                 if not opt.enabled:
                     raise _Stop(RunStatus.SOLD_OUT, f"variasi {self.variant!r} tidak bisa dipilih (habis?)")
                 self.d.click(opt)
+                waited = True
                 self.log.mark("variant_selected", self.variant)
                 end = self._mono() + VARIANT_VERIFY_S
                 while True:
@@ -1276,6 +1308,13 @@ class AndroidRunner:
         confirm = self._pick("sheet_confirm", self._sheet_nodes("sheet_confirm")) or self._find("sheet_confirm")
         if confirm is None:
             raise _Stop(RunStatus.ERROR, "tombol konfirmasi di pilihan variasi tidak ditemukan")
+        # konfirmasi = langkah yang mengikat: captcha/verifikasi (teks bila sempat memilih variasi; content-desc
+        # selalu) dicek tepat sebelumnya
+        if waited and (seen := self._danger(None, "after_buy")) is not None:
+            seen = self._no_pin(seen)
+            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._guard_at = float("-inf")
+        self._guard(1)
         self.d.clear_toast()
         t_click = self.clock.now_ms()
         self.d.click(confirm)
@@ -1424,11 +1463,30 @@ class AndroidRunner:
                             f"total checkout tidak stabil/terbaca dalam {timeout:.1f} s "
                             f"(ongkir {pricing.rupiah(shipping)}, total {pricing.rupiah(total)})")
         verdict = pricing.check_checkout(snap, self.limits)
+        if verdict.values.get("name_ok") is False or verdict.values.get("variant_ok") is False:
+            verdict = self._recheck_identity(snap, total_rid, shipping_rid) or verdict
         self.log.info(f"checkout terbaca: {verdict.summary()}")
         if not verdict.ok:
             raise _Stop(RunStatus.PRICE_GUARD, f"{'; '.join(verdict.reasons)} | {verdict.summary()}")
         self.log.mark("price_guard_ok", verdict.summary())
         return verdict
+
+    def _recheck_identity(self, snap: pricing.CheckoutSnapshot, total_rid, shipping_rid
+                          ) -> pricing.CheckoutVerdict | None:
+        """Nama/variasi tidak terlihat di bacaan sempit: bacaan sempit hanya memuat teks yang cocok pola, jadi
+        header toko bisa tak terbaca dan kolom produk lalu diambil dari harga (nama yang di kiri harga ikut
+        terbuang). Baca SEKALI semua teks layar (mahal, hanya di jalur gagal ini), susun ulang baris produk, dan
+        nilai ulang dengan total/ongkir yang sudah stabil. Tetap fail-closed: verdict baru harus lolos semua cek."""
+        nodes = self._snapshot()
+        seen = self._classify_nodes(nodes, "any")
+        if seen.screen in TERMINAL:
+            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        full = checkout_snapshot(nodes, total_rid, shipping_rid)
+        verdict = pricing.check_checkout(pricing.CheckoutSnapshot(rows=full.rows, totals=snap.totals,
+                                                                  shippings=snap.shippings,
+                                                                  page_text=full.page_text), self.limits)
+        self.log.info(f"nama/variasi dibaca ulang dari semua teks layar: {verdict.summary()}")
+        return verdict if verdict.ok else None
 
     # ------------------------------------------------------------------ akhir
 

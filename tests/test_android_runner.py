@@ -507,6 +507,53 @@ def test_variant_on_page_reselected_once_after_reload(tmp_path, reload):
     _no_order(out)
 
 
+def test_variant_reselect_that_opens_sheet_closes_it_and_buys_normally(tmp_path):
+    """Setelah reload, chip variasi ternyata membuka bottom sheet: sheet ditutup (back) - klik Beli berikutnya
+    tidak mendarat di konfirmasi sheet - dan variasi diverifikasi lagi di sheet setelah klik Beli."""
+    def patch(runner, app) -> None:
+        orig = app.on_intent
+
+        def on_intent(url: str, package: str) -> None:
+            orig(url, package)
+            if app.now() >= app.sc.open_at - 1:  # reload saat polling: chip & Beli kini membuka sheet
+                app.sc.sheet = True
+
+        app.on_intent = on_intent
+
+    out = run_android(tmp_path, variants=VARIANTS, variants_on_page=True, sheet=False, live_update=False,
+                      flash_price=150_000, variant_prices={TARGET_VARIANT: 95_000},
+                      cfg={"variant": TARGET_VARIANT, "android": {"reload": "intent"}}, during=_during_patch(patch))
+    assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
+    taps = [e for e in out.kind("tap") if e["t_server_ms"] >= _t(out) - 1000]
+    assert [e["detail"] for e in taps][:2] == [f"variant:{TARGET_VARIANT}", "buy"], taps
+    backs = [e for e in out.kind("back") if e["t_server_ms"] >= _t(out) - 1000]
+    assert [e["detail"] for e in backs] == ["sheet"] and taps[0]["t_server_ms"] < backs[0]["t_server_ms"] < taps[1][
+        "t_server_ms"]
+    assert len(out.kind("buy")) == 1 and len(out.kind("confirm")) == 1
+    assert "harga=Rp95.000" in out.result.step("price_guard_ok").detail
+    assert_polling_rules(out)
+    _no_order(out)
+
+
+def test_slow_clear_toast_does_not_trigger_button_reverify(tmp_path, monkeypatch):
+    """Re-verifikasi tombol hanya bila MENUNGGU slot > 50 ms; clear_toast yang lambat (sesudah slot) tidak
+    menambah query sebelum klik Beli."""
+    from flashbuy.android_driver import FakeDriver
+    from tests import android_harness
+
+    class SlowToastDriver(FakeDriver):
+        def clear_toast(self) -> None:
+            self._rpc("clear_toast", latency=0.11)
+
+    monkeypatch.setattr(android_harness, "FakeDriver", SlowToastDriver)
+    out = run_android(tmp_path)
+    assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
+    calls = out.driver.calls
+    first_click = next(i for i, (op, t) in enumerate(calls) if op == "click" and t == "Beli Sekarang")
+    assert calls[first_click - 1] == ("clear_toast", ""), calls[first_click - 3:first_click + 1]
+    assert "buy_recheck" not in out.step_names()
+
+
 def test_sheet_that_does_not_close_before_first_click_is_error_without_click(tmp_path):
     def patch(runner, app) -> None:
         _sheet_open_at_arm(runner, app)

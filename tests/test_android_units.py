@@ -2266,3 +2266,22 @@ def test_desc_danger_judged_on_content_desc_even_when_node_has_text(tmp_path):
     assert seen is not None and seen.screen == Screen.CAPTCHA, seen
     assert runner._danger(None, "product") is None  # text "Tutup" bukan penanda
     log.close()
+
+
+@pytest.mark.parametrize("screen, expected", [("login", Screen.LOGIN_REQUIRED), ("sold_out", Screen.SOLD_OUT)])
+def test_progress_bar_does_not_hide_login_or_sold_out_button(tmp_path, screen, expected):
+    """Indikator loading (mis. gambar yang masih dimuat) di layar login / halaman produk habis: tetap terbaca
+    LOGIN_REQUIRED / SOLD_OUT (cek murahnya sebelum ProgressBar), bukan LOADING yang ditunggu sampai habis waktu."""
+    runner, app, _driver, log = _prepared(tmp_path, variant_chip_sold_out=True)
+    spinner = ("", Node(cls="android.widget.ProgressBar", bounds=(310, 760, 410, 860)))
+    if screen == "login":
+        app.screen = "login"
+        orig = app._r_login
+        app._r_login = lambda: [*orig(), spinner]
+    else:
+        app.sold_out = True  # tombol "Habis" + chip variasi lain "Habis" (bukan tombol)
+        orig = app._r_product
+        app._r_product = lambda: [*orig(), spinner]
+    for context in ("product", "after_buy", "any"):
+        assert runner._classify(context).screen == expected, context
+    log.close()
