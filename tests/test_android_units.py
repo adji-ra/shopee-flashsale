@@ -480,6 +480,18 @@ def test_checkout_snapshot_expected_variant_must_be_in_product_row(variant, ok):
         assert f"variasi {variant!r} tidak terlihat di baris produk" in verdict.reasons
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "BUG: pricing.check_checkout - expected_variant dicari di SELURUH teks baris produk, termasuk nama produk. Judul "
+    "yang memuat teks variasi (mis. 'Kaos Polos Hitam Putih') membuat cek variasi lapis 3 selalu lolos walau baris "
+    "'Variasi:' menunjukkan variasi lain; padahal _handle_sheet menyerahkan chip yang tidak terbaca terpilih ke "
+    "lapis 3 ('diverifikasi di checkout')."))
+def test_checkout_variant_check_not_satisfied_by_product_name():
+    snap = checkout_snapshot(_checkout((("Kaos Polos Hitam Putih", "Rp99.000", "x1"),), variation="Variasi: Putih"))
+    assert snap.rows == ["Kaos Polos Hitam Putih\nVariasi: Putih\nRp99.000\nx1"]
+    verdict = pricing.check_checkout(snap, Limits(100_000, 120_000, "Kaos Polos", "Hitam"))
+    assert not verdict.ok, verdict.values  # variasi terpilih Putih, bukan Hitam
+
+
 def test_checkout_snapshot_without_rows_needs_exactly_one_order_group():
     nodes = [n for n in _checkout() if n.label != "x1"]
     nodes.append(_n("Total Pesanan (1 Produk):", (20, 1200, 400, 1230)))  # grup pesanan kedua (toko lain)
@@ -1909,6 +1921,39 @@ def test_u2_agent_alive_needs_ping_and_real_rpc():
         _check_alive = None
 
     assert U2Driver(device=NoCheck()).agent_alive() is None  # tidak bisa dicek
+
+
+class _U2Gestures(FakeU2Device):
+    """swipe/press persis uiautomator2 3.7: `self.jsonrpc.swipe(..)` / `self.jsonrpc.pressKey(..)` TANPA http_timeout
+    (bawaan HTTP_TIMEOUT = 300 s; patch soket memakai timeout yang sama)."""
+
+    def swipe(self, fx, fy, tx, ty, duration=None, steps=None):
+        steps = int(duration * 200) if duration else 10
+        return self.jsonrpc.swipe(fx, fy, tx, ty, max(2, steps))
+
+    def press(self, key):
+        return self.jsonrpc.pressKey(key)
+
+    def _rpc_swipe(self, fx, fy, tx, ty, steps):
+        self.actions.append(("swipe", fx, fy, tx, ty, steps))
+        return True
+
+    def _rpc_pressKey(self, key):
+        self.actions.append(("press", key))
+        return True
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "BUG: U2Driver.swipe_refresh/press_back lewat d.swipe()/d.press() u2 yang memanggil jsonrpc TANPA http_timeout "
+    "-> batas 300 s bawaan u2 (soket ikut 300 s), bukan rpc_timeout_s. Reload default (android.reload='swipe') adalah "
+    "aksi polling di T-1..T+8 s: agent yang macet menggantung runner hingga 5 menit, bukan gagal dalam 5 s."))
+def test_u2_polling_gestures_bounded_by_rpc_timeout():
+    dev = _U2Gestures([BUY_INFO])
+    drv = U2Driver(device=dev, rpc_timeout_s=2.0)
+    drv.swipe_refresh()  # reload saat polling
+    drv.press_back()  # menutup sheet yang terbuka sebelum klik Beli pertama
+    assert dev.actions == [("swipe", 360, 483, 360, 1209, 60), ("press", "back")]
+    assert [(m, t) for m, _, t in dev.rpcs] == [("swipe", 2.0), ("pressKey", 2.0)]
 
 
 def test_u2_restart_agent_http_stop_then_stop_start(monkeypatch):

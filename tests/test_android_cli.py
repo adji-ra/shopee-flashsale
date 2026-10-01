@@ -4,6 +4,13 @@ CLI memakai ServerClock() = jam sistem, jadi device palsu di sini memakai jam NY
 dengan latensi kecil (5 ms); latensi tetap FakeDriver yang besar (start_url 0,3 s, restart agent 2 s,
 dump 0,4 s) dipotong supaya tes tetap cepat. `cli._android_driver` diganti pabrik FakeDriver,
 `timesync.sync` diganti laporan palsu (tanpa jaringan), alarm tidak berbunyi.
+
+Desain ronde 2 yang diuji di sini: `run` menolak start setelah T-70 s (kecuali --allow-local, khusus mock/tes:
+semua run e2e di sini memakainya karena T hanya beberapa detik lagi); `--live --headless` butuh --allow-local;
+precheck/arm tidak pernah melempar (hasil ERROR/CAPTCHA/... dilaporkan, alarm arm de-dup); saldo dibandingkan
+dengan min(harga tampil, max_item_price); latensi info/exists dan find_all dilaporkan terpisah; pesan aplikasi
+lewat overlay node maupun Toast Android (getLastToast); last_toast/clear_toast = operasi agent saja;
+`cli._android_driver` membuat U2Driver(serial, package=...) yang memanggil jsonrpc langsung.
 """
 
 from __future__ import annotations
@@ -17,13 +24,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from rich.console import Console
 
 from flashbuy import android_selectors, cli, notifier, timesync
-from flashbuy.android_driver import DriverError, FakeDriver, Sel
+from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Sel, U2Driver
+from flashbuy.android_runner import AndroidRunner
+from flashbuy.android_screen import RP_ANY_MATCH
 from flashbuy.android_selectors import KIND_RANK
 from flashbuy.runner_base import MAYBE_ORDERED_MSG, RunStatus
 from flashbuy.timesync import WIB, OffsetResult, SyncReport
@@ -33,6 +43,7 @@ from tests.fake_android import PACKAGE, PRODUCT_URL, AppScenario, FakeShopeeApp
 SERIAL = "FAKE123"
 LATENCY_S = 0.005
 SLOW_QUERY_S = 0.15
+SLOW_FIND_ALL_S = 0.35
 OPEN_IN_S = 1.0  # start_time di depan: precheck + arm (~0,35 s) lalu benar-benar menunggu T-lead
 WM_SIZE = "Physical size: 1080x2460"  # beda dari tata letak app palsu: resolusi dibaca, bukan diasumsikan
 PROPS = {"ro.product.brand": "TECNO", "ro.product.manufacturer": "TECNO", "ro.product.model": "TECNO BG6",
@@ -41,6 +52,15 @@ PROPS = {"ro.product.brand": "TECNO", "ro.product.manufacturer": "TECNO", "ro.pr
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
 PRECHECK_ROWS = ["device", "agent uiautomator2", "layar", "aplikasi Shopee", "login", "tombol Beli",
                  "harga produk", "latensi query", "alamat default", "saldo ShopeePay"]
+# last_toast/clear_toast: status Toast di agent uiautomator2 saja (tidak menyentuh aplikasi/Shopee).
+AGENT_OPS = {"last_toast", "clear_toast"}
+# Operasi driver yang sah dipakai CLI/runner. Tidak ada input teks (PIN tidak mungkin diketik alat).
+ALLOWED_OPS = {"exists", "info", "find_all", "click", "current_app", "start_url", "swipe_refresh", "press_back",
+               "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
+# Klik yang harus langsung diikuti clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
+TOAST_CLEARED_CLICKS = {"Beli Sekarang", "Buat Pesanan"}
+VARIANTS = ["128GB Hitam", "256GB Biru"]
+VARIANT_TOAST = "Silakan pilih variasi terlebih dahulu"
 
 
 # ------------------------------------------------------------------ device palsu (jam nyata)
@@ -75,12 +95,29 @@ class SlowQueryDriver(FakeDriver):
         return super().exists(sel)
 
 
+class SlowFindAllDriver(FakeDriver):
+    """find_all (info_list: ~16 pencarian per elemen) 350 ms pada probe latensi; info/exists tetap cepat."""
+
+    def find_all(self, sel: Sel) -> list:
+        if sel == Sel("textMatches", RP_ANY_MATCH):
+            time.sleep(SLOW_FIND_ALL_S)
+        return super().find_all(sel)
+
+
 class AgentWontRestartDriver(FakeDriver):
     """Agent uiautomator2 mati dan tidak bisa dihidupkan ulang."""
 
     def restart_agent(self) -> None:
         self._rpc("restart_agent")
         raise DriverError("uiautomator2 tidak bisa dijalankan ulang")
+
+
+class AgentDiesOnFindAllDriver(FakeDriver):
+    """Agent dibunuh (HiOS) tepat saat bacaan find_all pertama di tengah precheck."""
+
+    def find_all(self, sel: Sel) -> list:
+        self._rpc("find_all", sel)
+        raise AgentDead("find_all: HTTPError: agent tidak menjawab")
 
 
 @dataclass
@@ -124,11 +161,19 @@ def sync_calls(monkeypatch) -> list[dict]:
     return calls
 
 
+class AlarmLog(list):
+    """Daftar event alarm (list biasa untuk perbandingan) + pesan tiap alarm di `messages`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+
 @pytest.fixture(autouse=True)
-def alarms(monkeypatch) -> list[str]:
+def alarms(monkeypatch) -> AlarmLog:
     """Notifier CLI tanpa beep/webhook; mengembalikan daftar event alarm (diisi saat run)."""
     made: list[notifier.Notifier] = []
-    events: list[str] = []
+    events = AlarmLog()
 
     class QuietNotifier(notifier.Notifier):
         def __init__(self, webhook_url: str = "", **kw):
@@ -137,6 +182,7 @@ def alarms(monkeypatch) -> list[str]:
 
         def alarm(self, event: str, message: str, **extra) -> None:
             events.append(event)
+            events.messages.append(message)
             super().alarm(event, message, **extra)
 
     monkeypatch.setattr(notifier, "Notifier", QuietNotifier)
@@ -238,7 +284,9 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
     assert rows["aplikasi Shopee"][1] == f"{PACKAGE} 3.40.21"
     assert "enabled=False" in rows["tombol Beli"][1]  # sebelum slot buka: tombol ada tapi belum aktif
     assert rows["harga produk"][1].startswith("harga Rp150.000 > maks Rp100.000")
-    assert re.fullmatch(r"median \d+ ms, p95 \d+ ms, maks \d+ ms \(13 query\)", rows["latensi query"][1])
+    # hot path (info/exists, 10 probe + 3 info tombol Beli) dan find_all (lebih mahal) diukur terpisah
+    assert re.fullmatch(r"info/exists median \d+ ms, p95 \d+ ms, maks \d+ ms \(13 query\); find_all \d+ ms",
+                        rows["latensi query"][1]), rows["latensi query"]
     assert "Rp500.000" in rows["saldo ShopeePay"][1]
     assert prechecks[0].status is None and prechecks[0].warnings == []
     assert dev.configs and dev.configs[0].android.serial == SERIAL
@@ -251,7 +299,8 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
                  "device ro.build.version.release = 13", "device ro.build.version.sdk = 33",
                  "device ro.tranos.version = hios13.6.0", f"device wm size = {WM_SIZE}",
                  "device wm density = Physical density: 320", "HiOS/Transsion terdeteksi",
-                 "latensi query precheck: median", "latensi precheck exists: n=10"):
+                 "latensi query precheck: info/exists median", "latensi precheck exists: n=10",
+                 "latensi precheck find_all: n="):
         assert line in log, line
     with (log_dir / "android-queries-precheck.csv").open(encoding="utf-8") as f:
         samples = list(csv.DictReader(f))
@@ -316,10 +365,46 @@ def test_precheck_slow_queries_warn_latency(tmp_path, device, term, prechecks):
     status, detail = table_rows(text)["latensi query"]
     assert status == "PERINGATAN"
     p95 = int(re.search(r"p95 (\d+) ms", detail).group(1))
-    assert p95 >= SLOW_QUERY_S * 1000 and "> target 100 ms" in detail
+    assert p95 >= SLOW_QUERY_S * 1000 and "> target 100/300 ms" in detail
     assert [i.name for i in prechecks[0].warnings] == ["latensi query"]
     log = (only_log("logs/*-precheck") / "android.log").read_text(encoding="utf-8")
-    assert re.search(r"WARN \d+ query > 100 ms \(terlama exists", log)
+    assert re.search(r"WARN \d+ query melewati target \(info/exists/klik 100 ms, find_all 300 ms\); "
+                     r"terlama exists text='__flashbuy_probe__'", log), log
+
+
+def test_precheck_slow_find_all_warns_with_its_own_budget(tmp_path, device, term, prechecks):
+    """find_all punya target sendiri (300 ms); info/exists cepat tetap di bawah 100 ms."""
+    rc, _ = run_precheck(tmp_path, device, driver_cls=SlowFindAllDriver)
+    text = term.getvalue()
+    assert rc == 0, text
+    status, detail = table_rows(text)["latensi query"]
+    assert status == "PERINGATAN" and "> target 100/300 ms" in detail, detail
+    hot_p95 = int(re.search(r"p95 (\d+) ms", detail).group(1))
+    find_all_ms = int(re.search(r"find_all (\d+) ms", detail).group(1))
+    assert hot_p95 < 100 <= SLOW_FIND_ALL_S * 1000 <= find_all_ms, detail
+    assert [i.name for i in prechecks[0].warnings] == ["latensi query"]
+    log = (only_log("logs/*-precheck") / "android.log").read_text(encoding="utf-8")
+    assert re.search(r"WARN \d+ query melewati target .*; terlama find_all textMatches=", log), log
+
+
+def test_precheck_agent_death_mid_precheck_is_reported_not_raised(tmp_path, device, term, prechecks):
+    """precheck() tidak pernah melempar: DriverError/AgentDead di tengah precheck -> PrecheckResult ERROR,
+    tabel tetap tercetak, exit 1 (bukan traceback / exit 2), log & CSV latensi tetap ditulis."""
+    rc, dev = run_precheck(tmp_path, device, driver_cls=AgentDiesOnFindAllDriver)
+    text = term.getvalue()
+    assert rc == 1, text
+    assert prechecks and prechecks[0].status == RunStatus.ERROR
+    items = [(i.name, i.ok) for i in prechecks[0].items]
+    assert items[0] == ("device", True), "info device yang sudah terbaca tetap dilaporkan"
+    assert items[-1] == ("device", False), items
+    failed = [i for i in prechecks[0].items if i.ok is False]
+    assert len(failed) == 1 and failed[0].detail.startswith("koneksi device/agent gagal: find_all: HTTPError")
+    assert table_rows(text)["device"] == ("GAGAL", failed[0].detail)  # tercetak di tabel
+    assert "Traceback" not in text
+    log_dir = only_log("logs/*-precheck")
+    assert (log_dir / "android-queries-precheck.csv").exists()
+    assert dev.app.kind("tap") == [] and dev.app.kind("order") == []
+    no_forbidden_shell(dev)
 
 
 @pytest.mark.parametrize(("scenario", "row", "detail"), [
@@ -335,18 +420,38 @@ def test_precheck_warnings_do_not_fail(tmp_path, device, term, prechecks, scenar
     assert [i.name for i in prechecks[0].warnings] == [row]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: precheck membandingkan saldo dengan harga yang tampil SEBELUM flash sale (harga normal Rp150.000 > "
-    "max_item_price) -> 'saldo ShopeePay' GAGAL & exit 1, padahal alat tidak akan pernah membayar di atas "
-    "max_item_price/max_total; saldo Rp110.000 cukup untuk harga flash Rp99.000 + ongkir Rp10.000. "
-    "Logika sama di web_runner."))
-def test_precheck_balance_enough_for_flash_price_is_not_failure(tmp_path, device, term):
+def test_precheck_balance_enough_for_flash_price_is_not_failure(tmp_path, device, term, prechecks):
+    # sebelum slot buka halaman menampilkan harga normal Rp150.000 (> max_item_price); alat tidak pernah membayar
+    # > max_item_price per unit, jadi saldo dibandingkan dengan min(harga tampil, max_item_price) = Rp100.000
     rc, _ = run_precheck(tmp_path, device, wallet_balance=110_000)
     text = term.getvalue()
     rows = table_rows(text)
-    assert rows["saldo vs max_total"] == ("PERINGATAN", "saldo Rp110.000 < max_total Rp120.000")
-    assert rows["saldo ShopeePay"][0] != "GAGAL", rows["saldo ShopeePay"]
+    assert "saldo vs max_total" not in rows, "saldo vs max_total = bagian baris 'saldo ShopeePay'"
+    assert rows["saldo ShopeePay"] == ("PERINGATAN", "saldo Rp110.000 >= harga Rp100.000 tetapi < max_total "
+                                                     "Rp120.000 (ongkir/biaya bisa membuatnya kurang)")
+    assert [i.name for i in prechecks[0].warnings] == ["saldo ShopeePay"]
     assert rc == 0, text
+
+
+@pytest.mark.parametrize(("normal_price", "balance", "status", "detail"), [
+    (150_000, 99_999, "GAGAL", "saldo Rp99.999 < harga Rp100.000"),  # acuan = max_item_price
+    (150_000, 120_000, "OK", "saldo Rp120.000 >= max_total Rp120.000"),
+    (80_000, 79_999, "GAGAL", "saldo Rp79.999 < harga Rp80.000"),  # harga tampil < max_item_price = acuan
+    (80_000, 80_000, "PERINGATAN", "saldo Rp80.000 >= harga Rp80.000 tetapi < max_total Rp120.000"),
+], ids=["kurang_dari_maks_item", "cukup_maks_total", "kurang_dari_harga_tampil", "sama_harga_tampil"])
+def test_precheck_balance_vs_min_displayed_price_and_max_item(tmp_path, device, term, prechecks, normal_price,
+                                                               balance, status, detail):
+    """Android: saldo < min(harga tampil, max_item_price) -> GAGAL (exit 1); < max_total -> PERINGATAN; else OK.
+
+    (PERINGATAN = penilai halaman saldo mengembalikan None -> halaman dibaca ulang sampai 5 s jam nyata; kasus
+    PERINGATAN sengaja sedikit supaya tes tetap cepat.)"""
+    rc, dev = run_precheck(tmp_path, device, normal_price=normal_price, wallet_balance=balance)
+    text = term.getvalue()
+    got_status, got_detail = table_rows(text)["saldo ShopeePay"]
+    assert got_status == status and got_detail.startswith(detail), (got_status, got_detail)
+    assert rc == (1 if status == "GAGAL" else 0), text
+    assert prechecks[0].status is None, "saldo kurang = item GAGAL, bukan status fatal"
+    assert dev.app.kind("tap") == [] and dev.app.kind("order") == [], "precheck hanya membaca"
 
 
 def test_precheck_login_required(tmp_path, device, term, prechecks):
@@ -365,30 +470,130 @@ def test_precheck_login_required(tmp_path, device, term, prechecks):
 
 @dataclass
 class CliRun:
-    rc: int
+    rc: int | None
     text: str
     dev: Device
     open_at: float
     result: dict | None
     run_dir: Path | None
+    error: BaseException | None = None  # exception dari cli.main (hanya bila run_cli(catch=True))
 
     def step_names(self) -> list[str]:
         return [s["name"] for s in self.result["steps"]]
+
+    def step(self, name: str) -> dict:
+        return next(s for s in self.result["steps"] if s["name"] == name)
 
     def buys(self) -> list[dict]:
         return self.dev.app.kind("buy")
 
 
 def run_cli(tmp_path, device, term, *, live: bool = False, cfg: dict | None = None, open_in_s: float = OPEN_IN_S,
-            **scenario) -> CliRun:
+            catch: bool = False, **scenario) -> CliRun:
     open_at = time.time() + open_in_s
     dev = device(open_at, **scenario)
-    argv = ["run", "--config", str(write_cfg(tmp_path, open_at, **(cfg or {}))), "--only", "android"]
-    rc = cli.main(argv + (["--live"] if live else []))
+    # T beberapa detik lagi (jam nyata): --allow-local (opsi tersembunyi khusus mock/tes) melewati penolakan
+    # "Terlambat" (run harus mulai <= T-70 s); penolakan itu sendiri diuji di test_run_late_start_*
+    argv = ["run", "--config", str(write_cfg(tmp_path, open_at, **(cfg or {}))), "--only", "android",
+            "--allow-local"]
+    rc, error = None, None
+    try:
+        rc = cli.main(argv + (["--live"] if live else []))
+    except Exception as e:  # noqa: BLE001 - hanya dengan catch=True (tes yang memeriksa keamanan saat konsol gagal)
+        if not catch:
+            raise
+        error = e
     found = list(tmp_path.glob("logs/*-android/android-result.json"))
     assert len(found) <= 1
     result = json.loads(found[0].read_text(encoding="utf-8")) if found else None
-    return CliRun(rc, term.getvalue(), dev, open_at, result, found[0].parent if found else None)
+    return CliRun(rc, term.getvalue(), dev, open_at, result, found[0].parent if found else None, error)
+
+
+def assert_safe_ops(dev: Device) -> None:
+    """Hanya operasi driver yang sah; tanpa perintah shell penutup aplikasi / input teks."""
+    assert set(dev.ops()) <= ALLOWED_OPS, set(dev.ops()) - ALLOWED_OPS
+    no_forbidden_shell(dev)
+
+
+def assert_toast_cleared_after_clicks(dev: Device) -> int:
+    """clear_toast (operasi agent) tepat setelah setiap klik Beli / konfirmasi sheet / Buat Pesanan."""
+    calls = dev.driver.calls
+    idx = [i for i, (op, target) in enumerate(calls) if op == "click" and target in TOAST_CLEARED_CLICKS]
+    assert idx, "tidak ada klik Beli/konfirmasi/Buat Pesanan"
+    for i in idx:
+        assert calls[i + 1] == ("clear_toast", ""), calls[i:i + 3]
+    return len(idx)
+
+
+def run_csv(out: CliRun) -> list[dict]:
+    with (out.run_dir / "android-queries-run.csv").open(encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def hook_arm(monkeypatch, before: Callable[[AndroidRunner], None]) -> None:
+    """Jalankan `before(runner)` tepat saat arm (T-60 s) dimulai, sebelum intent membuka produk."""
+    orig = AndroidRunner._arm_sync
+
+    def arm_sync(self: AndroidRunner) -> None:
+        before(self)
+        return orig(self)
+
+    monkeypatch.setattr(AndroidRunner, "_arm_sync", arm_sync)
+
+
+class ArmScreenApp(FakeShopeeApp):
+    """Intent saat arm (T-60 s) mendarat di layar lain (captcha/verifikasi/login), padahal precheck normal."""
+
+    arm_screen: str | None = None
+    arming = False
+
+    def on_intent(self, url: str, package: str) -> None:
+        super().on_intent(url, package)
+        if self.arming and self.arm_screen:
+            self.screen = self.arm_screen
+
+
+class ArmFailDriver(FakeDriver):
+    """Intent VIEW gagal saat arm (precheck sebelumnya normal)."""
+
+    arming = False
+
+    def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        if self.arming:
+            self._rpc("start_url", url)
+            raise DriverError("am start gagal: Error: Activity not started, unable to resolve Intent")
+        super().start_url(url, package, wait)
+
+
+class AsyncToastApp(FakeShopeeApp):
+    """Toast Android ASINKRON (seperti HP): tercatat di getLastToast `toast_delay_s` setelah tap, jadi
+    clearLastToast runner tepat setelah klik tidak menghapus reaksi klik itu. Tidak pernah menjadi node."""
+
+    toast_delay_s = 0.06
+
+    def __init__(self, sc, clock):
+        self._pending: tuple[str, float] | None = None
+        self._recorded: str | None = None
+        super().__init__(sc, clock)
+
+    def _flush(self) -> None:
+        if self._pending is not None and self.now() >= self._pending[1]:
+            self._recorded, self._pending = self._pending[0], None
+
+    def _show_toast(self, text: str) -> None:
+        self.toast = (text, self.now() + self.toast_delay_s + 1.5)
+        if self.sc.toast_mode == "toast":
+            self._pending = (text, self.now() + self.toast_delay_s)
+
+    @property
+    def last_toast(self) -> str | None:
+        self._flush()
+        return self._recorded
+
+    @last_toast.setter
+    def last_toast(self, value: str | None) -> None:
+        self._flush()
+        self._recorded = value
 
 
 def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
@@ -410,8 +615,14 @@ def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
     assert out.dev.app.kind("order") == []
     assert "place_order" not in [e["detail"] for e in out.dev.app.kind("tap")]
     assert out.dev.app.screen == "checkout", "aplikasi dibiarkan di checkout (tidak ditutup)"
-    no_forbidden_shell(out.dev)
+    assert_safe_ops(out.dev)
     assert alarms == []
+    # klik Beli & konfirmasi sheet langsung diikuti clear_toast (operasi agent, tidak menyentuh aplikasi)
+    assert assert_toast_cleared_after_clicks(out.dev) == 2
+    # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists), tanpa find_all/toast/dump
+    t_poll, t_click = out.step("poll_start")["t_server_ms"], out.step("click_buy")["t_server_ms"]
+    hot = {r["op"] for r in run_csv(out) if t_poll <= int(r["t_server_ms"]) <= t_click}
+    assert hot and hot <= {"info", "exists"}, hot
     # log run: device props, latensi query precheck & run, screenshot + dump status akhir
     log = (out.run_dir / "android.log").read_text(encoding="utf-8")
     assert "device ro.product.model = TECNO BG6" in log and f"device wm size = {WM_SIZE}" in log
@@ -431,9 +642,15 @@ def test_run_android_live_e2e_stops_at_pin_and_leaves_app_open(tmp_path, device,
     assert len(out.buys()) == 1 and len(out.dev.app.kind("order")) == 1, "tepat satu pesanan"
     assert out.dev.app.screen == "pin", "layar PIN dibiarkan untuk diisi manual"
     assert "press_back" not in out.dev.ops()
-    no_forbidden_shell(out.dev)  # tidak ada `input text` -> PIN tidak mungkin diketik alat
+    assert_safe_ops(out.dev)  # tidak ada `input text` -> PIN tidak mungkin diketik alat
     _subsequence(out.step_names(), ["price_guard_ok", "place_order_gate", "click_place_order", "pin_screen"])
     assert alarms == ["ORDER_PLACED_AWAIT_PIN"]
+    # Beli, konfirmasi sheet, Buat Pesanan: masing-masing langsung diikuti clear_toast
+    assert assert_toast_cleared_after_clicks(out.dev) == 3
+    # setelah klik "Buat Pesanan" tidak ada klik/tombol/intent lagi (layar PIN tidak disentuh)
+    calls = out.dev.driver.calls
+    after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
+    assert not {"click", "press_back", "start_url", "swipe_refresh"} & {op for op, _ in after}, after
 
 
 def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, device, term, alarms):
@@ -441,11 +658,20 @@ def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, dev
     assert out.rc == 1, out.text
     assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
     assert out.result["status"] == "UNKNOWN_STATE" and out.result["message"] == MAYBE_ORDERED_MSG
-    assert out.result["detail"].startswith("UNKNOWN_STATE: layar tidak dikenali")
+    # pesan diagnosa baru: dihitung dari waktu pengamatan, diagnosa (aplikasi aktif, WebView, content-desc)
+    assert re.fullmatch(r"UNKNOWN_STATE: layar tidak dikenali > \d+\.\d s \(tidak ada elemen yang dikenali, "
+                        rf"aplikasi aktif {re.escape(PACKAGE)}/\S+\)", out.result["detail"]), out.result["detail"]
     assert f"Detail: {out.result['detail']}" in out.text
     assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
     assert len(out.dev.app.kind("order")) == 1 and out.dev.app.screen == "order_unknown"
     assert alarms == ["UNKNOWN_STATE"]
+    # diagnosa mahal hanya SEKALI, saat naik ke UNKNOWN_STATE (bukan di setiap iterasi UNKNOWN)
+    calls = out.dev.driver.calls
+    assert [op for op, _ in calls].count("webview") == 1
+    assert len([1 for op, t in calls if op == "find_all" and t.startswith("descriptionMatches")]) == 1
+    after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
+    assert not {"click", "press_back", "start_url", "swipe_refresh"} & {op for op, _ in after}, "tanpa retry"
+    assert_safe_ops(out.dev)
 
 
 @pytest.mark.parametrize(("flag", "status"), [("captcha_after_buy", "CAPTCHA"),
@@ -459,16 +685,98 @@ def test_run_android_captcha_left_as_is_without_retry(tmp_path, device, term, al
     assert len(out.buys()) == 1, "tanpa retry otomatis"
     assert out.dev.ops().count("click") == 1 and "press_back" not in out.dev.ops()
     assert out.dev.app.screen == status.lower(), "layar captcha/verifikasi tidak disentuh"
-    assert alarms == [status]
+    assert alarms == [status], "alarm sekali (tidak dobel)"
+    # setelah klik Beli: tidak ada aksi ke aplikasi lagi (tanpa klik, back, reload, intent)
+    ops = out.dev.ops()
+    assert not {"click", "press_back", "start_url", "swipe_refresh"} & set(ops[ops.index("click") + 1:])
+    assert_safe_ops(out.dev)
+
+
+@pytest.mark.parametrize("toast", ["node", "toast"], ids=["overlay_node", "android_toast"])
+def test_run_android_variant_required_message_via_both_channels_is_error(tmp_path, device, term, alarms, toast):
+    """Pesan "Silakan pilih variasi" sebagai overlay in-app (node) ATAU Toast Android (hanya lewat getLastToast):
+    CLI berhenti ERROR (isi `variant`), tanpa klik ulang Beli/konfirmasi, tanpa checkout."""
+    kw = {"toast_mode": "node"} if toast == "node" else {"app_cls": AsyncToastApp}
+    out = run_cli(tmp_path, device, term, variants=VARIANTS, variant_required=True, **kw)
+    assert out.rc == 1, out.text
+    assert "Status: ERROR - produk wajib pilih variasi; isi `variant` di target.yaml" in out.text
+    assert len(out.buys()) == 1 and len(out.dev.app.kind("confirm")) == 1, "tanpa klik ulang"
+    assert "no_response" not in out.step_names()
+    assert out.dev.app.kind("variant") == [], "variasi tidak dipilih alat tanpa config `variant`"
+    assert out.dev.app.kind("checkout") == [] and out.dev.app.kind("order") == []
+    if toast == "toast":
+        assert out.dev.app.sc.toast_mode == "toast"
+        assert out.dev.app.last_toast == VARIANT_TOAST, "pesan hanya ada di kanal getLastToast"
+        assert "last_toast" in out.dev.ops()
+    assert_toast_cleared_after_clicks(out.dev)
+    assert_safe_ops(out.dev)
+    assert alarms == []
+
+
+@pytest.mark.parametrize(("screen", "status"), [("captcha", "CAPTCHA"), ("verification", "VERIFICATION"),
+                                                 ("login", "LOGIN_REQUIRED")])
+def test_run_android_terminal_screen_at_arm_alarms_immediately_once(tmp_path, monkeypatch, device, term, alarms,
+                                                                     screen, status):
+    """Captcha/verifikasi/login muncul saat buka produk T-60 s (precheck normal): alarm SAAT ITU (sebelum T),
+    hasil akhir dari attempt() tanpa alarm kedua, tanpa polling/klik, layar dibiarkan apa adanya."""
+    hook_arm(monkeypatch, lambda r: setattr(r.d.inner.app, "arming", True))
+    monkeypatch.setattr(ArmScreenApp, "arm_screen", screen)
+    out = run_cli(tmp_path, device, term, app_cls=ArmScreenApp)
+    assert out.rc == 1, out.text
+    assert out.result["status"] == status
+    assert out.result["message"].startswith("saat membuka produk: teks "), out.result["message"]
+    assert f"Status: {status} - saat membuka produk" in out.text
+    assert alarms == [status], "alarm sekali (arm), tidak diulang hasil akhir"
+    # alarm berasal dari arm (pesan "(T-60 s)"), dibunyikan sebelum menunggu T-lead
+    assert alarms.messages[0].startswith("saat membuka produk (T-60 s): teks "), alarms.messages
+    log = (out.run_dir / "android.log").read_text(encoding="utf-8")
+    assert log.index(f"WARN arm: {status}") < log.index("STEP t_minus_lead")
+    assert "poll_start" not in out.step_names() and "armed" not in out.step_names()
+    assert out.buys() == [] and out.dev.app.kind("tap") == [] and "click" not in out.dev.ops()
+    assert out.dev.app.screen == screen, "layar dibiarkan apa adanya"
+    ops = out.dev.ops()
+    last_intent = len(ops) - 1 - ops[::-1].index("start_url")
+    assert not {"press_back", "start_url", "swipe_refresh"} & set(ops[last_intent + 1:])
+    assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
+    captcha_note = "Captcha/verifikasi di HP dibiarkan apa adanya. Selesaikan manual; alat TIDAK akan retry."
+    assert (captcha_note in out.text) == (status != "LOGIN_REQUIRED")
+    assert_safe_ops(out.dev)
+
+
+def test_run_android_arm_driver_error_is_returned_by_attempt(tmp_path, monkeypatch, device, term, alarms):
+    """arm() tidak melempar: intent gagal di T-60 s -> disimpan, attempt() mengembalikan ERROR (exit 1)."""
+    hook_arm(monkeypatch, lambda r: setattr(r.d.inner, "arming", True))
+    out = run_cli(tmp_path, device, term, driver_cls=ArmFailDriver)
+    assert out.rc == 1, out.text
+    assert out.result["status"] == "ERROR"
+    assert out.result["message"].startswith("saat membuka produk (T-60 s): am start gagal"), out.result["message"]
+    assert "Status: ERROR - saat membuka produk (T-60 s): am start gagal" in out.text
+    assert "Traceback" not in out.text
+    assert "poll_start" not in out.step_names() and out.buys() == [] and "click" not in out.dev.ops()
+    assert alarms == ["ERROR"], "alarm arm sekali, tidak diulang hasil akhir"
+    log = (out.run_dir / "android.log").read_text(encoding="utf-8")
+    assert "WARN arm gagal: ERROR saat membuka produk (T-60 s)" in log
+    assert_safe_ops(out.dev)
+
+
+def test_run_android_precheck_error_stops_before_opening_product(tmp_path, device, term, alarms):
+    out = run_cli(tmp_path, device, term, driver_cls=AgentWontRestartDriver, driver_kw={"alive": False})
+    assert out.rc == 1, out.text
+    assert out.result["status"] == "ERROR"
+    assert out.result["message"] == "pre-check: agent uiautomator2: mati lalu dihidupkan ulang - gagal dihidupkan"
+    assert "arm" not in out.step_names() and out.dev.app.kind("intent") == []
+    assert out.buys() == [] and "click" not in out.dev.ops()
+    assert alarms == ["precheck"]
 
 
 # ------------------------------------------------------------------ run: ditolak sebelum driver & timesync
 
 
 @pytest.mark.parametrize("case", ["run_no_only", "precheck_no_only", "android_disabled", "live_no_expected_name",
-                                  "live_blank_expected_name", "lead_out_of_range", "start_passed"])
+                                  "live_blank_expected_name", "lead_out_of_range", "start_passed", "late_start",
+                                  "live_late_start", "live_headless"])
 def test_run_rejected_before_driver_and_timesync(tmp_path, device, term, sync_calls, case):
-    open_at = time.time() + (-30 if case == "start_passed" else 3600)
+    open_at = time.time() + {"start_passed": -30, "late_start": 5, "live_late_start": 30}.get(case, 3600)
     dev = device(open_at)
     cfg, argv, expect = {}, ["run", "--only", "android"], ""
     if case == "run_no_only":
@@ -485,6 +793,13 @@ def test_run_rejected_before_driver_and_timesync(tmp_path, device, term, sync_ca
         argv, expect = [*argv, "--lead-ms", "1500"], "--lead-ms harus 0..1000"
     elif case == "start_passed":
         expect = "sudah lewat"
+    elif case == "late_start":  # T beberapa detik lagi tanpa --allow-local: precheck/arm akan jatuh di jendela polling
+        expect = f"Terlambat: run harus dimulai paling lambat T-{cli.LATE_START_S} s"
+    elif case == "live_late_start":
+        cfg, argv, expect = {"expected_name": LIVE_NAME}, [*argv, "--live"], "Terlambat"
+    elif case == "live_headless":
+        cfg, argv, expect = {"expected_name": LIVE_NAME}, [*argv, "--live", "--headless"], \
+            "--live tidak boleh --headless"
     path = write_cfg(tmp_path, open_at, **cfg)
     rc = cli.main([argv[0], "--config", str(path), *argv[1:]])
     assert rc == 2
@@ -492,6 +807,31 @@ def test_run_rejected_before_driver_and_timesync(tmp_path, device, term, sync_ca
     assert dev.configs == [], "driver Android tidak boleh dibuat"
     assert sync_calls == [], "timesync tidak boleh jalan"
     assert dev.driver.calls == [] and not Path("logs").exists()
+
+
+@pytest.mark.parametrize(("start_in_s", "extra", "late"), [
+    (cli.LATE_START_S - 5, [], True),
+    (cli.LATE_START_S + 5, [], False),
+    (5, ["--allow-local"], False),  # mock/tes saja
+    (cli.LATE_START_S + 5, ["--live", "--headless", "--allow-local"], False),
+], ids=["T-65s_ditolak", "T-75s_lolos", "allow_local", "live_headless_allow_local"])
+def test_run_late_start_boundary(tmp_path, monkeypatch, term, sync_calls, start_in_s, extra, late):
+    """Batas T-70 s: lolos pemeriksaan = sampai ke pembuatan driver (di sini sengaja gagal konek -> exit 2)."""
+    reached = []
+
+    def factory(cfg):
+        reached.append(cfg)
+        raise DriverError(f"gagal konek ke device {cfg.android.serial}: berhenti di tes")
+
+    monkeypatch.setattr(cli, "_android_driver", factory)
+    path = write_cfg(tmp_path, time.time() + start_in_s, expected_name=LIVE_NAME)
+    rc = cli.main(["run", "--config", str(path), "--only", "android", *extra])
+    text = term.getvalue()
+    assert rc == 2, text
+    assert ("Terlambat" in text) is late, text
+    assert (reached == []) is late
+    assert sync_calls == [], "timesync tidak jalan (ditolak / gagal konek dulu)"
+    assert not Path("logs").exists()
 
 
 @pytest.mark.parametrize("argv", [["precheck", "--only", "android"], ["run", "--only", "android"],
@@ -522,6 +862,85 @@ def test_real_driver_factory_wraps_connect_failure(tmp_path, monkeypatch, term):
     rc = cli.main(["login", "--config", str(write_cfg(tmp_path, time.time() + 3600)), "--platform", "android"])
     assert rc == 2
     assert f"Android: gagal konek ke device {SERIAL}: device '{SERIAL}' not found" in term.getvalue()
+
+
+CUSTOM_PACKAGE = "com.shopee.id.uji"  # android.package dari config harus sampai ke U2Driver
+
+
+class _FakeJsonRpc:
+    """`d.jsonrpc.<method>(*params, http_timeout=...)` uiautomator2: dicatat, jawaban kalengan."""
+
+    def __init__(self, dev: FakeU2Device):
+        self._dev = dev
+
+    def __getattr__(self, method: str):
+        def call(*params, http_timeout=None):
+            self._dev.rpc.append((method, params, http_timeout))
+            return {"exist": True, "deviceInfo": {}}.get(method)
+
+        return call
+
+
+class FakeU2Device:
+    """uiautomator2.Device palsu sebatas yang dipakai U2Driver: jsonrpc, d(**kw).selector, shell."""
+
+    def __init__(self, serial: str | None):
+        self.serial = serial or ""
+        self.rpc: list[tuple[str, tuple, float | None]] = []
+        self.shells: list[list[str]] = []
+        self.jsonrpc = _FakeJsonRpc(self)
+        self.jsonrpc_call = None
+        # atribut internal yang dibaca _disable_implicit_restart (koneksi nyata)
+        self._dev, self._device_server_port, self._debug = object(), 9008, False
+
+    def __call__(self, **kw):
+        return SimpleNamespace(selector=dict(kw))
+
+    def shell(self, cmd, timeout=None):
+        self.shells.append(list(cmd))
+        return SimpleNamespace(output="Starting: Intent { act=android.intent.action.VIEW }\nStatus: ok\n")
+
+
+@pytest.fixture
+def u2_devices(monkeypatch) -> list[FakeU2Device]:
+    import uiautomator2
+
+    made: list[FakeU2Device] = []
+
+    def connect(serial=None):
+        made.append(FakeU2Device(serial))
+        return made[-1]
+
+    monkeypatch.setattr(uiautomator2, "connect", connect)
+    return made
+
+
+def test_real_driver_factory_builds_package_scoped_u2driver(tmp_path, u2_devices):
+    path = write_cfg(tmp_path, time.time() + 3600, android={"package": CUSTOM_PACKAGE})
+    cfg = cli._load(cli.build_parser().parse_args(["login", "--config", str(path), "--platform", "android"]))
+    drv = cli._android_driver(cfg)
+    assert isinstance(drv, U2Driver)
+    assert [d.serial for d in u2_devices] == [SERIAL] and drv.serial == SERIAL
+    assert drv.package == CUSTOM_PACKAGE, "query dibatasi ke aplikasi Shopee dari config"
+    # restart implisit u2 (berdetik-detik, diam-diam) dimatikan untuk koneksi nyata
+    assert drv.no_implicit_restart is True and callable(u2_devices[0].jsonrpc_call)
+    # query = jsonrpc langsung dengan selector ber-packageName dan timeout per panggilan
+    assert drv.exists(Sel("text", "Beli Sekarang")) is True
+    assert u2_devices[0].rpc == [("exist", ({"text": "Beli Sekarang", "packageName": CUSTOM_PACKAGE},),
+                                  drv.rpc_timeout_s)]
+    assert drv.rpc_timeout_s < 300, "bukan timeout bawaan u2 (300 s)"
+
+
+def test_login_android_with_real_driver_only_opens_app_intent(tmp_path, term, u2_devices):
+    path = write_cfg(tmp_path, time.time() + 3600, android={"package": CUSTOM_PACKAGE})
+    rc = cli.main(["login", "--config", str(path), "--platform", "android"])
+    text = term.getvalue()
+    assert rc == 0, text
+    (dev,) = u2_devices
+    assert dev.shells == [["am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", "https://shopee.co.id/",
+                           "-p", CUSTOM_PACKAGE]]
+    assert dev.rpc == [], "login tidak membaca/men-tap layar (alat tidak mengetik apa pun)"
+    assert f"Device {SERIAL}: aplikasi {CUSTOM_PACKAGE} dibuka." in text
 
 
 # ------------------------------------------------------------------ login --platform android
@@ -628,7 +1047,9 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
         ("[product_price]", None, ""),
         ("Elemen product_price tidak dikenali", None, "Rp150.000"),  # harga: tidak ada default -> diketik
         ("[sheet_marker]", goto(app, "sheet"), ""),
-        ("[sheet_confirm]", None, ""),
+        # konfirmasi sheet bertulisan sama dengan tombol Beli di belakang sheet: tidak bisa dikalibrasi
+        # (lihat test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet) -> dilewati
+        ("[sheet_confirm]", None, "lewati"),
         ("[place_order]", goto(app, "checkout"), ""),
         ("[payment_change]", None, ""),
         ("[payment_shopeepay]", goto(app, "payment_list"), ""),
@@ -649,8 +1070,8 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
 
     section = data["android"]
     steps = section["steps"]
-    assert set(steps) == {"buy_button", "product_price", "sheet_marker", "sheet_confirm", "place_order",
-                          "payment_change", "payment_shopeepay"}
+    assert set(steps) == {"buy_button", "product_price", "sheet_marker", "place_order", "payment_change",
+                          "payment_shopeepay"}
     assert_ordered(steps)
     assert steps["buy_button"] == [{"resourceId": BUY_RID}, {"text": "Beli Sekarang"},
                                    {"textContains": "Beli Sekaran"}, {"description": "Beli Sekarang"}]
@@ -661,7 +1082,7 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
     assert steps["payment_shopeepay"] == [{"resourceId": SHOPEEPAY_RID}, {"text": "ShopeePay"},
                                           {"description": "ShopeePay"}]
     assert section["calibrated"]["device"] == SERIAL
-    assert section["calibrated"]["skipped"] == ["variant_option", "payment_confirm"]
+    assert section["calibrated"]["skipped"] == ["variant_option", "sheet_confirm", "payment_confirm"]
     assert section["markers"] == {} and section["urls"] == {}
 
     # kalibrasi tidak pernah men-tap / membuka / menekan apa pun: hanya membaca layar
@@ -670,12 +1091,44 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
 
     # dimuat ulang: hasil kalibrasi di depan default sejenis, default teks tetap jadi cadangan
     loaded = android_selectors.load(sel_path)
+    # default buy_button ronde 2 = [text, description] (tanpa textContains); duplikat dibuang
     assert loaded.steps["buy_button"] == [{"resourceId": BUY_RID}, {"text": "Beli Sekarang"},
-                                          {"textContains": "Beli Sekaran"}, {"textContains": "Beli Sekarang"},
-                                          {"description": "Beli Sekarang"}]
+                                          {"textContains": "Beli Sekaran"}, {"description": "Beli Sekarang"}]
     assert loaded.candidates("place_order")[0] == Sel("resourceId", PLACE_ORDER_RID)
     assert loaded.steps["payment_confirm"] == android_selectors.ANDROID_DEFAULT_STEPS["payment_confirm"]
+    assert loaded.steps["sheet_confirm"] == [{"text": "Beli Sekarang"}, {"text": "Konfirmasi"}], "default baru"
     assert_ordered(loaded.steps)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "BUG: android_calibrate tidak konsisten dengan model jendela aktif. Elemen dicari di dump (SEMUA jendela, "
+    "urutan dokumen) lalu diverifikasi dengan find_all (jendela AKTIF saja). Tombol konfirmasi bottom sheet "
+    "bertulisan sama dengan tombol 'Beli Sekarang' halaman produk di belakang sheet -> _default_hit/_typed_hit "
+    "memilih tombol di belakang sheet, semua kandidat gagal verifikasi (bounds beda), langkah sheet_confirm "
+    "diulang terus sampai pengguna mengetik 'lewati': resource-id konfirmasi sheet tidak pernah bisa direkam."))
+def test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet(tmp_path, device, term):
+    sel_path = tmp_path / "selectors.json"
+    dev = device(time.time() + 3600, app_cls=CalibApp)
+    app = dev.app
+    user = ScriptedUser([
+        ("[buy_button]", goto(app, "product"), ""),
+        ("[product_price]", None, "lewati"),
+        ("[sheet_marker]", goto(app, "sheet"), ""),
+        ("[sheet_confirm]", None, ""),
+        ("[place_order]", goto(app, "checkout"), "lewati"),
+        ("[payment_change]", None, "lewati"),
+        ("[payment_shopeepay]", None, "lewati"),
+        ("[payment_confirm]", None, "lewati"),
+    ])
+    cfg = cli._load(cli.build_parser().parse_args(
+        ["calibrate", "--config", str(write_cfg(tmp_path, app.sc.open_at)), "--platform", "android"]))
+    rc = cli.calibrate_android(cfg, dev.driver, sel_path, prompt=user)
+    assert rc == 0 and user.script == []
+    steps = json.loads(sel_path.read_text(encoding="utf-8"))["android"]["steps"]
+    # yang direkam = tombol konfirmasi DI sheet (jendela aktif), bukan tombol Beli di belakangnya
+    assert steps["sheet_confirm"] == [{"resourceId": CONFIRM_RID}, {"text": "Beli Sekarang"},
+                                      {"textContains": "Beli Sekaran"}]
+    assert app.kind("tap") == [] and set(dev.ops()) <= {"dump", "find_all"}
 
 
 def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monkeypatch, device, term):
@@ -716,25 +1169,35 @@ def test_calibrate_android_via_cli_main_with_variant_placeholder(tmp_path, monke
 
 # ------------------------------------------------------------------ ringkasan hasil di konsol
 
+BRACKET_CART = {"product_name": "iPhone Uji Coba 128GB", "go_cart": True,
+                "cart_other_items": [("iPhone Casing Murah", 5_000, True)]}
+BRACKET_NAMES = "[iPhone Uji Coba 128GB; iPhone Casing Murah]"  # "[i..." = bentuk tag gaya Rich
+CLOSING_TAG_ITEM = "[/promo] Casing Murah"  # "[/..." = tag penutup Rich -> MarkupError bila tidak di-escape
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: cli.print_result mencetak result.message/detail dengan markup Rich aktif. Teks dari layar HP "
-    "(mis. nama produk di pesan PRICE_GUARD keranjang '[iPhone ...; ...]') yang diawali huruf kecil di dalam "
-    "kurung siku dianggap tag gaya dan HILANG dari konsol (dan '[/...' akan melempar MarkupError)."))
-def test_run_android_price_guard_message_keeps_bracketed_product_names(tmp_path, device, term):
-    out = run_cli(tmp_path, device, term, product_name="iPhone Uji Coba 128GB", go_cart=True,
-                  cart_other_items=[("iPhone Casing Murah", 5_000, True)])
+
+def timeline_detail(text: str, step: str) -> str:
+    """Sel Detail baris `step` di tabel Timeline (3 kolom)."""
+    for line in text.splitlines():
+        cells = [c.strip() for c in re.split(r"[│┃|]", line)]
+        if len(cells) == 5 and cells[1] == step:
+            return cells[3]
+    raise AssertionError(f"baris timeline {step!r} tidak ada")
+
+
+def test_run_android_price_guard_message_keeps_bracketed_product_names(tmp_path, device, term, alarms):
+    # pesan & detail hasil di-escape (print_result) dan baris log konsol = Text tanpa markup (RunLog)
+    out = run_cli(tmp_path, device, term, **BRACKET_CART)
     assert out.rc == 1, out.text
     assert out.result["status"] == "PRICE_GUARD"
-    assert "[iPhone Uji Coba 128GB; iPhone Casing Murah]" in out.result["message"]
+    assert BRACKET_NAMES in out.result["message"]
     assert out.dev.app.kind("checkout") == [] and out.dev.app.kind("order") == []
     assert f"Status: PRICE_GUARD - {out.result['message']}" in out.text
+    result_lines = [ln for ln in out.text.splitlines() if "[android] STEP result - PRICE_GUARD: keranjang" in ln]
+    assert result_lines and BRACKET_NAMES in result_lines[0], result_lines
+    assert alarms == ["PRICE_GUARD"]
+    assert_safe_ops(out.dev)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: RunLog mencetak baris WARN/ERROR ke console CLI dengan markup Rich aktif, sehingga awalan "
-    "'[android]' (dan teks layar/HP lain dalam kurung siku berhuruf kecil) hilang dari konsol; "
-    "file android.log tetap benar."))
 def test_run_android_console_warn_lines_keep_platform_tag(tmp_path, device, term):
     out = run_cli(tmp_path, device, term, stay_on="0")
     assert out.rc == 0, out.text
@@ -742,3 +1205,48 @@ def test_run_android_console_warn_lines_keep_platform_tag(tmp_path, device, term
     assert "[android] WARN precheck layar tetap menyala: PERINGATAN" in log
     warn_lines = [line for line in out.text.splitlines() if "WARN precheck layar tetap menyala" in line]
     assert warn_lines and all("[android] WARN" in line for line in warn_lines), warn_lines
+    # semua baris RunLog di konsol (STEP/INFO/WARN) mempertahankan awalan [android]
+    step_lines = [line for line in out.text.splitlines() if " STEP " in line]
+    assert step_lines and all("[android] STEP" in line for line in step_lines), step_lines
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "BUG: cli.print_result mengisi sel Detail tabel Timeline (detail langkah = teks layar: nama item keranjang, "
+    "pesan hasil) TANPA escape markup Rich (hanya baris Status/Detail yang di-escape). '[iPhone ...]' hilang dari "
+    "timeline; '[/promo] ...' melempar MarkupError sehingga print_result crash SEBELUM baris 'Status:' -> "
+    "traceback dari cli.main, ringkasan & 'Log:' tidak tercetak (di live: baris 'Status: UNKNOWN_STATE - "
+    "Pesanan MUNGKIN sudah terbuat' hilang dari ringkasan; masih ada di baris log RunLog & alarm)."))
+@pytest.mark.parametrize("case", ["tag_lowercase", "closing_tag_live"])
+def test_run_android_timeline_keeps_bracketed_screen_text(tmp_path, device, term, case):
+    if case == "tag_lowercase":
+        out = run_cli(tmp_path, device, term, **BRACKET_CART)
+        assert out.rc == 1, out.text
+        assert BRACKET_NAMES in timeline_detail(out.text, "result")
+    else:
+        out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, go_cart=True,
+                      cart_other_items=[(CLOSING_TAG_ITEM, 5_000, True)], unknown_after_order=True)
+        assert out.rc == 1, out.text
+        assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
+        assert CLOSING_TAG_ITEM in timeline_detail(out.text, "cart_uncheck")
+
+
+def test_run_android_live_maybe_ordered_safety_holds_even_if_console_rendering_fails(tmp_path, device, term,
+                                                                                     alarms):
+    """Teks layar '[/...' (nama item keranjang yang di-uncheck) boleh merusak ringkasan konsol (lihat xfail di
+    atas), tetapi keselamatan tetap: satu pesanan, alarm sekali, hasil + pesan wajib tersimpan & tampil di baris
+    log, aplikasi dibiarkan terbuka, tanpa retry. Lolos baik sebelum maupun sesudah bug konsol diperbaiki."""
+    out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, go_cart=True,
+                  cart_other_items=[(CLOSING_TAG_ITEM, 5_000, True)], unknown_after_order=True, catch=True)
+    assert out.rc in (1, None), out.text  # None = cli.main melempar (bug konsol di atas)
+    assert out.result["status"] == "UNKNOWN_STATE" and out.result["message"] == MAYBE_ORDERED_MSG
+    assert [e["detail"] for e in out.dev.app.kind("cart_toggle")] == [CLOSING_TAG_ITEM], "item lain di-uncheck"
+    assert len(out.buys()) == 1 and len(out.dev.app.kind("order")) == 1, "tepat satu pesanan, tanpa retry"
+    assert out.dev.app.screen == "order_unknown", "aplikasi tidak ditutup / disentuh lagi"
+    assert alarms == ["UNKNOWN_STATE"]
+    # pesan wajib tetap sampai ke konsol lewat baris log RunLog (Text tanpa markup) & app dibiarkan terbuka
+    assert any("[android] STEP result - UNKNOWN_STATE: " + MAYBE_ORDERED_MSG in ln for ln in out.text.splitlines())
+    assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
+    calls = out.dev.driver.calls
+    after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
+    assert not {"click", "press_back", "start_url", "swipe_refresh"} & {op for op, _ in after}
+    assert_safe_ops(out.dev)
