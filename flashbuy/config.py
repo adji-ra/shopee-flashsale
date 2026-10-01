@@ -127,6 +127,13 @@ class TargetConfig(_Strict):
         return f"{parts.scheme}://{parts.netloc}"
 
 
+def require_live_ready(cfg: TargetConfig) -> None:
+    """Syarat tambahan mode --live: `expected_name` wajib (pengaman nama produk di keranjang & checkout)."""
+    if not cfg.expected_name:
+        raise ConfigError("mode --live ditolak: `expected_name` wajib diisi di target.yaml "
+                          "(potongan nama produk, mis. \"Ponsel X 128GB\")")
+
+
 def load_config(path: str | Path, *, allow_local: bool = False) -> TargetConfig:
     path = Path(path)
     try:

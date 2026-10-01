@@ -21,7 +21,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from flashbuy import pricing, selector_store
-from flashbuy.config import FLOW_TIMEOUT_S, TargetConfig, WebConfig
+from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, WebConfig, require_live_ready
 from flashbuy.guards import ENABLED_JS, MIN_IFRAME_PX, TERMINAL, Classification, Guard, PageState
 from flashbuy.notifier import Notifier
 from flashbuy.runner_base import (
@@ -34,6 +34,7 @@ from flashbuy.runner_base import (
     RunLog,
     RunResult,
     RunStatus,
+    after_order_click,
     always_allow,
 )
 from flashbuy.selector_store import SelectorSet
@@ -395,6 +396,11 @@ class WebRunner:
 
     async def attempt(self, clock: ServerClock, live: bool) -> RunResult:
         self.clock = clock
+        if live:
+            try:
+                require_live_ready(self.cfg)
+            except ConfigError as e:
+                return await self._finish(RunStatus.ERROR, str(e), live)
         self._tracking = True
         self._unknown_since = None
         try:
@@ -736,10 +742,11 @@ class WebRunner:
     # ------------------------------------------------------------------ akhir
 
     async def _finish(self, status: RunStatus, message: str, live: bool) -> RunResult:
-        if self.order_clicked and status != RunStatus.ORDER_PLACED_AWAIT_PIN:
-            message = f"'Buat Pesanan' SUDAH diklik, cek status pesanan secara manual! ({message})"
-        self.log.mark("result", f"{status}: {message}")
-        result = RunResult(self.name, status, message, live, steps=list(self.log.steps))
+        detail = ""
+        if self.order_clicked:
+            status, message, detail = after_order_click(status, message)
+        self.log.mark("result", f"{status}: {message}" + (f" ({detail})" if detail else ""))
+        result = RunResult(self.name, status, message, live, steps=list(self.log.steps), detail=detail)
         if status in STOP_ALL_STATUSES and self.stop_event is not None:
             self.stop_event.set()
         if status in ALARM_STATUSES or self.order_clicked:

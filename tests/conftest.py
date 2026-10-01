@@ -79,6 +79,7 @@ def quiet_console() -> Console:
 
 
 PRICE_DEFAULTS = {"max_item_price": 100_000, "max_total": 120_000}
+LIVE_NAME = "Uji Coba"  # potongan nama produk mock ("Ponsel Uji Coba 128GB"), default expected_name tes live
 
 
 def make_cfg(mock, tmp_path, open_at: float, variant: str | None = None, web: dict | None = None,
@@ -127,7 +128,10 @@ async def run_web(mock, admin, tmp_path, *, scenario: str = "normal", live: bool
     st = admin.state()["scenario"]
     open_at = st["open_at"]
     clock = ServerClock(st["clock_offset_ms"] / 1000)
-    target = make_cfg(mock, tmp_path, open_at, variant, web=web, **(cfg or {}))
+    cfg = dict(cfg or {})
+    if live:
+        cfg.setdefault("expected_name", LIVE_NAME)  # --live wajib expected_name
+    target = make_cfg(mock, tmp_path, open_at, variant, web=web, **cfg)
     log = RunLog(tmp_path / "logs", clock, "web", quiet_console())
     notifier = Notifier(beep=lambda f, d: None, post=lambda u, p: None, repeat=1)
     runner = WebRunner(target, selectors or selector_store.defaults(), log=log, notifier=notifier,

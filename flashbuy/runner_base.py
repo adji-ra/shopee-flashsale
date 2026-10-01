@@ -50,6 +50,32 @@ NEEDS_USER_STATUSES = frozenset({RunStatus.ORDER_PLACED_AWAIT_PIN, RunStatus.CAP
 # Status yang membunyikan alarm.
 ALARM_STATUSES = NEEDS_USER_STATUSES | {RunStatus.PRICE_GUARD}
 
+# Setelah "Buat Pesanan" diklik tanpa layar PIN, hasilnya tidak pasti. Kalimat ini WAJIB dipakai.
+MAYBE_ORDERED_MSG = "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"
+# Status yang tetap dipertahankan setelah klik "Buat Pesanan" (butuh tindakan manual); selain ini -> UNKNOWN_STATE.
+_KEEP_AFTER_ORDER = frozenset({RunStatus.ORDER_PLACED_AWAIT_PIN, RunStatus.CAPTCHA, RunStatus.VERIFICATION,
+                               RunStatus.LOGIN_REQUIRED})
+
+
+def after_order_click(status: RunStatus, message: str) -> tuple[RunStatus, str, str]:
+    """(status, pesan, detail) final untuk run yang SUDAH mengklik "Buat Pesanan".
+
+    Tanpa layar PIN, pesanan mungkin sudah atau belum terbuat: status jadi UNKNOWN_STATE (stop semua
+    runner, alarm) kecuali captcha/verifikasi/login, dan pesan = MAYBE_ORDERED_MSG; penyebab asli di `detail`.
+    """
+    if status == RunStatus.ORDER_PLACED_AWAIT_PIN:
+        return status, message, ""
+    final = status if status in _KEEP_AFTER_ORDER else RunStatus.UNKNOWN_STATE
+    return final, MAYBE_ORDERED_MSG, f"{status}: {message}"
+
+
+def keep_open(live: bool, status: RunStatus | None) -> bool:
+    """Browser/app dibiarkan terbuka? Live: SELALU (apa pun statusnya, termasuk error).
+
+    Dry-run: hanya bila butuh tindakan manual (captcha/verifikasi/login); selain itu boleh ditutup.
+    """
+    return live or status in NEEDS_USER_STATUSES
+
 
 @dataclass
 class Step:
@@ -66,6 +92,7 @@ class RunResult:
     live: bool
     steps: list[Step] = field(default_factory=list)
     screenshots: list[Path] = field(default_factory=list)
+    detail: str = ""  # keterangan tambahan (mis. penyebab asli bila pesan diganti MAYBE_ORDERED_MSG)
 
     def step(self, name: str) -> Step | None:
         return next((s for s in self.steps if s.name == name), None)

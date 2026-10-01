@@ -13,7 +13,14 @@ from rich.console import Console
 from rich.table import Table
 
 from flashbuy import selector_store, timesync
-from flashbuy.config import DEFAULT_LEAD_MS, POLL_WINDOW_AFTER_S, ConfigError, TargetConfig, load_config
+from flashbuy.config import (
+    DEFAULT_LEAD_MS,
+    POLL_WINDOW_AFTER_S,
+    ConfigError,
+    TargetConfig,
+    load_config,
+    require_live_ready,
+)
 
 console = Console()
 
@@ -183,15 +190,42 @@ def print_result(result, open_at: float) -> None:
         table.add_row(name, f"{rel_ms:+,d} ms", detail)
     console.print(table)
     color = "green" if str(result.status) in OK_STATUSES else "red"
-    console.print(f"Status: [bold {color}]{result.status}[/] - {result.message}")
+    console.print(f"Status: [bold {color}]{result.status}[/] - {result.message}", highlight=False)
+    if result.detail:
+        console.print(f"Detail: {result.detail}", highlight=False)
     for shot in result.screenshots:
         console.print(f"Screenshot: {shot}")
 
 
+async def _hand_over_browser(runner, live: bool, status, headless: bool,
+                             wait_user: Callable[[object], Awaitable[None]] | None) -> None:
+    """Serahkan browser ke pengguna dan tunggu sampai jendelanya ditutup sendiri."""
+    from flashbuy.runner_base import RunStatus
+
+    if status in (RunStatus.CAPTCHA, RunStatus.VERIFICATION):
+        console.print("[bold red]Halaman captcha/verifikasi dibiarkan terbuka. Selesaikan manual; "
+                      "alat TIDAK akan retry.[/]")
+    if live:
+        console.print("[bold]Mode LIVE: browser TIDAK ditutup otomatis. Periksa/selesaikan manual "
+                      "(PIN, verifikasi, status pesanan), lalu tutup jendela browser sendiri.[/]")
+    else:
+        console.print("[bold]Browser dibiarkan terbuka. Selesaikan secara manual, lalu tutup jendela browser.[/]")
+    if wait_user is not None:
+        await wait_user(runner)
+    elif headless:
+        console.print("[yellow]--headless (khusus mock/tes): tidak ada jendela untuk ditutup pengguna.[/]")
+    else:
+        await runner.wait_closed()
+
+
 async def run_web(cfg: TargetConfig, sel: selector_store.SelectorSet, *, live: bool, lead_ms: int,
-                  report: timesync.SyncReport, run_dir: Path, headless: bool, samples: int):
+                  report: timesync.SyncReport, run_dir: Path, headless: bool, samples: int,
+                  wait_user: Callable[[object], Awaitable[None]] | None = None):
+    """Satu run web. Live: browser tidak pernah ditutup alat (apa pun hasilnya, termasuk error);
+    pengguna yang menutupnya. Dry-run: ditutup, kecuali captcha/verifikasi/login (butuh tindakan manual).
+    `wait_user` menggantikan "tunggu pengguna menutup jendela" (dipakai tes)."""
     from flashbuy.notifier import Notifier
-    from flashbuy.runner_base import NEEDS_USER_STATUSES, RunLog
+    from flashbuy.runner_base import RunLog, keep_open
     from flashbuy.session import run_single
     from flashbuy.web_runner import WebRunner
 
@@ -203,25 +237,29 @@ async def run_web(cfg: TargetConfig, sel: selector_store.SelectorSet, *, live: b
     def sync_fn() -> timesync.SyncReport:
         return timesync.sync(samples=samples, http_url=cfg.origin + "/")
 
+    result = None
     try:
         result = await run_single(runner, open_at=cfg.start_epoch, live=live, lead_ms=lead_ms,
                                   clock=clock, log=log, notifier=notifier, sync_fn=sync_fn)
         print_result(result, cfg.start_epoch)
-        if result.status in NEEDS_USER_STATUSES and not headless:
-            console.print("[bold]Browser dibiarkan terbuka. Selesaikan secara manual "
-                          "(PIN / verifikasi), lalu tutup jendela browser.[/]")
-            await runner.wait_closed()
         return result
     finally:
-        await runner.close()
-        log.close()
-        notifier.join(1)
+        status = result.status if result is not None else None
+        try:
+            if keep_open(live, status) and runner.context is not None:
+                await _hand_over_browser(runner, live, status, headless, wait_user)
+        finally:
+            await runner.close()
+            log.close()
+            notifier.join(1)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     if not _need_web(args, "only"):
         return 2
     cfg = _load(args)
+    if args.live:
+        require_live_ready(cfg)
     lead_ms = cfg.lead_ms if args.lead_ms is None else args.lead_ms
     if not 0 <= lead_ms <= 1000:
         console.print("[red]--lead-ms harus 0..1000[/]")
