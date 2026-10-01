@@ -21,6 +21,10 @@ PRICE_MATCH = r"\s*Rp\s?[\d.]+(,-)?(\s*[-–]\s*Rp\s?[\d.]+(,-)?)?\s*"
 QTY_MATCH = r"\s*[x×]\s?\d{1,3}\s*"
 ANY_TEXT_MATCH = r"(?s).*\S.*"
 ORDER_COUNT_MATCH = r"(?is).*\(\s*\d{1,3}\s*produk\s*\).*"
+TOTAL_LABEL_MATCH = rf"(?is).*(?:{TOTAL_LABEL}).*"
+SHIPPING_LABEL_MATCH = rf"(?is).*(?:{SHIPPING_LABEL}).*"
+RP_ANY_MATCH = r"(?s).*Rp\s?\d.*"  # teks ber-Rp apa pun, termasuk format rusak (agar terbaca "tidak terbaca")
+PENDING_MATCH = r"(?is).*(menghitung|memuat|loading).*"  # nilai yang belum siap (ikut dibaca agar fail-closed)
 
 _PRICE_RE = re.compile(PRICE_MATCH)
 _QTY_RE = re.compile(QTY_MATCH)
@@ -95,11 +99,21 @@ def label_values(nodes: list[Node], label_re: re.Pattern) -> list[str]:
     return out
 
 
-def checkout_snapshot(nodes: list[Node]) -> pricing.CheckoutSnapshot:
+def _by_rid(nodes: list[Node], rid_re: re.Pattern | None) -> list[str] | None:
+    if rid_re is None:
+        return None
+    vals = [n.label for n in nodes if n.rid and rid_re.fullmatch(n.rid)]
+    return vals or None
+
+
+def checkout_snapshot(nodes: list[Node], total_rid: re.Pattern | None = None,
+                      shipping_rid: re.Pattern | None = None) -> pricing.CheckoutSnapshot:
     """Bangun CheckoutSnapshot dari node teks layar checkout.
 
     Baris produk = satu per penanda kuantitas "xN". Teks baris = nama/variasi di kartu produk
     (di atas penanda, maks _CARD_LINES baris) + harga satuan di baris yang sama dengan penanda + "xN".
+    Total & ongkir: node ber-resource-id (testID, mis. labelTotalPayment) bila ada; selain itu
+    pasangan label -> nilai di layar.
     """
     nodes = [n for n in nodes if n.label.strip()]
     markers = sorted((n for n in nodes if is_qty(n)), key=lambda n: n.bounds[1])
@@ -126,8 +140,8 @@ def checkout_snapshot(nodes: list[Node]) -> pricing.CheckoutSnapshot:
         prev_bottom = m.bounds[3]
     return pricing.CheckoutSnapshot(
         rows=rows,
-        totals=label_values(nodes, _TOTAL_RE),
-        shippings=label_values(nodes, _SHIPPING_RE),
+        totals=_by_rid(nodes, total_rid) or label_values(nodes, _TOTAL_RE),
+        shippings=_by_rid(nodes, shipping_rid) or label_values(nodes, _SHIPPING_RE),
         page_text="\n".join(n.label for n in sorted(nodes, key=lambda n: (n.bounds[1], n.bounds[0]))),
     )
 

@@ -64,6 +64,7 @@ class AppScenario:
     screen_on: bool = True
     locked: bool = False
     stay_on: str = "3"
+    pin_title: str | None = "Masukkan PIN ShopeePay"  # None: layar PIN tanpa teks (hanya resource-id)
 
 
 def _n(text: str = "", bounds=(0, 0, 0, 0), **kw) -> Node:
@@ -88,6 +89,7 @@ class FakeShopeeApp:
         self.sold_out = sc.sold_out
         self.no_response_left = sc.no_response_clicks
         self.events: list[dict] = []
+        self._sheet_start = 0
 
     # ------------------------------------------------------------------ waktu & log
 
@@ -129,7 +131,15 @@ class FakeShopeeApp:
         return self.screen == "webview"
 
     def nodes(self) -> list[Node]:
+        """Semua jendela (jalur A: exists/info)."""
         return [n for _, n in self._render()]
+
+    def active_nodes(self) -> list[Node]:
+        """Jendela aktif saja (jalur B: find_all). Bottom sheet = jendela tersendiri di atas halaman produk."""
+        out = self._render()
+        if self.screen == "sheet":
+            out = out[self._sheet_start:]
+        return [n for _, n in out]
 
     def on_intent(self, url: str, package: str) -> None:
         if package != PACKAGE:
@@ -333,6 +343,7 @@ class FakeShopeeApp:
     def _r_sheet(self):
         sc = self.sc
         out = self._r_product()
+        self._sheet_start = len(out)
         out.append(("", _n("", (0, 900, 720, 1612), cls="android.view.ViewGroup")))
         if self.selected_variant or not sc.variants:
             price = rupiah(self.unit_price())
@@ -382,7 +393,7 @@ class FakeShopeeApp:
         out += [("", _n("Subtotal untuk Produk", (20, y + 40, 400, y + 70))),
                 ("", _n(rupiah(subtotal), (500, y + 40, 700, y + 70))),
                 ("", _n("Subtotal Pengiriman", (20, y + 80, 400, y + 110))),
-                ("", _n(ship, (500, y + 80, 700, y + 110)))]
+                ("", _n(ship, (500, y + 80, 700, y + 110), rid="labelShippingFinalPrice"))]
         if sc.service_fee:
             out += [("", _n("Biaya Layanan", (20, y + 120, 400, y + 150))),
                     ("", _n(rupiah(sc.service_fee), (500, y + 120, 700, y + 150)))]
@@ -390,7 +401,7 @@ class FakeShopeeApp:
                 ("", _n(rupiah(total), (500, y + 160, 700, y + 195)))]
         # bar bawah: label di atas nilai (pasangan "di bawah")
         out += [("", _n("Total Pembayaran", (300, 1515, 510, 1545))),
-                ("", _n(rupiah(total), (300, 1550, 510, 1595))),
+                ("", _n(rupiah(total), (300, 1550, 510, 1595), rid="labelTotalPayment")),
                 ("place_order", _n("Buat Pesanan", (520, 1500, 720, 1612), clickable=True))]
         return out
 
@@ -421,12 +432,14 @@ class FakeShopeeApp:
         n = sum(1 for c in self.cart if c["checked"])
         out += [("", _n("", (20, 1530, 70, 1580), cls="android.widget.CheckBox", checked=False)),
                 ("", _n("Semua", (80, 1530, 200, 1580))),
-                ("cart_checkout", _n(f"Checkout ({n})", (480, 1500, 720, 1612), clickable=True))]
+                ("cart_checkout", _n(f"Checkout ({n})", (480, 1500, 720, 1612), clickable=True,
+                                     rid="labelButtonCheckout"))]
         return out
 
     def _r_pin(self):
-        return [("", _n("Masukkan PIN ShopeePay", (100, 300, 620, 350)))] + \
-            [("", _n("", (100 + i * 90, 400, 170 + i * 90, 470), cls="android.widget.EditText")) for i in range(6)]
+        title = [] if self.sc.pin_title is None else [("", _n(self.sc.pin_title, (100, 300, 620, 350)))]
+        return title + [("", _n("", (100, 400, 640, 470), cls="android.widget.EditText",
+                                rid="com.shopee.id:id/payment_password_field"))]
 
     def _r_captcha(self):
         return [("", _n("Geser untuk verifikasi", (100, 700, 620, 750))),
