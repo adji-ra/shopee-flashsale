@@ -204,5 +204,6 @@ def test_order_clicked_but_no_pin_screen_still_alarms(mock, admin, tmp_path, run
     # halaman "Pesanan dibuat" (COD) tidak dikenali -> jaring UNKNOWN_STATE, tetap alarm
     assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
     assert out.result.message == "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"
+    assert out.result.detail, "penyebab asli disimpan di detail"
     assert len(out.kind("order")) == 1
-    assert [e["event"] for e in out.notifier.events] == [str(out.result.status)]
+    assert [e["event"] for e in out.notifier.events] == ["UNKNOWN_STATE"]

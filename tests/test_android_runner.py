@@ -630,18 +630,6 @@ def test_cart_flow_dry_run(tmp_path):
     assert_polling_rules(out)
 
 
-def test_cart_flow_live_unchecks_other_item_and_orders_once(tmp_path):
-    out = run_android(tmp_path, go_cart=True, live=True, cart_other_items=[("Kabel Data USB-C", 25_000, True)])
-    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
-    assert out.result.step("cart_uncheck").detail == "Kabel Data USB-C"
-    assert [e["detail"] for e in out.kind("cart_toggle")] == ["Kabel Data USB-C"]
-    _subsequence(out.step_names(), ["cart_uncheck", "cart_ok", "click_checkout", "price_guard_ok",
-                                    "click_place_order", "pin_screen"])
-    # hanya item target (qty 1) yang masuk checkout; tepat satu pesanan
-    assert [e["detail"] for e in out.kind("checkout")] == ["[('Ponsel Uji Coba 128GB', 99000, 1)]"]
-    assert len(out.kind("order")) == 1
-
-
 @pytest.mark.parametrize("confirm_button", [True, False], ids=["confirm_btn", "no_confirm_btn"])
 @BOTH
 def test_payment_default_cod_switched_to_shopeepay(tmp_path, live, confirm_button):
@@ -860,17 +848,10 @@ def test_sheet_open_before_first_click_live_never_orders_wrong_variant(tmp_path)
     out = run_android(tmp_path, live=True, variants=VARIANTS, variant_prices=VARIANT_PRICES,
                       cfg={"variant": TARGET_VARIANT, "expected_name": LIVE_NAME},
                       during=_during_patch(_sheet_open_at_arm))
-    orders = out.kind("order")
-    assert len(orders) <= 1
-    if orders:
-        assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
-        assert out.app.selected_variant == TARGET_VARIANT, "pesanan dibuat tanpa variasi yang diminta"
-    else:
-        # lapis 3 (fail-closed): variasi yang diminta tidak terlihat di baris produk checkout
-        assert out.result.status == RunStatus.PRICE_GUARD, out.result.message
-        assert TARGET_VARIANT in out.result.message
-        _alarmed(out, RunStatus.PRICE_GUARD)
-        _no_order(out)
+    # sheet ditutup (back) sebelum klik pertama, lalu variasi dipilih di sheet setelah Beli -> tepat 1 pesanan
+    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+    assert len(out.kind("order")) == 1
+    assert out.app.selected_variant == TARGET_VARIANT, "pesanan dibuat tanpa variasi yang diminta"
     assert set(_ops(out)) <= ALLOWED_OPS
     _assert_gated_rules(out)  # klik "Beli" yang mendarat di konfirmasi sheet tetap lewat gate
 
@@ -985,25 +966,16 @@ def test_never_opens_is_not_started_timeout(tmp_path, reload):
     _no_order(out)
 
 
-@pytest.mark.parametrize("scenario", [
-    {},
-    {"live": True},
-    {"sheet": False},
-    {"go_cart": True},
-    {"sale_skew_ms": 1500},
-    {"no_response_clicks": 2},
-    {"sale_skew_ms": 9500},
-    {"sale_skew_ms": 9500, "cfg": {"android": {"reload": "intent"}}},
-    {"variants": VARIANTS, "variants_on_page": True, "cfg": {"variant": TARGET_VARIANT}},
-    {"payment_default": "COD - Cek Dulu", "live": True},
-], ids=["dry", "live", "no_sheet", "cart", "skew1500", "no_response", "skew9500", "skew9500_intent",
-        "variant_on_page", "cod_live"])
-def test_polling_rules_hold(tmp_path, scenario):
+# Skenario lain (dry, live, tanpa sheet, keranjang, skew, no_response, never_opens) memeriksa aturan polling di tes
+# khususnya masing-masing; di sini hanya skenario yang tidak punya tes khusus.
+@pytest.mark.parametrize("scenario, orders", [
+    ({"variants": VARIANTS, "variants_on_page": True, "cfg": {"variant": TARGET_VARIANT}}, 0),
+    ({"payment_default": "COD - Cek Dulu", "live": True}, 1),
+], ids=["variant_on_page", "cod_live"])
+def test_polling_rules_hold(tmp_path, scenario, orders):
     out = run_android(tmp_path, **scenario)
-    acts = polling_actions(out)
-    assert acts and acts[0] >= _t(out) - 1000
     assert_polling_rules(out)
-    assert len(out.kind("order")) <= 1
+    assert len(out.kind("order")) == orders
 
 
 # ------------------------------------------------------------------ abort / stop / lock

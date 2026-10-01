@@ -24,10 +24,11 @@ def test_timesync_all_fail(monkeypatch):
     assert cli.main(["timesync"]) == 1
 
 
-def test_android_and_orchestrator_not_yet(tmp_path):
-    assert cli.main(["run", "--config", "x.yaml"]) == 2  # tanpa --only web
-    assert cli.main(["run", "--config", "x.yaml", "--only", "android"]) == 2
-    assert cli.main(["calibrate", "--config", "x.yaml", "--platform", "android"]) == 2
+def test_run_without_platform_is_orchestrator_stage4(tmp_path, capsys):
+    # tanpa --only web|android: orchestrator (dua jalur paralel) baru di tahap 4; ditolak sebelum config dibaca.
+    # Jalur Android sendiri diuji di tests/test_android_cli.py.
+    assert cli.main(["run", "--config", "x.yaml"]) == 2
+    assert "menyusul di tahap 4" in capsys.readouterr().out
 
 
 def test_missing_config_exit_2(tmp_path):

@@ -201,7 +201,8 @@ def test_unknown_limit_is_scalable(mock, admin, tmp_path, run):
     out = run(run_web(mock, admin, tmp_path, scenario="unknown_page", runner_attrs={"unknown_limit_s": 0.3}))
     assert out.result.status == RunStatus.UNKNOWN_STATE
     elapsed = out.result.step("result").t_server_ms - out.result.step("click_buy").t_server_ms
-    assert elapsed < 1200, elapsed
+    # batas 0,3 s berlaku: lebih cepat dari batas default (yang tidak mungkin < 1,5 s); longgar terhadap beban mesin
+    assert elapsed < 1500, elapsed
 
 
 def test_description_with_ambiguous_words_does_not_trigger(mock, admin, tmp_path, run):

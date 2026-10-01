@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -72,18 +71,8 @@ def test_runner_refuses_live_without_expected_name(mock, admin, tmp_path, run):
 # ------------------------------------------------------------------ e2e: pesan wajib pasca "Buat Pesanan"
 
 
-def test_order_clicked_then_unknown_uses_mandatory_message(mock, admin, tmp_path, run):
-    async def during(runner, open_at):
-        runner.flow_timeout_s = 3.0
-        while "payment_ok" not in [st.name for st in runner.log.steps]:
-            await asyncio.sleep(0.005)
-        await runner.page.evaluate("document.querySelector('[data-method=cod]').click()")
-
-    out = run(run_web(mock, admin, tmp_path, live=True, during=during))
-    assert out.result.status == RunStatus.UNKNOWN_STATE
-    assert out.result.message == MAYBE_ORDERED_MSG
-    assert out.result.detail
-    assert [e["event"] for e in out.notifier.events] == ["UNKNOWN_STATE"]
+# (klik 'Buat Pesanan' lalu layar tak dikenal -> pesan wajib: lihat
+#  test_web_runner.py::test_order_clicked_but_no_pin_screen_still_alarms)
 
 
 # ------------------------------------------------------------------ e2e: browser live tidak pernah ditutup

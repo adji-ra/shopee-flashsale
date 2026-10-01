@@ -49,6 +49,7 @@ from flashbuy.android_driver import (
     U2Driver,
     _disable_implicit_restart,
     _patch_u2_transport,
+    check_shell,
     node_matches,
 )
 from flashbuy.android_runner import MARKER_MAX_CHARS, Screen
@@ -1735,12 +1736,12 @@ def test_u2_errors_wrapped_in_driver_error(op, call):
     assert ei.value.__cause__ is original
 
 
+# ConnectionResetError: lihat test_u2_errors_wrapped_in_driver_error (AgentDead + pesan + __cause__)
 @pytest.mark.parametrize("exc, dead", [
     (HTTPError("Unable to connect to uiautomator2 server"), True),
     (HTTPTimeoutError("read timeout"), True),
     (UiAutomationNotConnectedError("UiAutomation not connected"), True),
     (LaunchUiAutomationError("uiautomator2 server gagal start"), True),
-    (ConnectionResetError("reset"), True),
     (BrokenPipeError("pipe"), True),
     (TimeoutError("timed out"), True),  # = socket.timeout (timeout soket adb)
     (OSError("adb transport"), True),
@@ -1852,13 +1853,45 @@ def test_u2_shell_output_variants():
         def shell(self, cmd, timeout=60):
             return "langsung str"
 
-    assert U2Driver(device=Raw()).shell(["id"]) == "langsung str"
+    assert U2Driver(device=Raw()).shell(["ps", "-A"]) == "langsung str"
 
     class Odd(FakeU2Device):
         def shell(self, cmd, timeout=60):
             return 42
 
-    assert U2Driver(device=Odd()).shell(["id"]) == ""
+    assert U2Driver(device=Odd()).shell(["ps", "-A"]) == ""
+
+
+@pytest.mark.parametrize("cmd", [
+    "input text 123456", "input tap 540 1500", "input keyevent 66", "su -c id", "pm install -r x.apk",
+    "pm uninstall com.shopee.id", "setprop debug.x 1", "am force-stop com.shopee.id", "am kill com.shopee.id",
+    "settings put secure x 1", "settings put global adb_enabled 0", "svc power stayon true", "id",
+    "am start -a android.intent.action.VIEW -d https://evil.example/shopee.co.id -p com.shopee.id",
+    "am start -a android.intent.action.VIEW -d https://shopee.co.id/x -p com.evil.app",
+])
+def test_shell_allowlist_rejects_everything_but_reading_intent_and_stay_awake(cmd):
+    """Spesifikasi I: perintah shell di luar allowlist ditolak SEBELUM dikirim (U2Driver & FakeDriver)."""
+    dev = FakeU2Device()
+    with pytest.raises(DriverError, match="perintah shell tidak diizinkan"):
+        U2Driver(device=dev).shell(cmd.split())
+    assert dev.shells == []
+    fake = FakeDriver(_StaticApp([]), FakeClock(tick=0.0))
+    with pytest.raises(DriverError, match="perintah shell tidak diizinkan"):
+        fake.shell(cmd.split())
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("cmd", [
+    "getprop", "getprop ro.product.model", "wm size", "wm density", "ps -A", "dumpsys power", "dumpsys window",
+    "dumpsys package com.shopee.id", "settings get global stay_on_while_plugged_in",
+    "settings get system screen_off_timeout", "settings put global stay_on_while_plugged_in 3",
+    "svc power stayon usb", "svc power stayon false", "pm path com.shopee.id",
+    "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME",
+    "am start -W -a android.intent.action.VIEW -d https://shopee.co.id/Produk-i.1.2 -p com.shopee.id",
+    "am start -a android.intent.action.VIEW -d https://shopee.co.id/user/shopeepay -p com.shopee.id",
+])
+def test_shell_allowlist_accepts_the_commands_the_tool_uses(cmd):
+    check_shell(cmd.split())
 
 
 def test_u2_window_size_cached_and_swipe_refresh_pulls_down():

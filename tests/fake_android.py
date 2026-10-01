@@ -66,6 +66,7 @@ class AppScenario:
     wallet_balance: int | None = 500_000
     address_utama: bool = True
     wallet_unsupported: bool = False  # intent halaman ShopeePay tidak bisa di-resolve
+    wallet_pin: bool = False  # halaman ShopeePay meminta PIN dulu (kolom PIN, tanpa saldo)
     installed: bool = True
     screen_on: bool = True
     locked: bool = False
@@ -551,6 +552,8 @@ class FakeShopeeApp:
         return out
 
     def _r_wallet(self):
+        if self.sc.wallet_pin:
+            return self._r_pin()
         out = [("", _n("ShopeePay", (20, 60, 400, 110)))]
         if self.sc.wallet_balance is not None:
             out += [("", _n("Saldo", (20, 200, 200, 240))),

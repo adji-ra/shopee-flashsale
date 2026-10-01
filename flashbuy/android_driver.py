@@ -160,6 +160,31 @@ class AndroidDriver(Protocol):
 # --------------------------------------------------------------------------- uiautomator2
 
 
+# Allowlist perintah adb shell (spesifikasi I: hanya interaksi UI lewat uiautomator2). Selain membaca status
+# device, hanya intent VIEW ke URL Shopee di package Shopee, dan "layar tetap menyala" selama run (dikembalikan
+# setelahnya). Tidak ada `input` (alat tidak pernah mengetik), su/root, pm install/uninstall, setprop, dll.
+_SHOPEE_URL = r"https://([a-z0-9-]+\.)*shopee\.co\.id(/\S*)?"
+SHELL_ALLOWED = re.compile("|".join([
+    r"getprop( [\w.]+)?",
+    r"wm (size|density)",
+    r"ps -A",
+    r"dumpsys (power|window|package [\w.]+)",
+    r"settings get (global|system) \w+",
+    r"settings put global stay_on_while_plugged_in \d",
+    r"svc power stayon (usb|false)",
+    r"pm path [\w.]+",
+    r"cmd package resolve-activity --brief -a android\.intent\.action\.MAIN -c android\.intent\.category\.HOME",
+    rf"am start (-W )?-a android\.intent\.action\.VIEW -d {_SHOPEE_URL} -p com\.shopee\.[a-z0-9_.]+",
+]))
+
+
+def check_shell(cmd: list[str]) -> None:
+    """Tolak perintah shell di luar allowlist (dipakai U2Driver & FakeDriver, jadi tes ikut menegakkannya)."""
+    line = " ".join(cmd)
+    if not SHELL_ALLOWED.fullmatch(line):
+        raise DriverError(f"perintah shell tidak diizinkan: {line[:120]!r}")
+
+
 RPC_TIMEOUT_S = 5.0  # batas satu query/klik ke agent (default u2: 300 s, dan timeout socket tidak dipasang)
 SWIPE_STEPS = 60  # swipe_refresh 0,3 s (u2: 1 langkah = 5 ms)
 SLOW_RPC_TIMEOUT_S = 30.0  # dump/screenshot/shell
@@ -351,6 +376,7 @@ class U2Driver:
         return self._call("dump_hierarchy", self.d.dump_hierarchy)  # hanya kalibrasi/diagnosa/status akhir
 
     def shell(self, cmd: list[str]) -> str:
+        check_shell(cmd)
         res = self._call(f"shell {' '.join(cmd[:3])}", lambda: self.d.shell(cmd, timeout=30))
         return getattr(res, "output", res if isinstance(res, str) else "")
 
@@ -630,6 +656,8 @@ class FakeDriver:
         return AppInfo(self.app.package, self.app.activity())
 
     def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        check_shell(["am", "start", *(["-W"] if wait else []), "-a", "android.intent.action.VIEW", "-d", url,
+                     "-p", package])  # sama dengan perintah U2Driver
         self._rpc("start_url", url, latency=0.3 if wait else 0.05)
         self.app.on_intent(url, package)
 
@@ -671,6 +699,7 @@ class FakeDriver:
         return "<hierarchy>\n" + "\n".join(rows) + "\n</hierarchy>\n"
 
     def shell(self, cmd: list[str]) -> str:
+        check_shell(cmd)
         self._rpc("shell", " ".join(cmd))
         if cmd[:1] == ["getprop"]:
             if len(cmd) == 1:

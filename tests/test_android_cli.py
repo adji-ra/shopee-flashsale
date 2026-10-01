@@ -438,6 +438,20 @@ def test_precheck_warnings_do_not_fail(tmp_path, device, term, prechecks, scenar
     assert [i.name for i in prechecks[0].warnings] == [row]
 
 
+def test_precheck_wallet_page_asking_pin_is_not_typed(tmp_path, device, term, prechecks, alarms):
+    """Halaman ShopeePay meminta PIN: alat tidak mengetik/men-tap kolom PIN; saldo tidak terbaca -> alarm saja,
+    precheck tidak gagal (spesifikasi G), lalu kembali ke halaman produk."""
+    rc, dev = run_precheck(tmp_path, device, wallet_pin=True)
+    text = term.getvalue()
+    assert rc == 0, text
+    assert table_rows(text)["saldo ShopeePay"] == (
+        "PERINGATAN", "ALARM: halaman meminta PIN; tidak dibaca (PIN tidak diketik alat)")
+    assert alarms == ["precheck_saldo ShopeePay"]
+    assert dev.app.kind("tap") == [] and "click" not in dev.ops(), "kolom PIN tidak disentuh"
+    assert not [c for c in dev.shell_cmds() if re.search(r"\binput\b", c)], "tidak ada input teks"
+    assert dev.app.screen == "product"
+
+
 def test_precheck_balance_enough_for_flash_price_is_not_failure(tmp_path, device, term, prechecks):
     # sebelum slot buka halaman menampilkan harga normal Rp150.000 (> max_item_price); alat tidak pernah membayar
     # > max_item_price per unit, jadi saldo dibandingkan dengan min(harga tampil, max_item_price) = Rp100.000

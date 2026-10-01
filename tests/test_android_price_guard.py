@@ -419,11 +419,9 @@ def test_l1_unreadable_price_with_strike_price_never_clicks(tmp_path, monkeypatc
     assert_polling_rules(out)
 
 
-@pytest.mark.parametrize("app_cls, scenario, shown", [
-    (_RbPrice, {}, "Rp99rb"),
-    (_RbPriceCheapChip, {"flash_price": 149_000}, "Rp149rb"),
-], ids=["falls_back_to_strike", "falls_back_to_cheap_chip"])
-def test_l1_unparseable_main_price_is_unreadable_not_replaced(tmp_path, monkeypatch, app_cls, scenario, shown):
+# varian harga coret (_RbPrice) diuji di test_l1_unreadable_price_with_strike_price_never_clicks
+def test_l1_unparseable_main_price_is_unreadable_not_replaced(tmp_path, monkeypatch):
+    app_cls, scenario, shown = _RbPriceCheapChip, {"flash_price": 149_000}, "Rp149rb"
     out = _run(tmp_path, monkeypatch, app_cls, **scenario)
     _no_order(out)
     assert out.result.status == RunStatus.PRICE_GUARD, out.result.message
@@ -568,12 +566,14 @@ CART_OTHER = {"go_cart": True, "cart_other_items": [(OTHER, 25_000, True)]}
 def test_l2_other_checked_item_is_unchecked_then_only_target_proceeds(tmp_path, live):
     out = run_android(tmp_path, live=live, cfg={"expected_name": "Uji Coba"}, **CART_OTHER)
     _passed(out, live)
-    assert OTHER in out.result.step("cart_uncheck").detail
+    assert out.result.step("cart_uncheck").detail == OTHER
     assert [e["detail"] for e in out.kind("cart_toggle")] == [OTHER]
     assert "1 item tercentang" in out.result.step("cart_ok").detail
-    assert _checkouts(out) == [f"[('{TARGET}', 99000, 1)]"]  # hanya target yang masuk checkout
+    assert _checkouts(out) == [f"[('{TARGET}', 99000, 1)]"]  # hanya target (qty 1) yang masuk checkout
     names = out.step_names()
     assert names.index("cart_ok") < names.index("click_checkout") < names.index("price_guard_ok")
+    if live:  # tepat satu pesanan, berhenti di layar PIN
+        assert names.index("click_place_order") < names.index("pin_screen")
 
 
 def test_l2_other_checked_item_without_expected_name_is_price_guard(tmp_path):
@@ -629,15 +629,6 @@ def test_l2_other_item_listed_above_target_is_unchecked(tmp_path, monkeypatch, l
     assert _checkouts(out) == [f"[('{TARGET}', 99000, 1)]"]
 
 
-def test_l2_other_item_listed_above_target_never_orders_both(tmp_path, monkeypatch):
-    # apa pun hasil lapis 2 pada tata letak ini: tidak pernah checkout/pesan dua item
-    out = _run(tmp_path, monkeypatch, _CartOtherFirst, live=True, **CART_OTHER)
-    assert all(OTHER not in d for d in _checkouts(out)), _checkouts(out)
-    assert len(out.kind("order")) <= 1
-    if out.result.status != RunStatus.ORDER_PLACED_AWAIT_PIN:
-        _blocked(out)
-
-
 @BOTH
 @pytest.mark.parametrize("app_cls", [FakeShopeeApp, _CartNameBesideBox], ids=["name_above_box", "name_beside_box"])
 def test_l2_item_named_with_semua_is_not_treated_as_select_all(tmp_path, monkeypatch, live, app_cls):
@@ -651,17 +642,12 @@ def test_l2_item_named_with_semua_is_not_treated_as_select_all(tmp_path, monkeyp
     assert _checkouts(out) == [f"[('{TARGET}', 99000, 1)]"]
 
 
-def test_l2_single_checked_non_target_never_ordered(tmp_path, monkeypatch):
-    out = _run(tmp_path, monkeypatch, _CartTargetUnchecked, live=True, **CART_OTHER)
-    _blocked(out, "keranjang", "item tercentang bukan target (nama acuan 'Uji Coba')", OTHER)
-
-
 @BOTH
 def test_l2_single_checked_non_target_is_blocked_in_cart(tmp_path, monkeypatch, live):
     # lapis 2 ketat (expected_name): satu-satunya item tercentang harus target; tidak menebak/menukar centang
     out = _run(tmp_path, monkeypatch, _CartTargetUnchecked, live=live, cfg={"expected_name": "Uji Coba"},
                **CART_OTHER)
-    _blocked(out, "keranjang", "item tercentang bukan target")
+    _blocked(out, "keranjang", "item tercentang bukan target (nama acuan 'Uji Coba')", OTHER)
     assert out.kind("checkout") == [], "item non-target tidak boleh sampai checkout"
     assert out.kind("cart_toggle") == []
     assert "click_checkout" not in out.step_names()
