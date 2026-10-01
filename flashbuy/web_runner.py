@@ -612,6 +612,13 @@ class WebRunner:
                     return c
             else:
                 seen_clear = True
+            if st == PageState.UNKNOWN:
+                # halaman tak dikenal (bisa tantangan yang tidak terbaca): jangan klik ulang/reload di atasnya;
+                # jaring UNKNOWN_STATE (_observe) yang memutuskan
+                if elapsed > self.flow_timeout_s:
+                    return Classification(PageState.UNKNOWN, "timeout")
+                await asyncio.sleep(POLL_S)
+                continue
             if self._nav_pending:
                 if elapsed > self.flow_timeout_s:
                     return Classification(PageState.UNKNOWN, "timeout")
