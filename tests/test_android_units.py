@@ -1,27 +1,43 @@
-"""Tes unit jalur Android tanpa menjalankan runner.
+"""Tes unit jalur Android tanpa menjalankan runner penuh.
 
 - android_screen: pembacaan layar dari node accessibility (harga utama, baris checkout, keranjang,
-  metode pembayaran, parse dump);
+  metode pembayaran, regex yang dikirim ke device, parse dump);
 - android_selectors: validasi kandidat, templating {variant}, urutan prioritas, load/save
   selectors.json, penggabungan regex penanda & sampel teks Indonesia;
-- android_driver: semantik selector (node_matches), Node.from_u2, U2Driver di atas device u2 palsu,
-  TimedDriver + QueryStats (latensi dari monotonic yang disuntikkan).
+- android_driver: semantik selector (node_matches, regex Java), Node.from_u2, U2Driver di atas device u2
+  palsu (jsonrpc langsung + d(**kw).selector), AgentDead, TimedDriver + QueryStats, FakeDriver;
+- bagian kecil AndroidRunner yang murni membaca layar (penanda habis, kanal toast vs node, harga hot path).
 
 Semua deterministik & cepat: tidak ada device, tidak ada sleep sungguhan.
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import re
+import socket
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from adbutils import AdbError
+from uiautomator2._selector import Selector as U2Selector
+from uiautomator2.exceptions import (
+    HTTPError,
+    HTTPTimeoutError,
+    LaunchUiAutomationError,
+    RPCUnknownError,
+    UiAutomationNotConnectedError,
+    UiObjectNotFoundError,
+)
 
-from flashbuy import android_selectors, pricing
+from flashbuy import android_runner, android_selectors, pricing
 from flashbuy.android_driver import (
+    RPC_TIMEOUT_S,
     SEL_KINDS,
+    AgentDead,
     AppInfo,
     DriverError,
     FakeDriver,
@@ -31,19 +47,29 @@ from flashbuy.android_driver import (
     Sel,
     TimedDriver,
     U2Driver,
+    _disable_implicit_restart,
+    _patch_u2_transport,
     node_matches,
 )
 from flashbuy.android_runner import MARKER_MAX_CHARS, Screen
 from flashbuy.android_screen import (
+    _SHIPPING_ROW,
+    _TOTAL_ROW,
     ANY_TEXT_MATCH,
     ORDER_COUNT_MATCH,
+    PENDING_MATCH,
     PRICE_MATCH,
     QTY_MATCH,
+    RP_ANY_MATCH,
+    RP_SHORT_MATCH,
+    SHIPPING_LABEL_MATCH,
+    TOTAL_LABEL_MATCH,
     cart_rows,
     checkout_count,
     checkout_snapshot,
     is_price,
     is_qty,
+    is_shopeepay,
     label_values,
     parse_dump,
     payment_value,
@@ -61,18 +87,20 @@ from flashbuy.android_selectors import (
     union,
 )
 from flashbuy.pricing import Limits
-from flashbuy.web_js import SHIPPING_LABEL, TOTAL_LABEL
 from tests.android_harness import make_android
 from tests.conftest import FakeClock
 from tests.fake_android import AppScenario, FakeShopeeApp
 
 L = Limits(max_item_price=100_000, max_total=120_000, expected_name="Uji Coba")
-TOTAL_RE = re.compile(TOTAL_LABEL, re.I)
-SHIPPING_RE = re.compile(SHIPPING_LABEL, re.I)
-PAYMENT_RE = re.compile(r"(?i)metode pembayaran")
+# regex baris label yang dipakai android_screen (label harus di AWAL teks; grup terakhir = nilai inline)
+TOTAL_RE = _TOTAL_ROW
+SHIPPING_RE = _SHIPPING_ROW
+TOTAL_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_total"][0]["resourceIdMatches"])
+SHIPPING_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_shipping"][0]["resourceIdMatches"])
 TARGET = "Ponsel Uji Coba 128GB"
 OTHER = "Kabel Data USB-C"
 BOX = "android.widget.CheckBox"
+RADIO = "android.widget.RadioButton"
 
 
 def _n(text: str = "", bounds=(0, 0, 0, 0), **kw) -> Node:
@@ -114,6 +142,58 @@ def test_any_text_and_order_count_regex():
         assert re.fullmatch(ORDER_COUNT_MATCH, s), s
     for s in ("Total Pesanan:", "(1 Item)", "(1000 Produk)"):
         assert re.fullmatch(ORDER_COUNT_MATCH, s) is None, s
+
+
+def _device_match(pattern: str, text: str) -> bool:
+    """Seperti di device: textMatches dengan semantik Java (lihat android_driver._jmatch)."""
+    return node_matches(_n(text), Sel("textMatches", pattern))
+
+
+@pytest.mark.parametrize("text, short, any_rp", [
+    ("Rp99.000", True, True),
+    ("Rp 99.000", True, True),  # NBSP ditulis eksplisit (di Java \s hanya ASCII)
+    ("Rp99rb", True, True),  # format rusak tetap terbaca -> diputuskan "tidak terbaca" oleh pricing
+    ("Rp99.OOO", True, True),
+    ("Hemat Rp51.000", True, True),
+    ("Rp89.000 - Rp129.000", True, True),
+    ("Gratis ongkir min. belanja Rp0 untuk semua produk toko ini", False, True),  # > 40 karakter: bukan harga
+    ("Rp", False, False), ("Beli Sekarang", False, False), ("99.000", False, False),
+])
+def test_rp_short_and_any_regex(text, short, any_rp):
+    assert _device_match(RP_SHORT_MATCH, text) is short
+    assert _device_match(RP_ANY_MATCH, text) is any_rp
+    assert (re.fullmatch(RP_SHORT_MATCH, text) is not None) is short  # Python & Java sepakat
+
+
+@pytest.mark.parametrize("text, total, shipping", [
+    ("Total Pembayaran", True, False),
+    ("Total Pembayaran:", True, False),
+    ("TOTAL PEMBAYARAN Rp109.000", True, False),
+    (" Total Pembayaran Rp109.000", True, False),
+    ("Subtotal Pengiriman", False, True),
+    ("Total Ongkos Kirim", False, True),
+    ("Ongkos Kirim", False, True),
+    ("Biaya Pengiriman", False, True),
+    ("Ongkir: Rp10.000", False, True),
+    # badge/promo yang MENYEBUT label bukan baris label
+    ("Gratis Ongkir", False, False),
+    ("Voucher Gratis Ongkir", False, False),
+    ("Hemat Ongkir s/d Rp20.000", False, False),
+    ("Ongkirnya ditanggung penjual", False, False),
+    ("Lihat Total Pembayaran", False, False),
+    ("Subtotal untuk Produk", False, False),
+])
+def test_label_regexes_require_label_at_start(text, total, shipping):
+    assert _device_match(TOTAL_LABEL_MATCH, text) is total
+    assert (TOTAL_RE.fullmatch(text) is not None) is total
+    assert _device_match(SHIPPING_LABEL_MATCH, text) is shipping
+    assert (SHIPPING_RE.fullmatch(text) is not None) is shipping
+
+
+def test_pending_regex_matches_unready_values():
+    for s in ("Menghitung...", "menghitung ongkir", "Memuat", "Loading..."):
+        assert _device_match(PENDING_MATCH, s), s
+    assert not _device_match(PENDING_MATCH, "Rp10.000")
 
 
 # ------------------------------------------------------------------ geometri
@@ -248,6 +328,18 @@ def test_label_values_pending_value_kept_as_is():
     assert pricing.consistent_amount(values) is None  # belum stabil -> tidak terbaca
 
 
+def test_label_values_ignore_badges_and_read_inline_values():
+    nodes = [
+        _n("Gratis Ongkir", (20, 100, 200, 130)), _n("Rp0", (220, 100, 300, 130)),  # badge + nominal di kanannya
+        _n("Voucher Gratis Ongkir", (20, 150, 300, 180)), _n("-Rp20.000", (500, 150, 700, 180)),
+        _n("Subtotal Pengiriman", (20, 200, 400, 230)), _n("Rp10.000", (500, 200, 700, 230)),
+        _n("Ongkir: Rp10.000", (20, 300, 400, 330)),
+    ]
+    values = label_values(nodes, SHIPPING_RE)
+    assert values == ["Rp10.000", "Rp10.000"]  # badge "Gratis Ongkir" tidak ikut (Rp0 tidak mengganggu)
+    assert pricing.consistent_amount(values) == 10_000
+
+
 # ------------------------------------------------------------------ checkout
 
 
@@ -296,16 +388,105 @@ def test_checkout_snapshot_single_row_drops_strike_price():
         1, 1, 99_000, 10_000, 109_000, True)
 
 
-def test_checkout_snapshot_from_fake_app_layout(fake_clock):
-    app = FakeShopeeApp(AppScenario(open_at=0.0), fake_clock)
+def _checkout_app(clock, **scenario) -> FakeShopeeApp:
+    app = FakeShopeeApp(AppScenario(open_at=0.0, **scenario), clock)
     app.screen = "checkout"
     app.checkout_items = [(TARGET, 99_000, 1)]
+    return app
+
+
+def test_checkout_snapshot_from_fake_app_layout(fake_clock):
+    app = _checkout_app(fake_clock)
     snap = checkout_snapshot(app.nodes())
     assert len(snap.rows) == 1 and snap.rows[0].endswith("Rp99.000\nx1")
+    assert TARGET in snap.rows[0]
     assert "Rp150.000" not in snap.rows[0]  # harga coret sebaris tidak ikut
+    assert "Toko Uji Resmi" not in snap.rows[0]  # header toko bukan bagian baris produk
     verdict = pricing.check_checkout(snap, L)
     assert verdict.ok, verdict.reasons
-    assert payment_value(app.nodes(), PAYMENT_RE) == "ShopeePay"
+    assert payment_value(app.nodes()) == "ShopeePay"
+    assert payment_value(app.nodes(), re.compile("metode pembayaran")) == "ShopeePay"  # label kustom (tanpa flag)
+
+
+def test_checkout_snapshot_testid_and_label_values_must_agree(fake_clock):
+    app = _checkout_app(fake_clock)
+    nodes = app.nodes()
+    snap = checkout_snapshot(nodes, TOTAL_RID, SHIPPING_RID)
+    # testID (bar bawah / ongkir) DAN pasangan label: semua dibaca
+    assert snap.totals == ["Rp109.000", "Rp109.000", "Rp109.000"]
+    assert snap.shippings == ["Rp10.000", "Rp10.000"]
+    assert pricing.read_total(snap) == (10_000, 109_000)
+    assert pricing.check_checkout(snap, L).ok
+
+    # testID berbeda dengan label (mis. total belum diperbarui) -> tidak terbaca (fail-closed), bukan pilih salah satu
+    tampered = [replace(n, text="Rp119.000") if n.rid == "labelTotalPayment" else n for n in nodes]
+    snap = checkout_snapshot(tampered, TOTAL_RID, SHIPPING_RID)
+    assert snap.totals == ["Rp119.000", "Rp109.000", "Rp119.000"]  # testID, label rincian, label bar bawah
+    assert pricing.read_total(snap)[1] is None
+    assert "total pembayaran tidak terbaca" in pricing.check_checkout(snap, L).reasons
+
+    # tanpa regex testID: hanya pasangan label (nilai ber-rid tetap terbaca lewat labelnya)
+    snap = checkout_snapshot(nodes)
+    assert snap.totals == ["Rp109.000", "Rp109.000"] and snap.shippings == ["Rp10.000"]
+
+
+def test_checkout_snapshot_testid_only_values():
+    nodes = [_n(TARGET, (140, 300, 700, 340)), _n("Rp99.000", (140, 395, 300, 430)), _n("x1", (640, 398, 700, 428)),
+             _n("Rp10.000", (500, 900, 700, 930), rid="com.shopee.id:id/labelShippingFinalPrice"),
+             _n("Rp109.000", (300, 1550, 510, 1595), rid="labelTotalPayment")]
+    snap = checkout_snapshot(nodes, TOTAL_RID, SHIPPING_RID)
+    assert (snap.totals, snap.shippings) == (["Rp109.000"], ["Rp10.000"])
+    assert pricing.check_checkout(snap, L).ok
+    assert checkout_snapshot(nodes).totals == []  # tanpa label & tanpa regex testID: tidak terbaca
+
+
+def test_checkout_snapshot_shop_header_does_not_satisfy_expected_name():
+    nodes = [
+        _n("Toko Uji Coba Official", (20, 250, 400, 280)),  # header toko DI DALAM jendela kartu, kolom kiri
+        _n("Ponsel Lain 64GB", (140, 300, 700, 340)),
+        _n("Rp150.000", (140, 402, 300, 427)), _n("Rp99.000", (320, 395, 500, 430)), _n("x1", (640, 398, 700, 428)),
+        _n("Subtotal Pengiriman", (20, 800, 400, 830)), _n("Rp10.000", (500, 800, 700, 830)),
+        _n("Total Pembayaran", (20, 850, 400, 880)), _n("Rp109.000", (500, 850, 700, 880)),
+    ]
+    snap = checkout_snapshot(nodes)
+    assert snap.rows == ["Ponsel Lain 64GB\nRp99.000\nx1"]
+    verdict = pricing.check_checkout(snap, L)
+    assert not verdict.ok and verdict.values["name_ok"] is False
+    assert "nama produk tidak memuat 'Uji Coba'" in verdict.reasons
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "BUG: android_screen.checkout_snapshot - kolom produk = kiri teks Rp PALING KIRI di kartu - 12 px. Bila harga "
+    "coret tidak tampil dan harga jual menjorok ke kanan nama (tata letak FakeShopeeApp strike_in_checkout=False: "
+    "nama x=140, harga x=320), nama produk & 'Variasi: ...' dibuang dari baris -> cek expected_name/variasi selalu "
+    "gagal -> PRICE_GUARD untuk pesanan yang sah (fail-closed, tetapi live tidak pernah bisa memesan)."))
+def test_checkout_snapshot_keeps_name_when_price_column_is_indented(fake_clock):
+    app = _checkout_app(fake_clock, strike_in_checkout=False)
+    app.selected_variant = "Hitam"
+    snap = checkout_snapshot(app.nodes(), TOTAL_RID, SHIPPING_RID)
+    assert TARGET in snap.rows[0] and "Variasi: Hitam" in snap.rows[0], snap.rows
+    verdict = pricing.check_checkout(snap, Limits(100_000, 120_000, "Uji Coba", "Hitam"))
+    assert verdict.ok, verdict.reasons
+
+
+@pytest.mark.parametrize("variant, ok", [
+    ("Hitam", True), ("hitam", True), ("Variasi Hitam", True), ("Putih", False), ("Hitam, 256GB", False),
+])
+def test_checkout_snapshot_expected_variant_must_be_in_product_row(variant, ok):
+    snap = checkout_snapshot(_checkout())  # baris: "...\nVariasi: Hitam\n..."
+    verdict = pricing.check_checkout(snap, Limits(100_000, 120_000, "Uji Coba", variant))
+    assert verdict.ok is ok, verdict.reasons
+    if not ok:
+        assert f"variasi {variant!r} tidak terlihat di baris produk" in verdict.reasons
+
+
+def test_checkout_snapshot_without_rows_needs_exactly_one_order_group():
+    nodes = [n for n in _checkout() if n.label != "x1"]
+    nodes.append(_n("Total Pesanan (1 Produk):", (20, 1200, 400, 1230)))  # grup pesanan kedua (toko lain)
+    snap = checkout_snapshot(nodes)
+    assert snap.rows == [] and pricing.order_counts(snap.page_text) == [1, 1]
+    verdict = pricing.check_checkout(snap, L)
+    assert not verdict.ok and "2 grup pesanan (harus tepat 1)" in verdict.reasons
 
 
 def test_checkout_snapshot_equal_height_strike_kept_fail_closed():
@@ -406,16 +587,31 @@ def test_cart_rows_extra_checked_item_below_target_is_unchecked(fake_clock):
     assert checkout_count(nodes) == [2]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_screen.cart_rows - pita baris item i berakhir di bounds.top checkbox berikutnya, padahal pita "
-    "item berikutnya dimulai box.height di atas checkbox itu; nama item berikutnya (di atas checkbox-nya) ikut "
-    "masuk teks baris i. Bila target BUKAN item teratas dan item lain tercentang, check_cart melihat nama target "
-    "di 2 baris -> 'target tidak bisa dipastikan' -> PRICE_GUARD, bukan uncheck item lain."))
 def test_cart_rows_row_text_does_not_include_next_item(fake_clock):
+    # nama item berada DI ATAS checkbox-nya: teks ditempelkan ke checkbox terdekat, tidak bocor ke baris lain
     rows, _ = _cart(_cart_app(fake_clock, [(OTHER, 20_000, True), (TARGET, 99_000, True)]))
     assert TARGET not in rows[0][0].text, rows[0][0].text
     verdict = pricing.check_cart([r for r, _ in rows], "Uji Coba")
     assert verdict.to_uncheck == [0], verdict.reason
+
+
+def test_cart_rows_three_items_each_row_has_only_its_own_name(fake_clock):
+    names = [OTHER, TARGET, "Casing HP Bening"]
+    rows, _ = _cart(_cart_app(fake_clock, [(OTHER, 20_000, True), (TARGET, 99_000, True),
+                                           ("Casing HP Bening", 15_000, False)]))
+    assert len(rows) == 3
+    for (row, _box), own in zip(rows, names, strict=True):
+        assert [n for n in names if n in row.text] == [own], row.text
+    assert [r.checked for r, _ in rows] == [True, True, False]
+    assert pricing.check_cart([r for r, _ in rows], "Uji Coba", strict=True).to_uncheck == [0]
+
+
+def test_cart_single_checked_non_target_blocked_when_strict(fake_clock):
+    rows, _ = _cart(_cart_app(fake_clock, [(TARGET, 99_000, False), (OTHER, 20_000, True)]))
+    cart = [r for r, _ in rows]
+    strict = pricing.check_cart(cart, "Uji Coba", strict=True)  # nama acuan dari expected_name
+    assert not strict.ok and strict.to_uncheck == [] and "bukan target" in strict.reason
+    assert pricing.check_cart(cart, "Uji Coba", strict=False).ok  # tanpa expected_name: hanya hitungan
 
 
 def test_cart_rows_selected_flag_and_select_all_bar_with_amount():
@@ -432,15 +628,21 @@ def test_cart_rows_selected_flag_and_select_all_bar_with_amount():
     assert row.text == "Ponsel Uji Coba 128GB\nRp99.000"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_screen.cart_rows - _SELECT_ALL_RE dicari di SEMUA teks sebaris checkbox, jadi item yang "
-    "namanya memuat kata 'Semua' (mis. 'Kabel Charger untuk Semua HP') dianggap bar 'Pilih Semua' dan dilewati; "
-    "lapis 2 tidak bisa meng-uncheck item itu."))
 def test_cart_rows_item_named_semua_is_not_select_all():
     nodes = [_n("Kabel Charger untuk Semua HP", (100, 240, 700, 280)), _n("Rp20.000", (100, 290, 300, 320))]
     boxes = [_n("", (20, 250, 70, 300), cls=BOX, checked=True)]  # sebaris dengan nama item
     rows = cart_rows(boxes, nodes)
     assert len(rows) == 1 and rows[0][0].checked
+
+
+@pytest.mark.parametrize("label, skipped", [
+    ("Semua", True), ("Pilih Semua", True), ("pilih semua (3)", True), ("Semua (2)", True),
+    ("Semua Ukuran", False), ("Pilih Semua Varian", False), ("Hapus Semua", False),
+])
+def test_cart_rows_select_all_only_exact_label_on_same_row(label, skipped):
+    nodes = [_n(label, (80, 230, 300, 280)), _n("Rp20.000", (320, 230, 500, 280))]
+    boxes = [_n("", (20, 230, 70, 280), cls=BOX, checked=True)]
+    assert (cart_rows(boxes, nodes) == []) is skipped
 
 
 @pytest.mark.parametrize("text, counts", [
@@ -458,18 +660,70 @@ def test_payment_value_right_below_inline():
     label = _n("Metode Pembayaran", (20, 500, 300, 540), clickable=True)
     right = _n("ShopeePay", (420, 500, 700, 540), clickable=True)  # nilai boleh clickable
     below = _n("COD - Cek Dulu", (20, 545, 400, 580))
-    assert payment_value([label, right], PAYMENT_RE) == "ShopeePay"
-    assert payment_value([label, below], PAYMENT_RE) == "COD - Cek Dulu"
-    assert payment_value([label, below, right], PAYMENT_RE) == "ShopeePay"  # kanan didahulukan
-    assert payment_value([_n("Metode Pembayaran ShopeePay", (20, 500, 700, 540))], PAYMENT_RE) == "ShopeePay"
-    assert payment_value([_n("Metode Pembayaran: SPayLater", (20, 500, 700, 540))], PAYMENT_RE) == "SPayLater"
+    assert payment_value([label, right]) == "ShopeePay"
+    assert payment_value([label, below]) == "COD - Cek Dulu"
+    assert payment_value([label, below, right]) == "ShopeePay"  # kanan didahulukan
+    assert payment_value([_n("Metode Pembayaran ShopeePay", (20, 500, 700, 540))]) == "ShopeePay"
+    assert payment_value([_n("Metode Pembayaran: SPayLater", (20, 500, 700, 540))]) == "SPayLater"
+    assert payment_value([_n(" metode pembayaran : ShopeePay", (20, 500, 700, 540))]) == "ShopeePay"
 
 
 def test_payment_value_missing():
-    assert payment_value([], PAYMENT_RE) is None
-    assert payment_value([_n("ShopeePay", (420, 500, 700, 540))], PAYMENT_RE) is None
+    assert payment_value([]) is None
+    assert payment_value([_n("ShopeePay", (420, 500, 700, 540))]) is None
     label = _n("Metode Pembayaran", (20, 500, 300, 540))
-    assert payment_value([label, _n("   ", (420, 500, 700, 540))], PAYMENT_RE) is None
+    assert payment_value([label, _n("   ", (420, 500, 700, 540))]) is None
+    assert payment_value([label]) is None
+
+
+def test_payment_value_label_row_must_start_with_label():
+    promo = _n("Diskon s/d Rp10.000 dengan Metode Pembayaran ShopeePay", (20, 100, 700, 140))
+    label = _n("Metode Pembayaran", (20, 500, 300, 540))
+    cod = _n("COD - Cek Dulu", (420, 500, 700, 540))
+    assert payment_value([promo, label, cod]) == "COD - Cek Dulu"  # teks promo yang menyebut label diabaikan
+    assert payment_value([promo]) is None
+
+
+def _method_list(checked: set[str], *, cls: str = RADIO, flag: str = "checked") -> list[Node]:
+    out = []
+    for i, m in enumerate(["ShopeePay", "SPayLater", "COD - Cek Dulu"]):
+        top = 150 + i * 100
+        out.append(_n(m, (100, top, 500, top + 40)))
+        out.append(_n("", (640, top, 690, top + 40), cls=cls, **{flag: m in checked}))
+    return out
+
+
+def test_payment_value_inline_radio_exactly_one_checked():
+    assert payment_value(_method_list({"ShopeePay"})) == "ShopeePay"
+    assert payment_value(_method_list({"SPayLater"})) == "SPayLater"
+    assert payment_value(_method_list({"COD - Cek Dulu"}, cls=BOX, flag="selected")) == "COD - Cek Dulu"
+    assert payment_value(_method_list(set())) is None  # tidak ada yang tercentang: tidak pasti
+    assert payment_value(_method_list({"ShopeePay", "SPayLater"})) is None  # dua tercentang: tidak pasti
+    # status radio menang atas teks baris "Metode Pembayaran"
+    row = [_n("Metode Pembayaran", (20, 40, 300, 80)), _n("ShopeePay", (420, 40, 700, 80))]
+    assert payment_value([*row, *_method_list({"COD - Cek Dulu"})]) == "COD - Cek Dulu"
+    lonely = [_n("", (640, 150, 690, 190), cls=RADIO, checked=True)]  # radio tercentang tanpa label di kirinya
+    assert payment_value(lonely) is None
+
+
+def test_payment_value_fake_app_payment_list(fake_clock):
+    app = _checkout_app(fake_clock)
+    app.screen = "payment_list"
+    app.list_choice = "SPayLater"
+    assert payment_value(app.nodes()) == "SPayLater"
+    app.list_choice = "ShopeePay"
+    assert payment_value(app.nodes()) == "ShopeePay"  # "Saldo Rp500.000" di bawahnya tidak mengganggu
+
+
+@pytest.mark.parametrize("value, ok", [
+    ("ShopeePay", True), ("Saldo ShopeePay", True), ("ShopeePay (Rp150.000)", True),
+    ("ShopeePay (Saldo Rp150.000)", True), ("shopeepay - Rp150.000", True), (" ShopeePay ", True),
+    ("SPayLater", False), ("ShopeePay Later", False), ("ShopeePay (Saldo tidak cukup)", False),
+    ("ShopeePay + SPayLater", False), ("Saldo ShopeePay tidak cukup", False), ("ShopeePayLater", False),
+    ("", False), (None, False),
+])
+def test_is_shopeepay_accepts_only_plain_shopeepay(value, ok):
+    assert is_shopeepay(value) is ok
 
 
 # ------------------------------------------------------------------ parse_dump
@@ -565,21 +819,33 @@ def test_to_sel_variant_templating():
     assert not node_matches(_n("Paket 11 Promo"), sel)  # '+' dan '()' literal, bukan regex
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_selectors.to_sel - {variant} hanya di-escape untuk textMatches; descriptionMatches juga regex "
-    "(UiSelector) tetapi variasi dimasukkan mentah, jadi variasi berisi '(', '+', '.' dsb. salah cocok/tidak "
-    "ditemukan."))
 def test_to_sel_variant_escaped_for_description_matches():
     sel = to_sel({"descriptionMatches": "(?i).*{variant}.*"}, "Hitam (128GB)")
     assert sel.value == "(?i).*" + re.escape("Hitam (128GB)") + ".*"
     assert node_matches(_n("", desc="Varian Hitam (128GB)"), sel)
 
 
+@pytest.mark.parametrize("kind", [k for k in SEL_KINDS if k.endswith("Matches")])
+def test_to_sel_variant_escaped_for_every_matches_kind(kind):
+    variant = "1+1 (Promo) v2.0"
+    sel = to_sel({kind: ".*{variant}"}, variant)
+    assert sel.value == ".*" + re.escape(variant)
+    attr = next(a for prefix, a in (("resourceId", "rid"), ("description", "desc"), ("text", "text"))
+                if kind.startswith(prefix))
+    assert node_matches(Node(**{attr: "Paket 1+1 (Promo) v2.0"}), sel)
+    assert not node_matches(Node(**{attr: "Paket 11 Promo v2x0"}), sel)  # '+', '()', '.' literal
+
+
+@pytest.mark.parametrize("kind", [k for k in SEL_KINDS if not k.endswith("Matches")])
+def test_to_sel_variant_raw_for_literal_kinds(kind):
+    assert to_sel({kind: "{variant}"}, "Hitam (128GB)") == Sel(kind, "Hitam (128GB)")  # bukan regex: apa adanya
+
+
 def test_candidates_dedupe_and_variant_step():
     sel = android_selectors.defaults()
     assert sel.candidates("variant_option") == []  # tanpa variasi
-    assert sel.candidates("variant_option", "Hitam") == [
-        Sel("text", "Hitam"), Sel("textContains", "Hitam"), Sel("description", "Hitam")]
+    # persis (textContains bisa kena judul produk yang memuat teks variasi)
+    assert sel.candidates("variant_option", "Hitam") == [Sel("text", "Hitam"), Sel("description", "Hitam")]
     sel.steps["variant_option"] = [{"text": "{variant}"}, {"text": "Hitam"}, {"description": "{variant}"}]
     assert sel.candidates("variant_option", "Hitam") == [Sel("text", "Hitam"), Sel("description", "Hitam")]
     assert sel.candidates("tidak_ada") == []
@@ -604,14 +870,7 @@ def test_order_candidates_priority_calibrated_first_within_kind():
     assert order_candidates([], []) == []
 
 
-_UNORDERED_DEFAULT = pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_selectors.ANDROID_DEFAULT_STEPS['sheet_confirm'] = text -> textContains -> text ('Konfirmasi'), "
-    "melanggar urutan wajib resourceId -> text -> textContains -> description; urutan default juga berbeda dengan "
-    "hasil load() bila selectors.json punya kalibrasi sheet_confirm (order_candidates mengurutkan ulang)."))
-
-
-@pytest.mark.parametrize("step", [pytest.param(s, marks=_UNORDERED_DEFAULT) if s == "sheet_confirm" else s
-                                  for s in ANDROID_DEFAULT_STEPS])
+@pytest.mark.parametrize("step", list(ANDROID_DEFAULT_STEPS))
 def test_default_steps_valid_and_already_in_priority_order(step):
     cands = ANDROID_DEFAULT_STEPS[step]
     ranks = []
@@ -638,6 +897,42 @@ def test_default_step_regexes_match_intended_texts():
     assert not hits("payment_shopeepay", "SPayLater") and not hits("payment_shopeepay", "ShopeePay Later")
     assert hits("place_order", "Buat Pesanan") and not hits("place_order", "Buat Pesanan Sekarang")
     assert hits("cart_marker", "Keranjang Saya (3)") and not hits("cart_marker", "Masukkan Keranjang")
+    assert hits("sheet_confirm", "Beli Sekarang") and hits("sheet_confirm", "Konfirmasi")
+    assert hits("buy_button", "Beli Sekarang")
+    for step in ("buy_button", "sheet_confirm"):  # substring "Beli" tidak aman (mis. "Beli Lagi", "Beli 2 Hemat")
+        assert not hits(step, "Beli") and not hits(step, "Beli Sekarang (Rp99.000)") and not hits(step, "Beli Lagi")
+
+
+def test_default_step_lists_of_redesign():
+    s = ANDROID_DEFAULT_STEPS
+    assert s["buy_button"] == [{"text": "Beli Sekarang"}, {"description": "Beli Sekarang"}]
+    assert s["variant_option"] == [{"text": "{variant}"}, {"description": "{variant}"}]
+    assert s["sheet_confirm"] == [{"text": "Beli Sekarang"}, {"text": "Konfirmasi"}]
+    assert s["cart_checkout"][0] == {"resourceIdMatches": "(.*:id/)?labelButtonCheckout"}
+    assert s["product_price"] == []  # kosong = teks Rp pendek pertama (RP_SHORT_MATCH)
+    for step in ("checkout_total", "checkout_shipping", "pin_screen"):
+        assert s[step] and all(set(c) == {"resourceIdMatches"} for c in s[step]), step
+    # tombol yang men-tap (aksi) tidak pernah memakai kandidat substring
+    for step in ("buy_button", "sheet_confirm", "place_order", "variant_option"):
+        assert all(not k.endswith("Contains") for c in s[step] for k in c), step
+
+
+@pytest.mark.parametrize("step, rid, ok", [
+    ("checkout_total", "labelTotalPayment", True),  # testID React Native mentah
+    ("checkout_total", "com.shopee.id:id/labelTotalPayment", True),
+    ("checkout_total", "labelTotalPaymentDiscount", False),
+    ("checkout_shipping", "labelShippingFinalPrice", True),
+    ("checkout_shipping", "labelShippingPrice", False),
+    ("cart_checkout", "labelButtonCheckout", True),
+    ("cart_checkout", "com.shopee.id:id/labelButtonCheckout", True),
+    ("pin_screen", "com.shopee.id:id/payment_password_field", True),
+    ("pin_screen", "com.shopee.id:id/keyboard_number_view", True),
+    ("pin_screen", "com.shopee.id:id/payment_password_hint", False),
+])
+def test_default_resource_id_steps_match_intended_ids(step, rid, ok):
+    cands = [c for c in android_selectors.defaults().candidates(step) if c.by.startswith("resourceId")]
+    assert cands, step
+    assert any(node_matches(_n(rid=rid), c) for c in cands) is ok
 
 
 def _write_json(path: Path, data: dict) -> Path:
@@ -674,8 +969,8 @@ def test_load_merges_android_section_with_defaults(tmp_path):
     sel = android_selectors.load(path)
     assert sel.source == path
     assert sel.steps["buy_button"] == [
-        {"resourceId": "com.shopee.id:id/btn_buy"}, {"text": "Beli Sekarang"}, {"textContains": "Beli Sekarang"},
-        {"description": "Beli"}, {"description": "Beli Sekarang"}]
+        {"resourceId": "com.shopee.id:id/btn_buy"}, {"text": "Beli Sekarang"},
+        {"description": "Beli"}, {"description": "Beli Sekarang"}]  # kalibrasi di depan default sejenis
     assert sel.candidates("buy_button")[0] == Sel("resourceId", "com.shopee.id:id/btn_buy")
     assert sel.steps["product_price"] == [{"resourceId": "com.shopee.id:id/tv_price"}]
     assert sel.steps["langkah_baru"] == [{"text": "Baru"}]
@@ -697,26 +992,40 @@ def test_load_without_android_section_is_defaults(tmp_path):
     assert sel.source == path
 
 
-@pytest.mark.parametrize("section, err", [
-    ({"steps": {"buy_button": [{"xpath": "//x"}]}}, ValueError),
-    ({"steps": {"buy_button": [{"text": "a", "description": "b"}]}}, ValueError),
-    ({"markers": {"captcha": ["(?is).*(geser"]}}, re.error),
+@pytest.mark.parametrize("section, match", [
+    ({"steps": {"buy_button": [{"xpath": "//x"}]}}, "tepat satu jenis"),
+    ({"steps": {"buy_button": [{"text": "a", "description": "b"}]}}, "tepat satu jenis"),
+    ({"markers": {"captcha": ["(?is).*(geser"]}}, r"android\.markers\.captcha: regex tidak valid"),
+    ({"markers": {"captcha": ["(?a).*geser.*"]}}, "regex tidak valid"),  # flag Python-only: gagal saat digabung
 ])
-def test_load_rejects_invalid_android_section(tmp_path, section, err):
+def test_load_rejects_invalid_android_section(tmp_path, section, match):
     path = _write_json(tmp_path / "selectors.json", {"android": section})
-    with pytest.raises(err):
+    with pytest.raises(ValueError, match=match):  # pesan menyebut letak kesalahan, bukan re.error mentah
         android_selectors.load(path)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_selectors.load - nilai regex kandidat (textMatches/descriptionMatches) tidak divalidasi "
-    "(penanda divalidasi dengan re.compile); regex rusak lolos lalu meledak sebagai re.error (bukan DriverError) "
-    "di AndroidRunner._local/node_matches saat klasifikasi layar."))
-def test_load_rejects_invalid_selector_regex(tmp_path):
-    path = _write_json(tmp_path / "selectors.json",
-                       {"android": {"steps": {"cart_checkout": [{"textMatches": "Checkout(("}]}}})
-    with pytest.raises((ValueError, re.error)):
+@pytest.mark.parametrize("cand", [
+    {"textMatches": "Checkout(("},
+    {"descriptionMatches": "[Checkout"},
+    {"resourceIdMatches": "(.*:id/labelButtonCheckout"},
+    {"textMatches": "(?i).*{variant}(.*"},  # divalidasi setelah {variant} diisi
+    {"textMatches": "Checkout(?i)"},  # flag global di tengah ditolak
+])
+def test_load_rejects_invalid_selector_regex(tmp_path, cand):
+    path = _write_json(tmp_path / "selectors.json", {"android": {"steps": {"cart_checkout": [cand]}}})
+    with pytest.raises(ValueError, match=r"android\.steps\.cart_checkout: regex tidak valid"):
         android_selectors.load(path)
+
+
+def test_load_accepts_valid_selector_regex_and_variant_template(tmp_path):
+    path = _write_json(tmp_path / "selectors.json", {"android": {"steps": {
+        "variant_option": [{"textMatches": "(?i)(?s){variant}"}],
+        "cart_checkout": [{"resourceIdMatches": ".*:id/btn_checkout"}]}}})
+    sel = android_selectors.load(path)
+    assert sel.candidates("variant_option", "1+1") == [
+        Sel("text", "1+1"), Sel("textMatches", "(?i)(?s)1\\+1"), Sel("description", "1+1")]  # urut jenis
+    assert sel.candidates("cart_checkout")[:2] == [Sel("resourceIdMatches", ".*:id/btn_checkout"),
+                                                   Sel("resourceIdMatches", "(.*:id/)?labelButtonCheckout")]
 
 
 def test_save_new_file_without_backup(tmp_path):
@@ -767,9 +1076,16 @@ def test_save_keeps_web_section_and_creates_backup(tmp_path):
     ("abc", "(?:abc)"),
     ("a|b", "(?:a|b)"),
     ("(?:a)(?i)", "(?:(?:a)(?i))"),  # bukan flag di awal -> dibungkus apa adanya
+    ("(?i)(?s).*x.*", "(?is:.*x.*)"),  # flag bertumpuk digabung
+    ("(?s)(?i)(?s)x", "(?is:x)"),
+    ("(?si)(?i)x", "(?is:x)"),
+    ("(?i)(?:a)", "(?i:(?:a))"),
 ])
 def test_scoped(pattern, expected):
     assert scoped(pattern) == expected
+    if pattern != "(?:a)(?i)":  # pola valid -> hasilnya valid dan bisa digabung dengan "|"
+        re.compile(pattern)
+        re.compile(f"{expected}|(?:z)")
 
 
 def test_union_keeps_per_pattern_flags():
@@ -792,17 +1108,16 @@ def test_union_of_all_default_markers_and_watch_pattern_compile():
     assert sel.marker_re("tidak_ada") is None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_selectors.scoped - hanya SATU grup flag di awal yang dipindah; pola '(?i)(?s)...' lolos "
-    "validasi load() (re.compile OK) tetapi union()/marker_re menghasilkan '(?i:(?s)...)' yang ditolak Python re "
-    "-> re.error saat AndroidRunner dibuat."))
 def test_stacked_leading_flags_marker_usable(tmp_path):
-    path = _write_json(tmp_path / "selectors.json", {"android": {"markers": {"antre": ["(?i)(?s).*antrean.*"]}}})
-    try:
-        sel = android_selectors.load(path)
-    except (ValueError, re.error):
-        return  # ditolak saat load juga benar (gagal lebih awal)
+    path = _write_json(tmp_path / "selectors.json", {"android": {"markers": {
+        "antre": ["(?i)(?s).*antrean.*"], "captcha": ["(?s)(?i).*geser.*kepingan.*"]}}})
+    sel = android_selectors.load(path)
     assert sel.marker_re("antre").fullmatch("ANTREAN\npenuh")
+    assert sel.marker_re("captcha").fullmatch("Geser\nKepingan puzzle")
+    assert re.compile(union([p for pats in sel.markers.values() for p in pats]))  # satu query gabungan
+    r, *_rest, log, _notifier = make_android(tmp_path / "run", selectors=sel)  # runner bisa dibuat
+    assert r._markers["captcha"].fullmatch("GESER\nkepingan")
+    log.close()
 
 
 # ------------------------------------------------------------------ sampel penanda (teks Indonesia)
@@ -895,6 +1210,134 @@ def test_runner_marker_length_boundary(runner):
     assert runner._marker("sold_out", [_n(at_limit + "x")]) is None
 
 
+def test_sold_out_bare_habis_and_strong_phrases(runner):
+    runner._screen_h = 1612  # pusat >= 85% tinggi (1370,2 px) = bar tombol bawah
+    buy = _n("Beli Sekarang", (360, 1500, 720, 1612), clickable=True)
+
+    def seen(text, bounds=(500, 860, 700, 900), *, clickable=False, with_buy=True, context="product"):
+        s = runner._message_screen(_n(text, bounds, clickable=clickable), buy if with_buy else None, context)
+        return None if s is None else s.screen
+
+    # "Habis" polos: lencana chip variasi lain (bukan tombol, di tengah layar) bukan produk habis
+    assert seen("Habis") is None
+    assert seen("Habis", with_buy=False, context="after_buy") is None
+    assert seen("Habis", clickable=True) == Screen.SOLD_OUT  # tombol
+    assert seen("Habis", (360, 1500, 720, 1612)) == Screen.SOLD_OUT  # di bar bawah
+    assert seen("Habis", (360, 1350, 720, 1392)) == Screen.SOLD_OUT  # pusat 1371 >= 1370,2
+    assert seen("Habis", (360, 1300, 720, 1340)) is None  # pusat 1320: masih area konten
+    assert seen("Stok Habis", (500, 860, 700, 900), with_buy=False) == Screen.SOLD_OUT  # bukan "Habis" polos
+    # frasa kuat: dihitung, kecuali di halaman produk yang tombol Beli-nya masih ada (bisa milik variasi lain)
+    assert seen("Stok habis") is None
+    assert seen("Stok habis", with_buy=False) == Screen.SOLD_OUT
+    assert seen("Stok habis", context="after_buy") == Screen.SOLD_OUT
+    assert seen("Produk ini terjual habis", context="any") == Screen.SOLD_OUT
+    assert seen("Flash Sale telah berakhir") == Screen.SOLD_OUT  # "berakhir" berlaku walau tombol Beli ada
+    assert seen("Flash Sale berakhir dalam 01:59:59", with_buy=False, context="after_buy") is None  # hitung mundur
+    runner._screen_h = 0  # tinggi layar tak terbaca: hanya "Habis" yang bisa diklik dihitung
+    assert seen("Habis", (360, 1500, 720, 1612)) is None
+    assert seen("Habis", (360, 1500, 720, 1612), clickable=True) == Screen.SOLD_OUT
+
+
+def _prepared(tmp_path, **kw):
+    """Runner dengan driver terpasang (prepare), jam sudah lewat T (slot buka), aplikasi di halaman produk."""
+    runner, app, driver, sclock, open_at, log, _notifier = make_android(tmp_path, **kw)
+    asyncio.run(runner.prepare())
+    sclock.clock.advance(open_at - sclock.now() + 1.0)
+    app.screen = "product"
+    return runner, app, driver, log
+
+
+TOAST_MESSAGES = [("Stok habis", Screen.SOLD_OUT),
+                  ("Silakan pilih variasi terlebih dahulu", Screen.VARIANT_REQUIRED),
+                  ("Flash sale belum dimulai", Screen.NOT_STARTED)]
+
+
+@pytest.mark.parametrize("message, screen", TOAST_MESSAGES)
+def test_classify_after_buy_reads_android_toast_channel(tmp_path, message, screen):
+    runner, app, driver, log = _prepared(tmp_path)  # toast_mode default "toast"
+    assert runner._classify("after_buy").screen == Screen.PRODUCT
+    app._show_toast(message)
+    assert not driver.exists(Sel("text", message))  # Toast Android: tidak ada di pohon node
+    seen = runner._classify("after_buy")
+    assert (seen.screen, seen.evidence) == (screen, f"toast {message!r}")
+    n_calls = len(driver.calls)
+    assert runner._classify("product").screen == Screen.PRODUCT  # polling tidak membaca toast (bisa basi)
+    assert ("last_toast", "") not in driver.calls[n_calls:]
+    runner.d.clear_toast()  # dipanggil runner tepat setelah klik: toast lama tidak dianggap reaksi
+    assert app.last_toast is None
+    assert runner._classify("after_buy").screen == Screen.PRODUCT
+    assert app.events == []  # last_toast/clear_toast hanya operasi agent, tidak menyentuh aplikasi
+    log.close()
+
+
+@pytest.mark.parametrize("message, screen", TOAST_MESSAGES)
+def test_classify_after_buy_reads_in_app_message_nodes(tmp_path, message, screen):
+    runner, app, driver, log = _prepared(tmp_path, toast_mode="node")  # overlay in-app (ada di pohon node)
+    app._show_toast(message)
+    assert driver.exists(Sel("text", message)) and app.last_toast is None
+    seen = runner._classify("after_buy")
+    assert (seen.screen, seen.evidence) == (screen, f"teks {message!r}")
+    log.close()
+
+
+@pytest.mark.parametrize("mode", ["toast", "node"])
+def test_classify_message_has_priority_over_open_sheet(tmp_path, mode):
+    runner, app, _driver, log = _prepared(tmp_path, toast_mode=mode, variants=["Hitam", "Putih"])
+    app.screen = "sheet"
+    assert runner._classify("after_buy").screen == Screen.SHEET
+    app._show_toast("Silakan pilih variasi terlebih dahulu")
+    assert runner._classify("after_buy").screen == Screen.VARIANT_REQUIRED  # bukan SHEET
+    log.close()
+
+
+def test_read_price_is_first_short_rp_text_and_keeps_broken_format(tmp_path):
+    runner, _app, _drv, _sclock, _open_at, log, _notifier = make_android(tmp_path)
+    nodes = [_n("Deskripsi: harga normal Rp150.000, sekarang jauh lebih murah!", (20, 100, 700, 200)),  # > 40
+             _n("Rp99rb", (20, 610, 400, 690)), _n("Rp150.000", (420, 640, 600, 670))]
+    runner._raw_driver = FakeDriver(_StaticApp(nodes), FakeClock(tick=0.0))
+    asyncio.run(runner.prepare())
+    runner.d.stats.samples.clear()
+    text = runner._read_price()
+    assert text == "Rp99rb"  # TIDAK diganti nominal lain (harga coret Rp150.000) -> tidak terbaca
+    assert pricing.check_product_price(text, runner.limits).describe(runner.limits) == "harga tidak terbaca ('Rp99rb')"
+    assert [s.op for s in runner.d.stats.samples] == ["info"]  # hot path: satu info, bukan find_all
+    runner._raw_driver.app._nodes[1] = _n("Rp99.000", (20, 610, 400, 690))
+    assert pricing.check_product_price(runner._read_price(), runner.limits).verdict == "ok"
+    log.close()
+
+
+def test_read_price_uses_calibrated_selector_only(tmp_path):
+    sel = android_selectors.defaults()
+    sel.steps["product_price"] = [{"resourceId": "com.shopee.id:id/tv_price"}]
+    runner, _app, _drv, _sclock, _open_at, log, _notifier = make_android(tmp_path, selectors=sel)
+    nodes = [_n("Rp1.000", (20, 100, 200, 140)), _n("Rp99.000", (20, 610, 400, 690), rid="com.shopee.id:id/tv_price")]
+    app = _StaticApp(nodes)
+    runner._raw_driver = FakeDriver(app, FakeClock(tick=0.0))
+    asyncio.run(runner.prepare())
+    assert runner._read_price() == "Rp99.000"
+    app._nodes.pop()  # selector kalibrasi tidak ketemu -> tidak terbaca (tidak menebak teks Rp lain)
+    assert runner._read_price() is None
+    log.close()
+
+
+def test_prepare_builds_u2driver_scoped_to_package(tmp_path, monkeypatch):
+    runner, _app, driver, _sclock, _open_at, log, _notifier = make_android(tmp_path)
+    made = []
+
+    def factory(serial, package=None):
+        made.append((serial, package))
+        driver.no_implicit_restart = True
+        return driver
+
+    monkeypatch.setattr(android_runner, "U2Driver", factory)
+    runner._raw_driver = None
+    asyncio.run(runner.prepare())
+    assert made == [("FAKE123", "com.shopee.id")]
+    assert runner.d.inner is driver and runner._screen_h == 1612
+    assert "restart implisit u2 mati" in (tmp_path / "logs" / "android.log").read_text(encoding="utf-8")
+    log.close()
+
+
 # =========================================================================== android_driver
 
 
@@ -933,6 +1376,18 @@ def test_sel_kinds_and_rendering():
     (Sel("resourceId", "buy"), _n(rid="com.shopee.id:id/buy"), False),
     (Sel("className", "android.widget.CheckBox"), _n(cls=BOX), True),
     (Sel("className", "CheckBox"), _n(cls=BOX), False),
+    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="labelTotalPayment"), True),
+    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="com.shopee.id:id/labelTotalPayment"), True),
+    (Sel("resourceIdMatches", "labelTotal"), _n(rid="labelTotalPayment"), False),  # seluruh resource-id
+    (Sel("resourceIdMatches", ".*"), _n("labelTotalPayment"), True),  # rid kosong pun cocok ".*"
+    (Sel("resourceIdMatches", "labelTotalPayment"), _n("labelTotalPayment"), False),  # bukan teks
+    # regex Java: \s, \w, \b hanya ASCII -> NBSP bukan spasi (karena itu android_screen menulis SP eksplisit)
+    (Sel("textMatches", r"Rp\s99\.000"), _n("Rp 99.000"), True),
+    (Sel("textMatches", r"Rp\s99\.000"), _n("Rp\u00a099.000"), False),
+    (Sel("textMatches", PRICE_MATCH), _n("Rp\u00a099.000"), True),
+    (Sel("textMatches", r"\w+"), _n("Kopi"), True),
+    (Sel("textMatches", r"\w+"), _n("Caf\u00e9"), False),
+    (Sel("descriptionMatches", r"(?s)Beli\s+Sekarang"), _n("", desc="Beli\nSekarang"), True),
 ])
 def test_node_matches_semantics(sel, node, expected):
     assert node_matches(node, sel) is expected
@@ -970,57 +1425,42 @@ def test_node_from_u2():
 # ------------------------------------------------------------------ device uiautomator2 palsu
 
 
-class UiObjectNotFoundError(Exception):
-    """Nama sama persis dengan uiautomator2.exceptions.UiObjectNotFoundError (U2Driver mengenali lewat nama)."""
-
-
 class _ShellResponse:
     def __init__(self, output: str):
         self.output = output
         self.exit_code = 0
 
 
-class _Lazy:
-    """Seperti u2 `Exists`: RPC baru terjadi saat bool()."""
-
-    def __init__(self, fn):
-        self.fn = fn
-
-    def __bool__(self) -> bool:
-        return self.fn()
-
-
 class _FakeU2Object:
-    def __init__(self, dev: FakeU2Device, kw: dict):
-        self.dev, self.kw = dev, kw
+    """Seperti u2 `UiObject`: hanya membawa `selector` (Selector u2 asli); U2Driver memanggil jsonrpc sendiri."""
 
-    def _found(self, op: str) -> list[dict]:
-        self.dev.queries.append((op, dict(self.kw)))
-        self.dev.maybe_raise(op)
-        ((by, value),) = self.kw.items()
-        sel = Sel(by, value)
-        return [i for i in self.dev.elements if node_matches(Node.from_u2(i), sel)]
+    def __init__(self, selector: U2Selector):
+        self.selector = selector
 
-    @property
-    def exists(self):
-        return _Lazy(lambda: bool(self._found("exists")))
 
-    @property
-    def info(self) -> dict:
-        found = self._found("info")
-        if not found:
-            raise UiObjectNotFoundError({"code": -32002, "message": "UiObjectNotFoundException", "data": self.kw})
-        return found[0]
+class _JsonRpc:
+    """Seperti u2 `d.jsonrpc`: `d.jsonrpc.<method>(*params, http_timeout=..)` -> `d.jsonrpc_call(method, params, t)`."""
 
-    def info_list(self) -> list[dict]:
-        found = self._found("info_list")
-        if not found and self.dev.info_list_not_found:
-            raise UiObjectNotFoundError({"code": -32002, "data": self.kw})
-        return found
+    def __init__(self, dev: FakeU2Device):
+        self.dev = dev
+
+    def __getattr__(self, method: str):
+        def call(*args, **kwargs):
+            http_timeout = kwargs.pop("http_timeout", 300)  # bawaan u2 (HTTP_TIMEOUT) = 300 s
+            return self.dev.jsonrpc_call(method, args if args else kwargs, http_timeout)
+
+        return call
+
+
+def _loose(node: Node, sel: Sel) -> bool:
+    """Jalur B server u2: contains/startsWith tidak peka huruf besar/kecil."""
+    lower = replace(node, text=node.text.lower(), desc=node.desc.lower())
+    return sel.by.endswith(("Contains", "StartsWith")) and node_matches(lower, Sel(sel.by, sel.value.lower()))
 
 
 class FakeU2Device:
-    """Pengganti uiautomator2.Device: hanya API yang dipakai U2Driver; semua panggilan dicatat."""
+    """Pengganti uiautomator2.Device: server jsonrpc palsu (exist/objInfo/objInfoOfAllInstances/click/deviceInfo/
+    getLastToast/clearLastToast) + API adb yang dipakai U2Driver; semua panggilan dicatat."""
 
     serial = "0123456789ABCDEF"
 
@@ -1030,25 +1470,85 @@ class FakeU2Device:
         self.shell_output = shell_output
         self.app = app if app is not None else {"package": "com.shopee.id",
                                                 "activity": "com.shopee.app.ui.home.HomeActivity_"}
-        self.errors: dict[str, Exception] = {}
-        self.info_list_not_found = False
+        self.errors: dict[str, Exception] = {}  # dilempar setiap kali metode/API itu dipanggil
+        self.fail_once: dict[str, list[Exception]] = {}  # dilempar sekali per entri, lalu normal
+        self.loose = False  # server mengembalikan elemen yang cocok tanpa peduli huruf (contains/startsWith)
+        self.null_entries = False  # objInfoOfAllInstances menyisipkan null (elemen hilang di tengah iterasi)
+        self.all_not_found = False  # objInfoOfAllInstances melempar UiObjectNotFoundError
         self.alive: bool | Exception = True
-        self.queries: list[tuple[str, dict]] = []
+        self.device_info: dict | Exception = {"sdkInt": 33, "productName": "BG6"}
+        self.toast: str | None = None
+        self.rpcs: list[tuple[str, tuple, float]] = []
         self.actions: list[tuple] = []
         self.shells: list[tuple[list[str], int]] = []
         self.window_size_calls = 0
         self.write_screenshot = True
 
     def maybe_raise(self, op: str) -> None:
+        if self.fail_once.get(op):
+            raise self.fail_once[op].pop(0)
         if op in self.errors:
             raise self.errors[op]
 
-    def __call__(self, **kw) -> _FakeU2Object:
-        return _FakeU2Object(self, kw)
+    # ---- jsonrpc
 
-    def click(self, x, y) -> None:
-        self.maybe_raise("click")
+    @property
+    def jsonrpc(self) -> _JsonRpc:
+        return _JsonRpc(self)
+
+    def __call__(self, **kw) -> _FakeU2Object:
+        return _FakeU2Object(U2Selector(**kw))
+
+    def jsonrpc_call(self, method: str, params=None, timeout: float = 10):
+        self.rpcs.append((method, params, timeout))
+        self.maybe_raise(method)
+        return getattr(self, f"_rpc_{method}")(*params)
+
+    def _match(self, selector: U2Selector) -> list[dict]:
+        ((by, value),) = [(k, selector[k]) for k in selector if k in SEL_KINDS]
+        sel = Sel(by, value)
+        pkg = selector.get("packageName")
+        out = []
+        for info in self.elements:
+            if pkg is not None and info.get("packageName") != pkg:
+                continue
+            node = Node.from_u2(info)
+            if node_matches(node, sel) or (self.loose and _loose(node, sel)):
+                out.append(info)
+        return out
+
+    def _rpc_exist(self, selector) -> bool:
+        return bool(self._match(selector))
+
+    def _rpc_objInfo(self, selector) -> dict:
+        found = self._match(selector)
+        if not found:
+            raise UiObjectNotFoundError(-32002, "androidx.test.uiautomator.UiObjectNotFoundException", selector)
+        return found[0]
+
+    def _rpc_objInfoOfAllInstances(self, selector) -> list:
+        if self.all_not_found:
+            raise UiObjectNotFoundError(-32002, "androidx.test.uiautomator.UiObjectNotFoundException", selector)
+        found = self._match(selector)
+        return [x for info in found for x in (None, info)] if self.null_entries else found
+
+    def _rpc_click(self, x, y) -> bool:
         self.actions.append(("click", x, y))
+        return True
+
+    def _rpc_deviceInfo(self) -> dict:
+        if isinstance(self.device_info, Exception):
+            raise self.device_info
+        return self.device_info
+
+    def _rpc_getLastToast(self):
+        return self.toast
+
+    def _rpc_clearLastToast(self) -> bool:
+        self.toast = None
+        return True
+
+    # ---- adb / API lain
 
     def app_current(self) -> dict:
         self.maybe_raise("app_current")
@@ -1099,17 +1599,20 @@ BUY_INFO = _u2_info("Beli Sekarang", None, "com.shopee.id:id/buy", "android.widg
                     clickable=True)
 DESC_INFO = _u2_info("", "Keranjang", "", "android.widget.ImageView", (600, 40, 680, 120))
 PRODUCT_URL = "https://shopee.co.id/Ponsel-Uji-Coba-128GB-i.1001.2002"
+STALE = "Unknown RPC error: -32001 androidx.test.uiautomator.StaleObjectException"
 
 
-def _u2(**kw) -> tuple[U2Driver, FakeU2Device]:
-    dev = FakeU2Device([BUY_INFO, DESC_INFO], **kw)
-    return U2Driver(device=dev), dev
+def _u2(*, rpc_timeout_s: float = RPC_TIMEOUT_S, package: str | None = None, elements=None,
+        **kw) -> tuple[U2Driver, FakeU2Device]:
+    dev = FakeU2Device([BUY_INFO, DESC_INFO] if elements is None else elements, **kw)
+    return U2Driver(device=dev, rpc_timeout_s=rpc_timeout_s, package=package), dev
 
 
 def test_u2_init_serial():
     dev = FakeU2Device()
     assert U2Driver(device=dev).serial == "0123456789ABCDEF"
     assert U2Driver("SERIALKU", device=dev).serial == "SERIALKU"
+    assert U2Driver(device=dev).no_implicit_restart is False  # device disuntikkan: tidak diutak-atik
 
     class NoSerial(FakeU2Device):
         serial = None
@@ -1128,28 +1631,90 @@ def test_u2_connect_failure_wrapped(monkeypatch):
         U2Driver("ABC")
     dev = FakeU2Device()
     monkeypatch.setattr(uiautomator2, "connect", lambda serial=None: dev)
-    assert U2Driver("").d is dev
+    drv = U2Driver("")
+    assert drv.d is dev
+    assert drv.no_implicit_restart is False  # device tanpa internal u2 (_dev/_device_server_port): tidak bisa
 
 
-def test_u2_exists_info_find_all():
-    drv, dev = _u2()
+def test_every_selector_kind_is_a_valid_u2_selector_field():
+    for kind in SEL_KINDS:
+        sel = U2Selector(**Sel(kind, "x").kwargs(), packageName="com.shopee.id")  # ReferenceError bila tidak dikenal
+        assert sel[kind] == "x" and sel["mask"] != 0
+
+
+def test_u2_exists_info_find_all_via_jsonrpc():
+    drv, dev = _u2(rpc_timeout_s=2.5)
     assert drv.exists(Sel("text", "Beli Sekarang")) is True
     assert drv.exists(Sel("text", "Tidak Ada")) is False
-    assert dev.queries[0] == ("exists", {"text": "Beli Sekarang"})  # selector diteruskan apa adanya
+    method, (selector,), timeout = dev.rpcs[0]
+    assert (method, timeout) == ("exist", 2.5)
+    assert isinstance(selector, U2Selector) and selector["text"] == "Beli Sekarang"
+    assert "packageName" not in selector  # tanpa package: tidak dibatasi
     node = drv.info(Sel("resourceId", "com.shopee.id:id/buy"))
     assert node.label == "Beli Sekarang" and node.bounds == (360, 1500, 720, 1612) and node.clickable
     assert drv.info(Sel("text", "Tidak Ada")) is None  # UiObjectNotFoundError -> None
     assert [n.label for n in drv.find_all(Sel("className", "android.widget.Button"))] == ["Beli Sekarang"]
     assert drv.find_all(Sel("text", "Tidak Ada")) == []
-    dev.info_list_not_found = True
-    assert drv.find_all(Sel("text", "Tidak Ada")) == []  # UiObjectNotFoundError -> []
+    assert drv.find_all(Sel("descriptionMatches", ANY_TEXT_MATCH)) == [Node.from_u2(DESC_INFO)]
+    assert {m for m, _, _ in dev.rpcs} == {"exist", "objInfo", "objInfoOfAllInstances"}
+    assert all(t == 2.5 for *_, t in dev.rpcs)  # timeout per RPC, bukan 300 s bawaan u2
+    assert U2Driver(device=dev).rpc_timeout_s == RPC_TIMEOUT_S
+
+
+def test_u2_package_injected_into_every_selector():
+    notif = {**BUY_INFO, "packageName": "com.android.systemui",
+             "bounds": {"left": 0, "top": 0, "right": 720, "bottom": 80}}  # notifikasi "Beli Sekarang" di atas
+    drv_all, _ = _u2(elements=[notif, BUY_INFO])
+    assert drv_all.info(Sel("text", "Beli Sekarang")).bounds == (0, 0, 720, 80)  # tanpa package: kena notifikasi
+    drv, dev = _u2(elements=[notif, BUY_INFO], package="com.shopee.id")
+    buy = Sel("text", "Beli Sekarang")
+    assert drv.info(buy).bounds == (360, 1500, 720, 1612)
+    assert [n.bounds for n in drv.find_all(buy)] == [(360, 1500, 720, 1612)]
+    assert drv.exists(buy) is True
+    assert drv.click(buy) is True and dev.actions == [("click", 540, 1556)]
+    assert drv.webview_present() is False
+    selectors = [params[0] for m, params, _ in dev.rpcs if m != "click"]
+    assert selectors and all(s["packageName"] == "com.shopee.id" for s in selectors)
+
+
+def test_u2_find_all_drops_null_entries_and_not_found():
+    drv, dev = _u2()
+    dev.null_entries = True
+    assert [n.label for n in drv.find_all(Sel("textMatches", ANY_TEXT_MATCH))] == ["Beli Sekarang"]
+    dev.all_not_found = True
+    assert drv.find_all(Sel("text", "Beli Sekarang")) == []  # UiObjectNotFoundError -> []
+
+
+def test_u2_client_side_recheck_of_returned_nodes():
+    drv, dev = _u2()
+    dev.loose = True  # server mengembalikan elemen yang hanya cocok tanpa peduli huruf
+    assert drv.info(Sel("textContains", "beli")) is None
+    assert drv.find_all(Sel("textStartsWith", "beli")) == []
+    assert drv.click(Sel("textContains", "beli")) is False and dev.actions == []  # tidak men-tap elemen salah
+    assert drv.info(Sel("textContains", "Beli")).label == "Beli Sekarang"
+
+
+def test_u2_info_retries_stale_object_once():
+    drv, dev = _u2()
+    buy = Sel("text", "Beli Sekarang")
+    dev.fail_once["objInfo"] = [RPCUnknownError(STALE, None, "trace")]
+    assert drv.info(buy).label == "Beli Sekarang"  # dibangun ulang tepat saat T: coba sekali lagi
+    assert [m for m, _, _ in dev.rpcs] == ["objInfo", "objInfo"]
+    dev.rpcs.clear()
+    dev.fail_once["objInfo"] = [RPCUnknownError(STALE, None, "trace"), RPCUnknownError(STALE, None, "trace")]
+    assert drv.info(buy) is None  # dua kali stale -> tidak ada (bukan error, bukan percobaan ketiga)
+    assert [m for m, _, _ in dev.rpcs] == ["objInfo", "objInfo"]
+    dev.fail_once["objInfo"] = [RPCUnknownError(STALE, None, "trace")]
+    assert drv.info(Sel("text", "Tidak Ada")) is None
 
 
 @pytest.mark.parametrize("op, call", [
-    ("exists", lambda d: d.exists(Sel("text", "Beli Sekarang"))),
-    ("info", lambda d: d.info(Sel("text", "Beli Sekarang"))),
-    ("info_list", lambda d: d.find_all(Sel("text", "Beli Sekarang"))),
+    ("exist", lambda d: d.exists(Sel("text", "Beli Sekarang"))),
+    ("objInfo", lambda d: d.info(Sel("text", "Beli Sekarang"))),
+    ("objInfoOfAllInstances", lambda d: d.find_all(Sel("text", "Beli Sekarang"))),
     ("click", lambda d: d.click(Node(bounds=(0, 0, 10, 10)))),
+    ("getLastToast", lambda d: d.last_toast()),
+    ("clearLastToast", lambda d: d.clear_toast()),
     ("app_current", lambda d: d.current_app()),
     ("shell", lambda d: d.shell(["getprop"])),
     ("swipe", lambda d: d.swipe_refresh()),
@@ -1161,35 +1726,75 @@ def test_u2_errors_wrapped_in_driver_error(op, call):
     drv, dev = _u2()
     original = ConnectionResetError("koneksi ke agent putus")
     dev.errors[op] = original
-    with pytest.raises(DriverError) as ei:
+    with pytest.raises(AgentDead) as ei:  # transport putus = agent mati (bisa dipulihkan dengan restart)
         call(drv)
+    assert isinstance(ei.value, DriverError)
     assert "ConnectionResetError: koneksi ke agent putus" in str(ei.value)
     assert ei.value.__cause__ is original
 
 
+@pytest.mark.parametrize("exc, dead", [
+    (HTTPError("Unable to connect to uiautomator2 server"), True),
+    (HTTPTimeoutError("read timeout"), True),
+    (UiAutomationNotConnectedError("UiAutomation not connected"), True),
+    (LaunchUiAutomationError("uiautomator2 server gagal start"), True),
+    (ConnectionResetError("reset"), True),
+    (BrokenPipeError("pipe"), True),
+    (TimeoutError("timed out"), True),  # = socket.timeout (timeout soket adb)
+    (OSError("adb transport"), True),
+    (AdbError("device offline"), True),
+    (RPCUnknownError("Unknown RPC error: -32001 java.lang.IllegalStateException", None, "trace"), False),
+    (RuntimeError("x"), False),
+    (ValueError("respon aneh"), False),
+])
+def test_u2_dead_agent_errors_become_agent_dead(exc, dead):
+    drv, dev = _u2()
+    dev.errors["exist"] = exc
+    with pytest.raises(DriverError) as ei:
+        drv.exists(Sel("text", "Beli Sekarang"))
+    assert isinstance(ei.value, AgentDead) is dead  # runner hanya me-restart agent untuk AgentDead
+    assert ei.value.__cause__ is exc
+
+
 def test_u2_error_message_names_the_query():
     drv, dev = _u2()
-    dev.errors["info"] = RuntimeError("rpc timeout")
-    with pytest.raises(DriverError, match=r"^info text='Beli Sekarang': RuntimeError: rpc timeout"):
+    dev.errors["objInfo"] = RuntimeError("rpc timeout")
+    with pytest.raises(DriverError, match=r"^info text='Beli Sekarang': RuntimeError: rpc timeout") as ei:
         drv.info(Sel("text", "Beli Sekarang"))
-    dev.errors["info"] = DriverError("sudah DriverError")
+    assert not isinstance(ei.value, AgentDead)
+    dev.errors["objInfo"] = DriverError("sudah DriverError")
     with pytest.raises(DriverError, match="^sudah DriverError$"):  # tidak dibungkus dua kali
         drv.info(Sel("text", "Beli Sekarang"))
 
 
 def test_u2_click_and_get_text():
-    drv, dev = _u2()
+    drv, dev = _u2(rpc_timeout_s=1.5)
     assert drv.click(Sel("text", "Beli Sekarang")) is True
     assert dev.actions == [("click", 540, 1556)]  # tap tengah bounds
+    assert dev.rpcs[-1] == ("click", (540, 1556), 1.5)
     assert drv.click(Sel("text", "Tidak Ada")) is False
     assert dev.actions == [("click", 540, 1556)]  # tidak ada tap tambahan
-    n_queries = len(dev.queries)
+    n_rpcs = len(dev.rpcs)
     assert drv.click(Node(text="x", bounds=(0, 100, 101, 201))) is True
     assert dev.actions[-1] == ("click", 50, 150)
-    assert len(dev.queries) == n_queries  # klik Node = 1 RPC, tanpa query info
+    assert [m for m, _, _ in dev.rpcs[n_rpcs:]] == ["click"]  # klik Node = 1 RPC, tanpa query info
     assert drv.get_text(Sel("text", "Beli Sekarang")) == "Beli Sekarang"
     assert drv.get_text(Sel("description", "Keranjang")) == "Keranjang"  # text kosong -> desc
     assert drv.get_text(Sel("text", "Tidak Ada")) is None
+
+
+def test_u2_last_toast_and_clear_toast():
+    drv, dev = _u2(rpc_timeout_s=1.5)
+    assert drv.last_toast() is None
+    dev.toast = "Stok habis"
+    assert drv.last_toast() == "Stok habis"
+    dev.toast = ""
+    assert drv.last_toast() is None  # string kosong = tidak ada toast
+    dev.toast = "Silakan pilih variasi terlebih dahulu"
+    drv.clear_toast()
+    assert dev.toast is None and drv.last_toast() is None
+    assert [r for r in dev.rpcs if r[0] == "clearLastToast"] == [("clearLastToast", {}, 1.5)]
+    assert dev.actions == []  # operasi agent saja: tidak ada tap/gestur ke aplikasi
 
 
 def test_u2_current_app():
@@ -1260,10 +1865,10 @@ def test_u2_window_size_cached_and_swipe_refresh_pulls_down():
     drv.swipe_refresh()
     assert dev.window_size_calls == 1
     _, fx, fy, tx, ty, duration = dev.actions[0]
-    assert (fx, tx) == (540, 540)
-    assert fy == pytest.approx(2460 * 0.30) and ty == pytest.approx(2460 * 0.75)
+    assert (fx, fy, tx, ty) == (540, 738, 540, 1845)  # 30% -> 75% tinggi, koordinat piksel bulat
+    assert all(isinstance(v, int) for v in (fx, fy, tx, ty))
     assert fy < ty  # tarik ke bawah = muat ulang
-    assert duration == pytest.approx(0.12)
+    assert duration == pytest.approx(0.3)  # tarik pelan, bukan fling
     assert drv.window_size() == (1080, 2460)
     assert dev.window_size_calls == 1
 
@@ -1273,7 +1878,8 @@ def test_u2_press_back_webview_screenshot_dump(tmp_path):
     drv.press_back()
     assert dev.actions[-1] == ("press", "back")
     assert drv.webview_present() is False
-    assert dev.queries[-1] == ("exists", {"className": "android.webkit.WebView"})
+    method, (selector,), _ = dev.rpcs[-1]
+    assert method == "exist" and selector["className"] == "android.webkit.WebView"
     dev.elements.append(_u2_info(cls="android.webkit.WebView", bounds=(0, 0, 720, 1612)))
     assert drv.webview_present() is True
     shot = tmp_path / "akhir.png"
@@ -1284,23 +1890,115 @@ def test_u2_press_back_webview_screenshot_dump(tmp_path):
     assert "Beli Sekarang" in drv.dump()
 
 
-def test_u2_agent_alive_and_restart():
-    drv, dev = _u2()
+def test_u2_agent_alive_needs_ping_and_real_rpc():
+    drv, dev = _u2(rpc_timeout_s=1.5)
     assert drv.agent_alive() is True
+    assert dev.rpcs == [("deviceInfo", {}, 1.5)]  # /ping saja tidak cukup: UiAutomation dibuktikan dengan RPC
+    dev.rpcs.clear()
     dev.alive = False
     assert drv.agent_alive() is False
+    assert dev.rpcs == []  # /ping gagal: tidak perlu RPC
+    dev.alive = True
+    dev.device_info = UiAutomationNotConnectedError("UiAutomation not connected")
+    assert drv.agent_alive() is False  # server HTTP hidup, UiAutomation mati (HiOS)
+    dev.device_info = {"sdkInt": 33}
     dev.alive = ConnectionError("port forward hilang")
     assert drv.agent_alive() is False  # error saat cek = dianggap mati
-    drv.restart_agent()
-    assert dev.actions[-2:] == [("stop_uiautomator",), ("start_uiautomator",)]
-    dev.errors["start_uiautomator"] = RuntimeError("server not ready")
-    with pytest.raises(DriverError, match="restart agent: RuntimeError: server not ready"):
-        drv.restart_agent()
 
     class NoCheck(FakeU2Device):
         _check_alive = None
 
     assert U2Driver(device=NoCheck()).agent_alive() is None  # tidak bisa dicek
+
+
+def test_u2_restart_agent_http_stop_then_stop_start(monkeypatch):
+    from uiautomator2 import core
+
+    http = []
+
+    def fake_http(dev_, port, method, path, data=None, timeout=10.0, print_request=False):
+        http.append((dev_, port, method, path, timeout))
+
+    monkeypatch.setattr(core, "_http_request", fake_http)
+    drv, dev = _u2()
+    dev._dev, dev._device_server_port = "ADBDEV", 9008
+    drv.restart_agent()
+    assert http == [("ADBDEV", 9008, "GET", "/stop", 3)]  # server bukan milik sesi ini juga diminta berhenti
+    assert dev.actions == [("stop_uiautomator",), ("start_uiautomator",)]
+
+    def http_down(*a, **kw):
+        raise HTTPError("server sudah mati")
+
+    monkeypatch.setattr(core, "_http_request", http_down)
+    drv.restart_agent()  # /stop gagal (server sudah mati) bukan alasan berhenti
+    assert dev.actions[-2:] == [("stop_uiautomator",), ("start_uiautomator",)]
+    dev.errors["start_uiautomator"] = RuntimeError("server not ready")
+    with pytest.raises(DriverError, match="restart agent: RuntimeError: server not ready"):
+        drv.restart_agent()
+
+
+def test_u2_implicit_restart_disabled_for_real_connections(monkeypatch):
+    import uiautomator2
+    from uiautomator2 import core
+
+    calls = []
+
+    def direct_call(dev_, port, method, params, timeout, debug):
+        calls.append((dev_, port, method, timeout, debug))
+        raise HTTPError("agent dibunuh HiOS")
+
+    monkeypatch.setattr(core, "_jsonrpc_call", direct_call)
+    dev = FakeU2Device([BUY_INFO])
+    dev._dev, dev._device_server_port, dev._debug = "ADBDEV", 9008, False
+    monkeypatch.setattr(uiautomator2, "connect", lambda serial=None: dev)
+    drv = U2Driver("SER", rpc_timeout_s=1.5, package="com.shopee.id")
+    assert drv.no_implicit_restart is True
+    with pytest.raises(AgentDead, match="HTTPError: agent dibunuh HiOS"):
+        drv.info(Sel("text", "Beli Sekarang"))
+    assert calls == [("ADBDEV", 9008, "objInfo", 1.5, False)]  # sekali, tanpa restart+ulang diam-diam
+    assert dev.actions == [] and dev.rpcs == []  # stop/start_uiautomator tidak dipanggil u2
+    assert _disable_implicit_restart(object()) is False
+
+
+def test_patch_u2_transport_sets_socket_timeout_and_nodelay(monkeypatch):
+    from uiautomator2 import core
+
+    class Sock:
+        def __init__(self):
+            self.timeout, self.opts = None, []
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def setsockopt(self, *args):
+            self.opts.append(args)
+
+    class NotTcp(Sock):
+        def setsockopt(self, *args):
+            raise OSError("bukan soket TCP")
+
+    class Conn:  # pengganti AdbHTTPConnection (kelas asli dipulihkan monkeypatch)
+        sock_cls = Sock
+
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def connect(self):
+            self.sock = self.sock_cls()
+
+    monkeypatch.setattr(core, "AdbHTTPConnection", Conn)
+    _patch_u2_transport()
+    conn = Conn(2.5)
+    conn.connect()
+    assert conn.sock.timeout == 2.5  # u2 menyetel conn.timeout tetapi tidak pernah ke soket
+    assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) in conn.sock.opts
+    patched = Conn.connect
+    _patch_u2_transport()
+    assert Conn.connect is patched  # idempoten: tidak dibungkus dua kali
+    Conn.sock_cls = NotTcp
+    conn = Conn(None)
+    conn.connect()  # error setsockopt / timeout bukan angka diabaikan
+    assert conn.sock.timeout is None
 
 
 # ------------------------------------------------------------------ TimedDriver & QueryStats
@@ -1340,6 +2038,8 @@ def test_timed_driver_records_every_call_with_latency(tmp_path):
     td.swipe_refresh()
     td.press_back()
     assert td.webview_present() is False
+    assert td.last_toast() is None
+    td.clear_toast()
     assert td.screenshot(tmp_path / "x.png") is True
     assert "<hierarchy>" in td.dump()
     assert td.shell(["getprop", "ro.product.model"]) == "TECNO BG6\n"
@@ -1350,15 +2050,18 @@ def test_timed_driver_records_every_call_with_latency(tmp_path):
     samples = td.stats.samples
     assert [s.op for s in samples] == [
         "exists", "info", "find_all", "click", "click", "get_text", "current_app", "start_url", "swipe_refresh",
-        "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "window_size"]
+        "press_back", "webview", "last_toast", "clear_toast", "screenshot", "dump", "shell", "agent_alive",
+        "restart_agent", "window_size"]
     by_op = {s.op: s for s in samples}
     assert samples[0].target == "text='Beli Sekarang'"
     assert samples[4].target == "node 'Beli Sekarang'"
     assert by_op["start_url"].target == PRODUCT_URL
     assert by_op["shell"].target == "getprop ro.product.model"
     assert by_op["screenshot"].target == str(tmp_path / "x.png")
-    expected_ms = {"exists": 20, "info": 20, "find_all": 20, "get_text": 20, "start_url": 300, "swipe_refresh": 150,
-                   "screenshot": 200, "dump": 400, "agent_alive": 5, "restart_agent": 2000, "window_size": 0}
+    # find_all = latency + per_match (default latency/2) x 1 elemen cocok; toast = operasi agent ringan
+    expected_ms = {"exists": 20, "info": 20, "find_all": 30, "get_text": 20, "start_url": 300, "swipe_refresh": 150,
+                   "last_toast": 10, "clear_toast": 10, "screenshot": 200, "dump": 400, "agent_alive": 5,
+                   "restart_agent": 2000, "window_size": 0}
     for op, ms in expected_ms.items():
         assert by_op[op].ms == pytest.approx(ms), op
     assert samples[3].ms == pytest.approx(40)  # click(Sel) = info + tap, dicatat SEKALI sebagai satu query
@@ -1424,3 +2127,56 @@ def test_fake_driver_device_shell_and_failures():
     assert clock.monotonic() - t0 == pytest.approx(0.05)  # query gagal tetap memakan waktu
     assert drv.exists(Sel("text", "Beli Sekarang")) is True  # hanya sekali
     assert drv.calls[-1] == ("exists", "text='Beli Sekarang'")
+
+
+def test_fake_driver_find_all_cost_scales_with_matches():
+    clock = FakeClock(tick=0.0)
+    nodes = [_n(f"Rp{i}.000", (0, i * 50, 100, i * 50 + 40)) for i in range(1, 5)]
+    rp = Sel("textMatches", RP_ANY_MATCH)
+
+    def cost(fn) -> float:
+        t0 = clock.monotonic()
+        fn()
+        return clock.monotonic() - t0
+
+    drv = FakeDriver(_StaticApp(nodes), clock, latency_s=0.02)
+    assert drv.per_match_s == pytest.approx(0.01)  # default latency/2 (info_list: ~16 pencarian per elemen)
+    assert cost(lambda: drv.find_all(rp)) == pytest.approx(0.02 + 4 * 0.01)
+    assert cost(lambda: drv.find_all(Sel("text", "x"))) == pytest.approx(0.02)
+    assert cost(lambda: drv.info(rp)) == pytest.approx(0.02)  # info/exists: satu pencarian, berapa pun cocoknya
+    assert cost(lambda: drv.exists(rp)) == pytest.approx(0.02)
+    slow = FakeDriver(_StaticApp(nodes), clock, latency_s=0.02, per_match_s=0.05)
+    assert cost(lambda: slow.find_all(rp)) == pytest.approx(0.02 + 4 * 0.05)
+
+
+def test_fake_driver_info_sees_all_windows_find_all_only_active(fake_clock):
+    app = FakeShopeeApp(AppScenario(open_at=0.0), fake_clock)  # slot sudah buka (jam palsu jauh setelah 0)
+    app.screen = "sheet"
+    drv = FakeDriver(app, fake_clock)
+    buy = Sel("text", "Beli Sekarang")
+    assert drv.info(buy).bounds == (360, 1500, 720, 1612)  # jalur A: tombol halaman produk DI BELAKANG sheet
+    assert [n.bounds for n in drv.find_all(buy)] == [(0, 1500, 720, 1612)]  # jalur B: hanya tombol sheet
+    assert drv.exists(Sel("text", "Detail Produk")) and drv.find_all(Sel("text", "Detail Produk")) == []
+
+
+def test_fake_driver_toast_channel_is_agent_only(fake_clock):
+    app = FakeShopeeApp(AppScenario(open_at=0.0), fake_clock)
+    app.screen = "product"
+    drv = FakeDriver(app, fake_clock)
+    assert drv.last_toast() is None
+    app._show_toast("Stok habis")
+    assert drv.last_toast() == "Stok habis"
+    assert not drv.exists(Sel("text", "Stok habis"))  # Toast Android bukan node
+    drv.clear_toast()
+    assert drv.last_toast() is None and app.last_toast is None
+    assert [c for c in drv.calls if "toast" in c[0]] == [("last_toast", "")] * 2 + [("clear_toast", "")] + \
+        [("last_toast", "")]
+    assert app.events == []  # tidak ada tap/intent/refresh: aplikasi & server Shopee tidak tersentuh
+
+    node_app = FakeShopeeApp(AppScenario(open_at=0.0, toast_mode="node"), fake_clock)
+    node_app.screen = "product"
+    node_drv = FakeDriver(node_app, fake_clock)
+    node_app._show_toast("Stok habis")
+    assert node_drv.exists(Sel("text", "Stok habis")) and node_drv.last_toast() is None  # overlay in-app = node
+    fake_clock.advance(1.6)
+    assert not node_drv.exists(Sel("text", "Stok habis"))  # overlay hilang sendiri setelah 1,5 s
