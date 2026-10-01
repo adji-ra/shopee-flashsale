@@ -172,7 +172,8 @@ Jadwal (waktu server terkoreksi):
 | T+0,5 s | tombol belum aktif atau harga belum valid → reload, lalu tiap 2 s. Setelah reload variasi dipilih ulang. Reload terhitung aksi polling |
 | sukses | keranjang (lapis 2) → Checkout → pastikan ShopeePay → cek harga (lapis 3) → **DRY-RUN berhenti** (screenshot) / LIVE klik "Buat Pesanan" → layar PIN → alarm |
 
-Kalau run dimulai setelah T-2 menit, resync dilewati karena timesync awal masih segar.
+Kalau run dimulai setelah T-2 menit, resync dilewati karena timesync awal masih segar. Run yang
+dimulai setelah T-70 s ditolak (precheck & buka halaman tidak boleh jatuh di jendela polling).
 Browser dibiarkan terbuka untuk PIN, captcha, atau verifikasi. Selesaikan manual lalu tutup
 browser.
 
@@ -305,6 +306,9 @@ python -m flashbuy precheck --config target.yaml --only android
 
 ### 4. Dry-run lalu live
 
+Run harus dimulai paling lambat **T-70 s** (precheck & pembukaan halaman tidak boleh jatuh di jendela
+polling); lebih lambat ditolak.
+
 ```powershell
 python -m flashbuy run --config target.yaml --only android            # DRY-RUN
 python -m flashbuy run --config target.yaml --only android --live     # pesanan sungguhan
@@ -324,22 +328,45 @@ Setiap iterasi **mengklasifikasi layar dulu, lalu bertindak** (produk, bottom sh
 keranjang, checkout, PIN, habis, captcha/verifikasi, login, loading, aplikasi lain, tak dikenal).
 
 Kecepatan:
-- Hot path memakai query selector di device (`d(...).info`, satu query gabungan `textMatches`
-  untuk harga + penanda status, klik koordinat), **bukan** `dump_hierarchy`. Dump hanya untuk
-  kalibrasi, diagnosa layar tak dikenal, dan status akhir (`android-<ts>-<status>.xml`).
+- Hot path hanya memakai query satu-elemen di device (`info`/`exists`, satu pencarian pohon):
+  per iterasi polling = tombol Beli + satu query bahaya (captcha/verifikasi/PIN) + harga. Klasifikasi
+  layar = rantai `exists`/`info` berprioritas dengan regex gabungan. **Bukan** `dump_hierarchy`
+  (dump hanya untuk kalibrasi, diagnosa, dan status akhir `android-<ts>-<status>.xml`), dan bukan
+  `info_list`, yang di u2.jar melakukan ~16 pencarian pohon per elemen cocok. `find_all` hanya dipakai
+  untuk bacaan sempit di langkah maju (sheet, checkout, keranjang).
+- Toast Android (jendela terpisah, tidak ada di pohon node) dibaca lewat `getLastToast`.
 - Latensi tiap query diukur dan ditulis setelah run ke log (ringkasan median/p95/maks) dan
-  `android-queries-run.csv`. Query > 100 ms diberi peringatan.
+  `android-queries-run.csv`. Target info/exists < 100 ms, find_all < 300 ms; lebih = peringatan.
+- Koneksi u2: timeout per RPC 5 s (bawaan u2 tidak menerapkan timeout socket), TCP_NODELAY, dan restart
+  agent implisit u2 dimatikan: agent yang dibunuh HiOS terlihat sebagai error, lalu di-restart
+  eksplisit (tercatat, maks 2× saat polling). Query dibatasi ke package `com.shopee.id`.
 - Tidak ada sleep tetap; semua penantian berbasis kondisi + timeout. Indikator loading
-  (ProgressBar) setelah klik ditunggu sampai batas 30 s, tidak dianggap "tak dikenal".
+  (ProgressBar) setelah klik ditunggu sampai batas 30 s; layar tak dikenal tidak pernah memicu
+  klik ulang/reload, hanya jaring `UNKNOWN_STATE` (1,5 s).
+
+Keamanan klik:
+- Klik ulang Beli, konfirmasi ulang di bottom sheet, dan reload = aksi polling (≥ 425 ms, jendela
+  T-1..T+8 s). Reload dihitung dari saat gestur/intent **selesai**.
+- Bila sempat menunggu slot, tombol Beli dibaca ulang tepat sebelum diklik (layar bisa sudah
+  berganti ke checkout; koordinat lama tidak pernah dipakai).
+- Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"
+  (`UNKNOWN_STATE` + pesan wajib + alarm).
 
 Pembacaan harga di aplikasi (aksesibilitas Android tidak memberi tahu teks yang dicoret):
-- harga produk: nominal Rp dengan tinggi teks terbesar (harga flash biasanya paling besar);
-- checkout: harga pada baris yang sama dengan penanda "x1" (harga coret sebaris yang lebih kecil
-  diabaikan; bila seri, diambil yang terbesar), label "Total Pembayaran"/"Subtotal Pengiriman"
-  dipasangkan dengan nilai di kanannya atau tepat di bawahnya;
-- keranjang: baris per checkbox.
-Bila tampilan asli berbeda, hasilnya `PRICE_GUARD` (aman). Kalibrasi `product_price` dengan
-resourceId bila heuristik salah memilih.
+- harga produk (lapis 1): teks Rp pendek **pertama** yang terlihat (harga utama berada di atas harga
+  coret); format aneh ("Rp99rb", rentang) = tidak terbaca → tidak diklik. Kalibrasi `product_price`
+  (resourceId) bila heuristik salah memilih;
+- keranjang (lapis 2): teks ditempelkan ke checkbox terdekat; dengan `expected_name`, satu-satunya item
+  tercentang pun harus target; centang ditunggu terbarui (≤ 2 s) setelah uncheck;
+- checkout (lapis 3): harga pada baris yang sama dengan penanda "x1" (harga coret sebaris yang lebih
+  kecil diabaikan; seri → diambil yang terbesar); nama dicocokkan hanya di kolom produk (bukan nama
+  toko); `variant` dari config harus terlihat di baris produk; "Total Pembayaran"/ongkir dari testID
+  (`labelTotalPayment`, `labelShippingFinalPrice`) **dan** label baris (harus diawali label, jadi badge
+  "Gratis Ongkir" diabaikan), semua harus sama; stabil ≥ 100 ms, atau ≥ 1 s setelah ganti metode
+  bayar/uncheck keranjang (server menghitung ulang total & promo);
+- metode bayar: dari radio yang tercentang atau baris yang diawali "Metode Pembayaran"; hanya
+  "ShopeePay", "Saldo ShopeePay", "ShopeePay (Rp…)" yang diterima (bukan SPayLater/"saldo tidak cukup").
+Bila tampilan asli berbeda, hasilnya `PRICE_GUARD` (aman).
 
 Aplikasi tidak pernah ditutup alat. Captcha/verifikasi/PIN dibiarkan di layar untuk Anda.
 
