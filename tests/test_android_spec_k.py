@@ -1,12 +1,13 @@
 """Spesifikasi K (jaminan lintas skenario) jalur Android di atas FakeDriver + FakeShopeeApp (waktu virtual).
 
-- Stok habis lalu harga kembali normal -> SOLD_OUT pada deteksi pertama, tanpa klik Beli (live).
+- "Stok habis" saat konfirmasi lalu halaman kembali ke harga normal dengan Beli aktif -> SOLD_OUT, tanpa beli ulang.
 - Setiap status stop yang bisa dicapai mode LIVE, DRYRUN_OK, dan kalibrasi: 0 klik "Buat Pesanan".
-- Alat tidak pernah mengetik: tidak ada API/operasi input teks, tidak ada `input` shell, tidak ada aksi ke aplikasi
-  setelah layar PIN muncul (setelah "Buat Pesanan" maupun halaman saldo saat precheck).
+- Alat tidak pernah mengetik: tidak ada API/RPC input teks (juga lewat jsonrpc mentah), tidak ada aksi ke aplikasi
+  setelah layar PIN muncul (juga layar PIN tanpa teks).
 - E.5 refresh: pertama T+0,5 s, lalu tiap 2 s (dihitung dari AWAL reload), lewat RateLimiter & jendela T-1..T+8 s;
-  variasi dipilih ulang setelah reload (status chip tak terbaca: hanya setelah intent; chip terlambat: ditunggu).
-- Spesifikasi I: tanpa frida/jadx/apktool/root/su/hook/API privat; perintah adb shell hanya dari daftar izin.
+  variasi dipilih ulang setelah reload (chip tak terbaca: intent & swipe, swipe yang mereset variasi, chip
+  terlambat).
+- Spesifikasi I: tanpa frida/jadx/apktool/root/su/hook/API privat (perintah adb shell: allowlist check_shell).
 Waktu = waktu server (ms) relatif T (slot buka). Tes yang terkait dengan tes lain dirujuk di komentar satu baris.
 """
 
@@ -50,7 +51,11 @@ DRIVER_API = {"exists", "info", "info_any", "find_all", "click", "get_text", "cu
               "swipe_refresh", "press_back", "webview_present", "screenshot", "last_toast", "clear_toast", "dump",
               "shell", "agent_alive", "restart_agent", "window_size"}
 TEXT_INPUT_API = {"set_text", "send_keys", "input_text", "clear_text", "type_text", "send_text", "set_value",
-                  "press_key", "keyevent", "set_input_ime", "set_fastinput_ime", "send_action"}
+                  "press_key", "keyevent", "set_input_ime", "set_fastinput_ime", "send_action", "set_clipboard"}
+# Nama RPC/metode uiautomator2 untuk mengetik/menekan tombol (camelCase server agent).
+U2_TYPING = {"setText", "clearTextField", "injectInputEvent", "pressKeyCode", "sendKeys", "sendAction",
+             "setClipboard"}
+TYPING_RX = re.compile(r"\b(" + "|".join(sorted(TEXT_INPUT_API | U2_TYPING)) + r")\b")
 # Pemanggilan uiautomator2 yang dipakai U2Driver: jsonrpc agent + utilitas device. Tanpa setText/injectInputEvent.
 U2_RPC = {"exist", "objInfo", "objInfoOfAllInstances", "click", "swipe", "pressKey", "getLastToast", "clearLastToast",
           "deviceInfo"}
@@ -58,10 +63,6 @@ U2_DEVICE_ATTRS = {"jsonrpc", "app_current", "window_size", "screenshot", "dump_
                    "_dev", "_device_server_port", "stop_uiautomator", "start_uiautomator"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol.
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b|monkey", re.I)
-# Spesifikasi I: awalan perintah adb shell yang boleh dikirim alat (dibandingkan per kata).
-SHELL_ALLOW = ("getprop", "wm", "dumpsys", "settings get", "settings put global stay_on_while_plugged_in",
-               "svc power stayon", "pm path", "ps", "cmd package resolve-activity",
-               "am start -W -a android.intent.action.VIEW", "am start -a android.intent.action.VIEW")
 
 
 # ------------------------------------------------------------------ util
@@ -138,26 +139,13 @@ def _use_app(monkeypatch, app_cls: type[FakeShopeeApp]) -> None:
 # ------------------------------------------------------------------ driver & aplikasi palsu tambahan
 
 
-class _CmdRecorder:
-    """`self` pengganti untuk U2Driver.start_url: menangkap perintah `am start` persis seperti yang dikirim U2Driver."""
-
-    def __init__(self, sink: list[str]):
-        self.sink = sink
-
-    def shell(self, cmd: list[str]) -> str:
-        self.sink.append(" ".join(cmd))
-        return "Starting: Intent { act=android.intent.action.VIEW }\nStatus: ok\n"
-
-
 class _SpyDriver(FakeDriver):
-    """FakeDriver yang juga mencatat: waktu AWAL tiap reload (sebelum RPC), waktu tiap query info, dan setiap perintah
-    adb shell yang akan dikirim device nyata (intent disusun oleh U2Driver.start_url sendiri)."""
+    """FakeDriver yang juga mencatat waktu AWAL tiap reload (sebelum RPC) dan waktu tiap query info."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.reload_starts: list[tuple[str, float]] = []
         self.infos: list[tuple[float, Sel]] = []
-        self.adb: list[str] = []
 
     def info(self, sel: Sel) -> Node | None:
         self.infos.append((self.clock.time(), sel))
@@ -170,12 +158,7 @@ class _SpyDriver(FakeDriver):
     def start_url(self, url: str, package: str, wait: bool = True) -> None:
         if not wait:  # reload intent (tanpa -W); intent precheck/arm/login memakai -W
             self.reload_starts.append(("intent", self.clock.time()))
-        U2Driver.start_url(_CmdRecorder(self.adb), url, package, wait)
         super().start_url(url, package, wait)
-
-    def shell(self, cmd: list[str]) -> str:
-        self.adb.append(" ".join(cmd))
-        return super().shell(cmd)
 
 
 @pytest.fixture(autouse=True)
@@ -183,21 +166,12 @@ def _spy(monkeypatch):
     monkeypatch.setattr(android_harness, "FakeDriver", _SpyDriver)
 
 
-class _SoldOutThenNormalApp(FakeShopeeApp):
-    """Saat slot buka tombol Beli jadi "Habis"; RESTOCK_S kemudian halaman kembali ke harga NORMAL dengan "Beli
-    Sekarang" aktif lagi (flash sale habis, produk dijual biasa)."""
-
-    RESTOCK_S = 1.0
-
-    def phase(self) -> str:
-        if not self.sale_active():
-            return "before"
-        return "habis" if self.now() < self.open_eff + self.RESTOCK_S else "normal"
+class _SoldOutThenNormalPriceApp(FakeShopeeApp):
+    """Konfirmasi di sheet -> pesan "Stok habis" (Toast/overlay); halaman produk lalu kembali ke harga NORMAL dengan
+    "Beli Sekarang" AKTIF (kuota flash sale habis, produk dijual biasa) - tanpa tombol "Habis" sama sekali."""
 
     def _r_product(self):
-        phase = self.phase()
-        self.sold_out = phase == "habis"
-        if phase != "normal":
+        if not self.sold_out:
             return super()._r_product()
         sc = self.sc
         return [("", Node(text="Detail Produk", bounds=(100, 60, 500, 110))),
@@ -226,18 +200,25 @@ class _StuckCartApp(FakeShopeeApp):
         super()._handle(key, node)
 
 
-class _WalletPinApp(FakeShopeeApp):
-    """Halaman ShopeePay (precheck saldo) langsung meminta PIN."""
-
-    def _r_wallet(self):
-        return self._r_pin()
-
-
 class _UnreadableChipApp(FakeShopeeApp):
     """Chip variasi di halaman produk tidak pernah melaporkan status terpilih (selected=False selalu)."""
 
     def _r_product(self):
         return [(k, replace(n, selected=False) if k.startswith("variant:") else n) for k, n in super()._r_product()]
+
+
+class _SwipeResetsVariantApp(FakeShopeeApp):
+    """Swipe-down memuat ulang halaman ke variasi BAWAAN (pilihan variasi hilang), seperti intent."""
+
+    def on_refresh(self) -> None:
+        was_product = self.screen == "product"
+        super().on_refresh()
+        if was_product:
+            self.selected_variant = None
+
+
+class _SwipeResetsUnreadableChipApp(_SwipeResetsVariantApp, _UnreadableChipApp):
+    """Swipe mereset variasi DAN status terpilih chip tidak terbaca."""
 
 
 class _LateChipApp(FakeShopeeApp):
@@ -316,30 +297,32 @@ def _calibrate(tmp_path, monkeypatch) -> tuple[FakeShopeeApp, _SpyDriver, dict]:
 # ------------------------------------------------------------------ K: stok habis lalu harga kembali normal
 
 
+@pytest.mark.parametrize("toast_mode", ["toast", "node"], ids=["android_toast", "overlay_node"])
 @pytest.mark.parametrize("normal_price", [150_000, 100_000], ids=["normal_di_atas_maks", "normal_dalam_maks"])
-def test_sold_out_then_normal_price_again_stops_at_first_sold_out(tmp_path, monkeypatch, normal_price):
-    """Tombol "Habis" saat T -> SOLD_OUT segera; halaman yang ~1 s kemudian kembali ke harga normal dengan Beli aktif
-    tidak pernah diklik, juga bila harga normal masih <= max_item_price (hanya status stop yang mencegah beli)."""
-    # terkait: test_android_safety.test_sold_out_at_open_without_click (tanpa fase harga normal)
-    _use_app(monkeypatch, _SoldOutThenNormalApp)
+def test_sold_out_message_then_normal_price_with_active_buy_never_rebuys(tmp_path, monkeypatch, normal_price,
+                                                                         toast_mode):
+    """"Stok habis" setelah konfirmasi, lalu halaman produk menampilkan harga normal dengan "Beli Sekarang" aktif
+    (tanpa tombol "Habis"): SOLD_OUT dari pesan itu saja; tidak ada klik Beli/konfirmasi ulang, juga bila harga
+    normal masih <= max_item_price. Tanpa alarm, bukan stop-semua, aplikasi dibiarkan terbuka."""
+    # terkait: test_android_safety.test_sold_out_on_confirm (fake jatuh ke tombol "Habis", tanpa harga normal)
+    _use_app(monkeypatch, _SoldOutThenNormalPriceApp)
     stop = threading.Event()
-    out = run_android(tmp_path, live=True, normal_price=normal_price, runner_attrs={"stop_event": stop})
+    out = run_android(tmp_path, live=True, sold_out_on_confirm=True, normal_price=normal_price,
+                      toast_mode=toast_mode, runner_attrs={"stop_event": stop})
     assert out.result.status == RunStatus.SOLD_OUT, out.result.message
-    assert "Habis" in out.result.message
-    t_result = out.result.step("result").t_server_ms - _t(out)
-    assert 0 <= t_result < _SoldOutThenNormalApp.RESTOCK_S * 1000, f"bukan deteksi habis pertama: T+{t_result} ms"
-    assert out.kind("buy") == [] and out.kind("buy_disabled") == [] and out.kind("tap") == []
-    assert "click" not in _ops(out) and "click_buy" not in out.step_names()
-    assert polling_actions(out) == [], "tanpa reload/klik setelah habis terdeteksi"
+    channel = "toast" if toast_mode == "toast" else "teks"
+    assert out.result.message == f"{channel} 'Stok habis'"
+    assert len(out.kind("buy")) == 1 and len(out.kind("confirm")) == 1, "tanpa beli/konfirmasi ulang"
+    assert out.kind("checkout") == [] and out.kind("buy_disabled") == []
+    confirm = out.kind("confirm")[0]
+    assert out.app.events[out.app.events.index(confirm) + 1:] == [], "tidak ada aksi ke aplikasi setelah pesan habis"
     assert not stop.is_set() and out.events() == [], "SOLD_OUT: bukan stop-semua, tanpa alarm"
     _hard_rules(out)
     _left_open(out)
-    # fase berikutnya memang nyata: harga normal & "Beli Sekarang" aktif, tetapi alat sudah berhenti
-    out.app.clock.advance(max(0.0, out.open_at + 1.5 - out.app.now()))
-    assert out.app.phase() == "normal"
+    # skenario memang nyata: saat hasil, halaman produk menampilkan harga normal & "Beli Sekarang" aktif
+    assert out.app.screen == "product"
     labels = {n.label: n for n in out.app.nodes()}
-    assert labels["Beli Sekarang"].enabled and rupiah(normal_price) in labels
-    assert out.kind("buy") == []
+    assert labels["Beli Sekarang"].enabled and rupiah(normal_price) in labels and "Habis" not in labels
 
 
 # ------------------------------------------------------------------ K: 0 klik "Buat Pesanan" di semua status stop
@@ -370,14 +353,19 @@ STOP_CASES = [
 ]
 
 
+def test_stop_cases_cover_every_status_except_live_success():
+    """Daftar STOP_CASES mencakup setiap RunStatus selain ORDER_PLACED_AWAIT_PIN (status baru wajib ditambahkan)."""
+    covered = {c.values[3] for c in STOP_CASES}
+    assert covered == set(RunStatus) - {RunStatus.ORDER_PLACED_AWAIT_PIN}, set(RunStatus) ^ covered
+
+
 @pytest.mark.parametrize("live, scenario, app_cls, status", STOP_CASES)
 def test_no_place_order_click_in_any_stop_status_or_dry_run(tmp_path, monkeypatch, live, scenario, app_cls, status):
     """Setiap status stop yang bisa dicapai LIVE (+ DRYRUN_OK): 0 event pesanan, 0 klik driver bertarget "Buat
     Pesanan", tanpa langkah click_place_order; lock before_place_order hanya diminta di ujung (ABORTED/DRYRUN_OK).
-    Captcha/verifikasi/UNKNOWN_STATE: stop semua runner + alarm + tanpa retry; aplikasi dibiarkan terbuka."""
+    Alarm hanya untuk status yang butuh tindakan manual. Captcha/verifikasi/UNKNOWN_STATE: stop semua runner +
+    alarm + tanpa retry; aplikasi dibiarkan terbuka."""
     # terkait: test_android_runner.test_app_never_closed (subset status, tanpa cek lock & stop_event)
-    covered = {c.values[3] for c in STOP_CASES}
-    assert covered == set(RunStatus) - {RunStatus.ORDER_PLACED_AWAIT_PIN}, "setiap status selain sukses live diuji"
     scenario = dict(scenario)
     deny = scenario.pop("deny", False)
     asked: list[int] = []
@@ -402,6 +390,8 @@ def test_no_place_order_click_in_any_stop_status_or_dry_run(tmp_path, monkeypatc
     assert stop.is_set() == (status in STOP_ALL_STATUSES), "stop-semua hanya untuk captcha/verifikasi/UNKNOWN_STATE"
     if status in ALARM_STATUSES:
         assert out.events(), f"{status} butuh tindakan manual: alarm wajib"
+    else:
+        assert out.events() == [], f"alarm palsu untuk {status}: {out.notifier.events}"
     if status in STOP_ALL_STATUSES:
         assert out.events() == [str(status)], out.notifier.events
         buys = out.kind("buy")
@@ -437,22 +427,31 @@ def test_calibration_full_flow_never_taps_even_on_checkout(tmp_path, monkeypatch
     assert ops <= {"dump", "find_all", "shell"}, ops
     assert not ops & ACTION_OPS
     assert not [t for op, t in driver.calls if op == "find_all" and ("Buat" in t or "place_order" in t)]
-    assert driver.adb == [f"dumpsys package {PACKAGE}", "wm size"]
+    assert [t for op, t in driver.calls if op == "shell"] == [f"dumpsys package {PACKAGE}", "wm size"]
 
 
 # ------------------------------------------------------------------ K: alat tidak pernah mengetik (PIN)
 
 
-def _u2_static_calls() -> tuple[set[str], list[tuple[str, ...]], set[str]]:
-    """(metode jsonrpc, argumen konstanta tiap _rpc, atribut self.d) yang dipakai U2Driver (dari source)."""
-    tree = ast.parse((ROOT / "flashbuy" / "android_driver.py").read_text(encoding="utf-8"))
+def _is_jsonrpc(node: ast.AST) -> bool:
+    """`self.d.jsonrpc`."""
+    return isinstance(node, ast.Attribute) and node.attr == "jsonrpc" and isinstance(node.value, ast.Attribute) \
+        and node.value.attr == "d" and isinstance(node.value.value, ast.Name) and node.value.value.id == "self"
+
+
+def _u2_static_calls(source: str) -> tuple[set[str], list[tuple[str, ...]], set[str], list[str]]:
+    """Dari source android_driver.py: (metode jsonrpc U2Driver lewat _rpc("<konst>") ATAU self.d.jsonrpc.<nama>,
+    argumen konstanta tiap _rpc, atribut self.d, pelanggaran: getattr dinamis pada jsonrpc di luar _rpc)."""
+    tree = ast.parse(source)
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "U2Driver")
-    rpc, args, attrs = set(), [], set()
+    rpc, args, attrs, bad = set(), [], set(), []
     for node in ast.walk(cls):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_rpc" \
                 and node.args and isinstance(node.args[0], ast.Constant):
             rpc.add(node.args[0].value)
             args.append(tuple(a.value for a in node.args if isinstance(a, ast.Constant)))
+        if isinstance(node, ast.Attribute) and _is_jsonrpc(node.value):
+            rpc.add(node.attr)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) and node.value.attr == "d" \
                 and isinstance(node.value.value, ast.Name) and node.value.value.id == "self":
             attrs.add(node.attr)
@@ -460,40 +459,97 @@ def _u2_static_calls() -> tuple[set[str], list[tuple[str, ...]], set[str]]:
                 and isinstance(node.args[0], ast.Attribute) and node.args[0].attr == "d":
             name = node.args[1]
             attrs.add(name.value if isinstance(name, ast.Constant) else "<dinamis>")
-    return rpc, args, attrs
+    allowed = {id(c) for f in ast.walk(cls) if isinstance(f, ast.FunctionDef) and f.name == "_rpc"
+               for c in ast.walk(f) if isinstance(c, ast.Call)}
+    for node in ast.walk(tree):  # seluruh modul: getattr(<...jsonrpc...>, nama) hanya boleh di U2Driver._rpc
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" \
+                and node.args and id(node) not in allowed \
+                and any(isinstance(a, ast.Attribute) and "jsonrpc" in a.attr for a in ast.walk(node.args[0])):
+            bad.append(f"getattr jsonrpc baris {node.lineno}")
+    return rpc, args, attrs, bad
 
 
-def test_tool_never_types_pin_or_any_text(tmp_path, monkeypatch):
-    """Tidak ada jalur mengetik: API driver tanpa metode input teks; U2Driver hanya memanggil jsonrpc baca/tap/swipe/
-    back; pada run live sampai layar PIN (berteks / hanya resource-id) dan halaman saldo ber-PIN saat precheck, tidak
-    ada operasi input, tidak ada `input` shell, dan tidak ada aksi ke aplikasi setelah layar PIN muncul."""
-    # terkait: test_android_runner.test_live_places_one_order_and_stops_at_pin (satu skenario, tanpa cek API)
+def _typing_names(source: str, name: str = "<src>") -> list[str]:
+    """Nama/atribut/fungsi/string konstanta (bukan docstring) yang menyebut API mengetik u2 (camelCase/snake)."""
+    tree = ast.parse(source)
+    docs = {id(n.body[0].value) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body
+            and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            s = node.attr
+        elif isinstance(node, ast.Name):
+            s = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            s = node.name
+        elif isinstance(node, ast.keyword) and node.arg:
+            s = node.arg
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
+            s = node.value
+        else:
+            continue
+        if m := TYPING_RX.search(s):
+            hits.append(f"{name}:{getattr(node, 'lineno', '?')} {m.group(1)}")
+    return hits
+
+
+ANCHOR = 'self._call(f"click {x},{y}", lambda: self._rpc("click", x, y))\n'
+INJECTED = [  # tiap baris = satu jalur mengetik yang harus tertangkap pemindai (disisipkan di U2Driver.click)
+    'self.d.jsonrpc.setText(self._selector(Sel("className", "android.widget.EditText")), "123456")',
+    "self.d.jsonrpc.pressKeyCode(66)",
+    'getattr(self.d.jsonrpc, "press" + "KeyCode")(66)',
+    'core._jsonrpc_call(self.d._dev, 0, "injectInputEvent", [], 5, False)',
+    'self.d(className="android.widget.EditText").send_keys("123456")',
+]
+
+
+def test_tool_never_types_static_driver_has_no_text_input_path():
+    """Tidak ada jalur mengetik di kode: API driver tanpa metode input teks; U2Driver hanya memanggil jsonrpc baca/
+    tap/swipe/back (lewat _rpc maupun self.d.jsonrpc.<nama>), tanpa getattr dinamis pada jsonrpc di luar _rpc;
+    nama API mengetik u2 (setText/injectInputEvent/pressKeyCode/send_keys/...) tidak muncul di modul Android & CLI.
+    Pemindai dibuktikan menangkap tiap jalur yang disisipkan ke U2Driver.click."""
+    # terkait: test_spec_i_no_apk_tampering_root_hook_or_private_api (hanya .send_keys/.set_text/.clear_text)
     for cls in (AndroidDriver, U2Driver, FakeDriver, TimedDriver):
         public = {n for n in dir(cls) if not n.startswith("_")}
         assert public == DRIVER_API, f"{cls.__name__}: {public ^ DRIVER_API}"
-        assert not {n for n in dir(cls) if n.lstrip("_") in TEXT_INPUT_API}, cls.__name__
-    rpc, args, attrs = _u2_static_calls()
+        assert not {n for n in dir(cls) if n.lstrip("_") in TEXT_INPUT_API | U2_TYPING}, cls.__name__
+    src = (ROOT / "flashbuy" / "android_driver.py").read_text(encoding="utf-8")
+    rpc, args, attrs, bad = _u2_static_calls(src)
     assert rpc <= U2_RPC, rpc - U2_RPC  # tanpa setText/clearTextField/injectInputEvent
     assert [a for a in args if a[0] == "pressKey"] == [("pressKey", "back")], "hanya tombol back"
     assert attrs <= U2_DEVICE_ATTRS, attrs - U2_DEVICE_ATTRS  # tanpa send_keys/set_text/clear_text/press
+    assert bad == [], bad
+    files = sorted((ROOT / "flashbuy").glob("android_*.py")) + [ROOT / "flashbuy" / "cli.py"]
+    assert len(files) >= 5
+    hits = [h for f in files for h in _typing_names(f.read_text(encoding="utf-8"), f.name)]
+    assert hits == [], hits
 
-    cases = [("pin_teks", FakeShopeeApp, {}), ("pin_tanpa_teks", FakeShopeeApp, {"pin_title": None}),
-             ("pin_halaman_saldo", _WalletPinApp, {})]
-    for name, app_cls, scenario in cases:
-        _use_app(monkeypatch, app_cls)
-        out = run_android(tmp_path / name, live=True, **scenario)
-        assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, (name, out.result.message)
-        _hard_rules(out, ordered=True)
-        assert out.result.step("pin_screen") is not None
-        assert not [c for c in out.driver.adb if re.search(r"\binput\b", c)], name
-        assert not {op for op in _ops(out) if re.search(r"text|key|input|type", op)}, name
-        if app_cls is _WalletPinApp:
-            # halaman saldo meminta PIN: tidak dibaca/diisi; alat langsung kembali ke halaman produk (intent)
-            events = out.app.events
-            i = next(k for k, e in enumerate(events) if e["kind"] == "intent" and "/user/shopeepay" in e["detail"])
-            assert events[i + 1]["kind"] == "intent" and "/user/" not in events[i + 1]["detail"], events[i:i + 3]
-            pre = [e for e in out.notifier.events if e["event"] == "precheck_saldo ShopeePay"]
-            assert len(pre) == 1 and "PIN tidak diketik alat" in pre[0]["message"]
+    # pemindai benar-benar menangkap jalur yang lolos versi sebelumnya (jsonrpc mentah, konstanta RPC)
+    assert src.count(ANCHOR) == 1, "jangkar U2Driver.click berubah: perbarui ANCHOR"
+    indent = " " * 8
+    mutated = src.replace(ANCHOR, ANCHOR + "".join(f"{indent}{line}\n" for line in INJECTED))
+    rpc, _, attrs, bad = _u2_static_calls(mutated)
+    assert rpc - U2_RPC == {"setText", "pressKeyCode"}, rpc - U2_RPC
+    assert len(bad) == 1 and "getattr jsonrpc" in bad[0], bad
+    found = {h.split()[-1] for h in _typing_names(mutated)}
+    assert found >= {"setText", "pressKeyCode", "injectInputEvent", "send_keys"}, found
+
+
+def test_pin_screen_without_text_after_place_order_left_alone(tmp_path):
+    """Layar PIN setelah "Buat Pesanan" hanya dikenali dari resource-id (tanpa teks): ORDER_PLACED_AWAIT_PIN +
+    alarm, kolom PIN tidak disentuh, tidak ada aksi apa pun ke aplikasi setelah klik "Buat Pesanan"."""
+    # terkait: test_android_runner.test_live_places_one_order_and_stops_at_pin (layar PIN berteks)
+    # terkait: test_android_runner.test_pin_screen_after_buy_click_is_unknown_state_and_left_alone (PIN setelah Beli)
+    out = run_android(tmp_path, live=True, pin_title=None)
+    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+    _hard_rules(out, ordered=True)
+    names = out.step_names()
+    assert names[-3:] == ["click_place_order", "pin_screen", "result"], names[-5:]
+    assert [n.label for n in out.app.nodes()] == [""], "layar PIN memang tanpa teks (hanya kolom resource-id)"
+    assert out.events() == [str(RunStatus.ORDER_PLACED_AWAIT_PIN)]
+    assert out.runner.order_clicked
+    _left_open(out)
 
 
 # ------------------------------------------------------------------ E.5: jadwal refresh
@@ -528,38 +584,80 @@ def test_refresh_first_at_t_plus_0_5_then_every_2_s_through_rate_limiter(tmp_pat
 
 # ------------------------------------------------------------------ E.5: pilih ulang variasi setelah refresh
 
+VARIANT_RUN = {"variants": VARIANTS, "variants_on_page": True, "sheet": False, "live_update": False,
+               "variant_prices": {TARGET: 95_000}}
 
-@pytest.mark.parametrize("reload", ["intent", "swipe"])
-def test_unreadable_variant_chip_reselected_once_per_intent_reload_not_after_swipe(tmp_path, monkeypatch, reload):
+
+def test_unreadable_variant_chip_reselected_once_per_intent_reload(tmp_path, monkeypatch):
     """Status terpilih chip tidak terbaca: setelah tiap reload intent (halaman dibuka ulang = variasi bawaan) chip
-    di-tap ulang tepat sekali, lewat gate; setelah swipe tidak di-tap (tap bisa jadi toggle yang melepas pilihan)."""
+    di-tap ulang tepat sekali, lewat gate, sebelum reload berikutnya; harga lapis 1 & checkout = variasi target."""
     # terkait: test_android_runner.test_variant_on_page_reselected_once_after_reload (status chip terbaca)
     _use_app(monkeypatch, _UnreadableChipApp)
-    out = run_android(tmp_path, variants=VARIANTS, variants_on_page=True, sheet=False, live_update=False,
-                      button_enabled_before_open=True, flash_price=150_000, variant_prices={TARGET: 95_000},
-                      sale_skew_ms=2600, cfg={"variant": TARGET, "android": {"reload": reload}})
+    out = run_android(tmp_path, button_enabled_before_open=True, flash_price=150_000, sale_skew_ms=2600,
+                      cfg={"variant": TARGET, "android": {"reload": "intent"}}, **VARIANT_RUN)
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
     log = (out.log_dir / "android.log").read_text(encoding="utf-8")
     assert f"status terpilih variasi {TARGET!r} tidak terbaca" in log
     arm_taps = [e for e in out.kind("variant") if e["t_server_ms"] < _t(out) - 1000]
     assert len(arm_taps) == 1, "dipilih sekali saat arm"
-    reloads = _reload_arrivals(out, reload)
+    reloads = _reload_arrivals(out, "intent")
     retaps = _variant_taps(out)
     reselects = [s for s in out.result.steps if s.name == "variant_selected" and RESEL in s.detail]
     assert len(reloads) >= 2, reloads
-    if reload == "intent":
-        assert len(retaps) == len(reloads) == len(reselects), (reloads, retaps)
-        for k, r in enumerate(reloads):
-            nxt = reloads[k + 1] if k + 1 < len(reloads) else float("inf")
-            assert r + 425 <= retaps[k] < nxt, f"pilih ulang #{k + 1} di luar (reload + 425 ms, reload berikutnya)"
-    else:
-        assert retaps == [] and reselects == [], "swipe tidak melepas pilihan: chip tidak di-tap ulang"
+    assert len(retaps) == len(reloads) == len(reselects), (reloads, retaps)
+    for k, r in enumerate(reloads):
+        nxt = reloads[k + 1] if k + 1 < len(reloads) else float("inf")
+        assert r + 425 <= retaps[k] < nxt, f"pilih ulang #{k + 1} di luar (reload + 425 ms, reload berikutnya)"
     buys = [e["t_server_ms"] for e in out.kind("buy")]
     assert len(buys) == 1 and buys[0] > max([*reloads, *retaps])
     assert out.app.selected_variant == TARGET
+    assert "harga Rp95.000" in out.result.step("buy_ready").detail
     assert "harga=Rp95.000" in out.result.step("price_guard_ok").detail
     _gated(out)
     _hard_rules(out)
+
+
+@pytest.mark.parametrize("default_price", [150_000, 99_000], ids=["bawaan_di_atas_maks", "bawaan_dalam_maks"])
+def test_swipe_that_resets_variant_reselects_readable_chip_then_orders_target(tmp_path, monkeypatch, default_price):
+    """Swipe-down mengembalikan halaman ke variasi bawaan (status chip terbaca): chip target di-tap ulang tepat
+    sekali, >= 425 ms setelah swipe sampai (gate), sebelum lapis 1 membaca harga; pesanan = variasi target."""
+    # terkait: test_android_runner.test_variant_on_page_reselected_once_after_reload (swipe di fake tidak mereset)
+    _use_app(monkeypatch, _SwipeResetsVariantApp)
+    out = run_android(tmp_path, live=True, flash_price=default_price, cfg={"variant": TARGET}, **VARIANT_RUN)
+    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+    (swipe,) = _reload_arrivals(out, "swipe")
+    taps = [e["t_server_ms"] for e in out.kind("variant")]
+    assert len(taps) == 2 and taps[0] < _t(out) - 1000, "sekali saat arm + sekali setelah swipe"
+    assert taps[1] - swipe >= 425, f"pilih ulang {taps[1] - swipe} ms setelah swipe (tanpa gate)"
+    reselects = [s for s in out.result.steps if s.name == "variant_selected" and RESEL in s.detail]
+    assert len(reselects) == 1
+    (buy,) = [e["t_server_ms"] for e in out.kind("buy")]
+    assert buy - taps[1] >= 425
+    buy_ready = out.result.step("buy_ready")
+    assert "harga Rp95.000" in buy_ready.detail and buy_ready.t_server_ms > taps[1], "lapis 1 = harga variasi target"
+    assert "harga=Rp95.000" in out.result.step("price_guard_ok").detail
+    assert out.app.selected_variant == TARGET
+    _gated(out)
+    _hard_rules(out, ordered=True)
+
+
+@pytest.mark.parametrize("default_price", [150_000, 99_000], ids=["bawaan_di_atas_maks", "bawaan_dalam_maks"])
+def test_swipe_reset_with_unreadable_chip_reselects_once_and_orders_target(tmp_path, monkeypatch, default_price):
+    """Swipe mereset variasi DAN status chip tidak terbaca: spesifikasi E.5 'pilih ulang variasi setelah refresh' ->
+    chip target di-tap ulang tepat sekali setelah swipe (lewat gate), lalu lapis 1 membaca harga variasi target dan
+    pesanan = variasi target (bukan variasi bawaan, baik harga bawaannya di atas maupun di dalam batas)."""
+    _use_app(monkeypatch, _SwipeResetsUnreadableChipApp)
+    out = run_android(tmp_path, live=True, flash_price=default_price, cfg={"variant": TARGET}, **VARIANT_RUN)
+    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+    (swipe,) = _reload_arrivals(out, "swipe")
+    taps = [e["t_server_ms"] for e in out.kind("variant")]
+    assert len(taps) == 2 and taps[0] < _t(out) - 1000, "sekali saat arm + sekali setelah swipe"
+    assert taps[1] - swipe >= 425, f"pilih ulang {taps[1] - swipe} ms setelah swipe (tanpa gate)"
+    assert len(out.kind("order")) == 1 and out.app.selected_variant == TARGET
+    assert "harga Rp95.000" in out.result.step("buy_ready").detail
+    assert "harga=Rp95.000" in out.result.step("price_guard_ok").detail
+    _hard_rules(out, ordered=True)
+    _gated(out)
 
 
 @pytest.mark.parametrize("default_price", [150_000, 99_000], ids=["bawaan_di_atas_maks", "bawaan_dalam_maks"])
@@ -569,9 +667,8 @@ def test_variant_chip_rendered_late_after_reload_is_awaited_then_reselected_then
     Beli (harga variasi bawaan, juga yang <= maks, tidak boleh dipakai); begitu chip tampil -> pilih ulang (gate) ->
     harga variasi target -> Beli."""
     _use_app(monkeypatch, _LateChipApp)
-    out = run_android(tmp_path, variants=VARIANTS, variants_on_page=True, sheet=False, live_update=False,
-                      flash_price=default_price, variant_prices={TARGET: 95_000},
-                      cfg={"variant": TARGET, "android": {"reload": "intent"}})
+    out = run_android(tmp_path, flash_price=default_price, cfg={"variant": TARGET, "android": {"reload": "intent"}},
+                      **VARIANT_RUN)
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
     (reload,) = _reload_arrivals(out, "intent")
     chip_at = reload + int(_LateChipApp.CHIP_DELAY_S * 1000)
@@ -686,34 +783,3 @@ def bypass_captcha(d):
     names = {re.split(r"[\s<>=!~;\[]", d, maxsplit=1)[0].lower() for d in deps}
     assert not names & _BANNED_DEPS, names & _BANNED_DEPS
     assert "uiautomator2" in names, "interaksi Android hanya lewat uiautomator2"
-
-
-def _allowed_shell(cmd: str) -> bool:
-    return any(cmd == p or cmd.startswith(p + " ") for p in SHELL_ALLOW)
-
-
-def test_spec_i_every_adb_shell_command_is_allow_listed(tmp_path, monkeypatch):
-    """Spesifikasi I (dinamis): semua perintah adb shell yang dikirim pada precheck + run live (reload intent, layar
-    tetap menyala selama run & dikembalikan) + login + kalibrasi berawalan daftar izin; intent hanya VIEW ke
-    com.shopee.id untuk URL shopee.co.id (tanpa -S/force-stop)."""
-    monkeypatch.setattr(cli, "console", Console(file=io.StringIO(), width=200))
-    out = run_android(tmp_path / "run", live=True, live_update=False, stay_on="1",
-                      cfg={"android": {"reload": "intent"}}, runner_attrs={"hold_screen_on": True})
-    _hard_rules(out, ordered=True)
-    out.runner._stay_restore = "0"  # cabang pengembalian lain: semula 0 -> `svc power stayon false`
-    out.runner._restore_stay_awake()
-    cmds = list(out.driver.adb)
-    cli.login_android(out.runner.cfg, out.driver)
-    cmds += out.driver.adb[len(cmds):]
-    _, cal_driver, _ = _calibrate(tmp_path, monkeypatch)
-    cmds += cal_driver.adb
-
-    bad = [c for c in cmds if not _allowed_shell(c)]
-    assert bad == [], f"perintah adb di luar daftar izin: {bad}"
-    unused = [p for p in SHELL_ALLOW if not any(c == p or c.startswith(p + " ") for c in cmds)]
-    assert unused == [], f"daftar izin tidak teruji (run kurang lengkap): {unused}"
-    for c in (c for c in cmds if c.startswith("am start")):
-        assert c.endswith(f" -p {PACKAGE}") and " -d https://shopee.co.id/" in c and " -S" not in c, c
-    assert {c for c in cmds if c.startswith(("settings put", "svc"))} == {
-        "svc power stayon usb", "settings put global stay_on_while_plugged_in 1", "svc power stayon false"}
-    assert not [c for c in cmds if FORBIDDEN_SHELL.search(c)]

@@ -103,7 +103,6 @@ MARKER_MAX_CHARS = 120  # penanda status hanya dicari di teks pendek (bukan desk
 MAX_AGENT_RESTARTS = 2  # restart agent maksimal saat polling (HiOS bisa membunuhnya)
 GUARD_FRESH_S = 0.5  # cek pra-klik (content-desc bahaya, sheet sebelum klik pertama) dianggap segar selama ini
 SHEET_CLOSE_S = 1.0  # sheet yang ditutup dengan back harus hilang dalam waktu ini
-UNKNOWN_DIAG_AFTER_S = 0.3  # diagnosa mahal (aplikasi aktif, content-desc) hanya saat UNKNOWN bertahan
 _NO_PRICE = "\u0000"
 
 DEVICE_PROPS = (
@@ -663,9 +662,12 @@ class AndroidRunner:
         end = self._mono() + timeout_s
         while True:
             self._checkpoint()
-            seen = self._classify(context)
-            if seen.screen in targets or seen.screen in TERMINAL:
-                return seen
+            # dialog crash/ANR di atas layar yang masih terbaca (mis. checkout setelah "Buat Pesanan") = UNKNOWN
+            # (jaring 1,5 s), bukan layar di bawahnya
+            if not self._guard(1):
+                seen = self._classify(context)
+                if seen.screen in targets or seen.screen in TERMINAL:
+                    return seen
             if self._mono() >= end:
                 return Seen(Screen.UNKNOWN, "timeout")
 
@@ -839,17 +841,19 @@ class AndroidRunner:
         if not cal_ver:
             return PrecheckItem("versi vs kalibrasi", None, "belum ada kalibrasi Android (memakai default teks); "
                                                           "jalankan calibrate --platform android")
-        if version and version != cal_ver:
-            msg = (f"PERINGATAN KERAS: versi Shopee {version} berbeda dari saat kalibrasi ({cal_ver}); selector bisa "
-                   "tidak cocok - kalibrasi ulang lalu dry-run, atau matikan auto-update Shopee")
+        if version != cal_ver:
+            what = (f"versi Shopee {version} berbeda dari saat kalibrasi ({cal_ver})" if version else
+                    f"versi Shopee tidak terbaca, tidak bisa dibandingkan dengan kalibrasi ({cal_ver})")
+            msg = (f"PERINGATAN KERAS: {what}; selector bisa tidak cocok - kalibrasi ulang lalu dry-run, atau matikan "
+                   "auto-update Shopee")
             self.log.warn(msg)
             self._alarm("precheck_versi", msg)
             return PrecheckItem("versi vs kalibrasi", None, msg)
         if cal_size and size and cal_size != size:
             return PrecheckItem("versi vs kalibrasi", None, f"versi sama ({cal_ver}), tetapi resolusi berubah: "
                                                           f"kalibrasi {cal_size!r}, sekarang {size!r}")
-        return PrecheckItem("versi vs kalibrasi", True if version else None,
-                            f"versi {version or '?'} = kalibrasi {cal_ver}" + (f", {cal_size}" if cal_size else ""))
+        return PrecheckItem("versi vs kalibrasi", True,
+                            f"versi {version} = kalibrasi {cal_ver}" + (f", {cal_size}" if cal_size else ""))
 
     def _stay_awake(self) -> PrecheckItem:
         """Run: `svc power stayon usb` (layar tidak mati selama kabel USB terpasang); nilai lama dikembalikan di
@@ -1044,8 +1048,7 @@ class AndroidRunner:
             self.d.press_back()
             self.log.info("pilih variasi membuka bottom sheet; ditutup, dipilih ulang setelah klik Beli")
             return
-        # dicek ulang setelah tiap reload saat polling. Status terpilih chip tak terbaca: dipilih ulang hanya
-        # setelah reload intent (lihat _variant_after_reload)
+        # dicek ulang setelah tiap reload saat polling (status chip tak terbaca: dipilih ulang sekali per reload)
         self._variant_on_page = True
         end = self._mono() + VARIANT_VERIFY_S
         readable = False
@@ -1054,8 +1057,8 @@ class AndroidRunner:
             readable = chip is not None and (chip.selected or chip.checked)
         self._variant_unreadable = not readable
         if not readable:
-            self.log.info(f"status terpilih variasi {self.variant!r} tidak terbaca; setelah reload intent dipilih "
-                          "ulang sekali, setelah swipe tidak")
+            self.log.info(f"status terpilih variasi {self.variant!r} tidak terbaca; dipilih ulang sekali setelah tiap "
+                          "reload")
 
     # ------------------------------------------------------------------ attempt
 
@@ -1156,6 +1159,8 @@ class AndroidRunner:
                     if fresh is None or fresh.bounds != btn.bounds:
                         self.log.mark("buy_recheck", "tombol Beli berubah/hilang saat menunggu slot; tidak diklik")
                         continue
+                if self._dialog_blocks_click():
+                    continue  # dialog crash/ANR di atas tombol: tap akan mengenai dialog ("Tutup aplikasi")
                 t_click = clock.now_ms()
                 self.d.click(btn)
                 clicks += 1
@@ -1190,6 +1195,9 @@ class AndroidRunner:
             btn = self._wait_find("cart_checkout", deadline)
             if btn is None:
                 return RunStatus.ERROR, "tombol Checkout di keranjang tidak ditemukan"
+            while self._dialog_blocks_click():  # tunggu dialog hilang (jaring UNKNOWN 1,5 s)
+                self._checkpoint()
+                btn = self._find("cart_checkout") or btn
             self._checkpoint()
             t_click = clock.now_ms()
             self.d.click(btn)
@@ -1377,6 +1385,19 @@ class AndroidRunner:
         self._guard_at = self._mono()
         return False
 
+    def _dialog_blocks_click(self) -> bool:
+        """Cek paksa (1 query, tanpa batas package) tepat sebelum tap yang mengikat: dialog crash/ANR yang muncul
+        < 0,5 s sebelumnya tidak tertangkap _guard (cek berkala). Ada -> UNKNOWN (jaring 1,5 s), tidak di-tap."""
+        seen = self._system_dialog()
+        if seen is None:
+            return False
+        self._observe(seen)
+        if seen.evidence != self._dialog_logged:
+            self._dialog_logged = seen.evidence
+            self.log.warn(f"{seen.evidence}: tidak ada klik selama dialog tampil")
+        self._guard_at = float("-inf")
+        return True
+
     def _close_sheet(self) -> None:
         """Tutup bottom sheet yang terbuka sebelum klik Beli pertama (back), lalu pastikan sudah hilang."""
         self.d.press_back()
@@ -1398,7 +1419,8 @@ class AndroidRunner:
         opt = self._find("variant_option", sticky=False)
         if opt is None or opt.selected or opt.checked or not opt.enabled:
             return
-        if self._variant_unreadable and self.cfg.android.reload != "intent":
+        if self._dialog_blocks_click():
+            self._recheck_variant = True  # dicoba lagi setelah dialog hilang
             return
         self.d.click(opt)
         self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
@@ -1412,8 +1434,8 @@ class AndroidRunner:
         yang dipilih di halaman produk saat arm diperiksa sekali per reload:
         - chip belum tampil -> "wait" (harga belum dibaca, Beli belum diklik) sampai SETTLE_TIMEOUT_S sejak reload;
         - status terpilih terbaca & belum terpilih -> chip (dipilih ulang lewat gate, aksi polling);
-        - status terpilih TIDAK terbaca -> dipilih ulang hanya setelah reload intent (halaman dibuka ulang =
-          variasi bawaan); setelah swipe tidak (tap bisa jadi toggle yang melepas pilihan). Lapis 3 penentu."""
+        - status terpilih TIDAK terbaca -> dipilih ulang sekali per reload (spesifikasi E.5). Bila tap ternyata
+          melepas pilihan (toggle), variasi tetap dipilih di bottom sheet setelah Beli dan diverifikasi lapis 3."""
         opt = self._find("variant_option", sticky=False)
         if opt is None:
             settling = last_reload is not None and self._clock.now() - last_reload < SETTLE_TIMEOUT_S
@@ -1423,8 +1445,6 @@ class AndroidRunner:
             return None
         self._recheck_variant = False
         if opt.selected or opt.checked or not opt.enabled:
-            return None
-        if self._variant_unreadable and self.cfg.android.reload != "intent":
             return None
         return opt
 

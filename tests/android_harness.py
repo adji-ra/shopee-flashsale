@@ -74,7 +74,45 @@ def make_android(tmp_path, *, open_in_s: float = 12.0, cfg: dict | None = None, 
     return runner, app, driver, sclock, open_at, log, notifier
 
 
-def run_android(tmp_path, *, live: bool = False, lead_ms: float = 150, during=None, **kw) -> AndroidOutcome:
+# Semua operasi FakeDriver yang sah. Tidak ada operasi input teks: alat tidak pernah mengetik (PIN diketik manual).
+DRIVER_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
+              "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "last_toast",
+              "clear_toast"}
+
+
+def check_invariants(out: AndroidOutcome, live: bool) -> None:
+    """Aturan keras yang dicek otomatis di SETIAP run palsu (spesifikasi K), apa pun skenario & hasilnya:
+    - dry-run: nol klik "Buat Pesanan"; live: paling banyak satu, dan hanya bila hasilnya PIN / "mungkin terbuat";
+    - operasi driver hanya dari DRIVER_OPS (tanpa input teks) dan tidak ada tap ke dialog sistem;
+    - aksi polling (klik Beli, reload) hanya di jendela T-1 s..T+8 s dan berjarak >= 400 ms."""
+    status = str(out.result.status)
+    orders = out.kind("order")
+    place_clicks = [t for op, t in out.driver.calls if op == "click" and t == "Buat Pesanan"]
+    if not live:
+        assert orders == [] and place_clicks == [], "dry-run: 'Buat Pesanan' diklik"
+        # order_clicked di dry-run hanya untuk layar PIN tak terduga setelah Beli ("pesanan mungkin terbuat")
+        assert not out.runner.order_clicked or status == "UNKNOWN_STATE", status
+    else:
+        assert len(place_clicks) <= 1 and len(orders) <= 1, "'Buat Pesanan' lebih dari sekali"
+        if place_clicks or orders:
+            assert out.runner.order_clicked and status in ("ORDER_PLACED_AWAIT_PIN", "UNKNOWN_STATE", "CAPTCHA",
+                                                           "VERIFICATION", "LOGIN_REQUIRED"), status
+    if status == "ORDER_PLACED_AWAIT_PIN":
+        assert live and len(orders) == 1
+    ops = {op for op, _ in out.driver.calls}
+    assert ops <= DRIVER_OPS, f"operasi driver tak dikenal: {ops - DRIVER_OPS}"
+    assert not [e for e in out.kind("tap") if e["detail"].startswith("system:")], "tap mengenai dialog sistem"
+    t = int(out.open_at * 1000)
+    acts = polling_actions(out)
+    assert all(t - 1000 <= a <= t + 8000 for a in acts), [a - t for a in acts]
+    assert all(b - a >= 400 for a, b in zip(acts, acts[1:], strict=False)), [b - a for a, b in zip(acts, acts[1:],
+                                                                                                    strict=False)]
+
+
+def run_android(tmp_path, *, live: bool = False, lead_ms: float = 150, during=None, invariants: bool = True,
+                **kw) -> AndroidOutcome:
+    """Satu run AndroidRunner di device palsu. invariants=False hanya untuk tes yang sengaja melanggar aturan
+    di luar runner (mis. menyuntik aksi sendiri)."""
     runner, app, driver, sclock, open_at, log, notifier = make_android(tmp_path, live=live, **kw)
 
     async def go():
@@ -91,7 +129,10 @@ def run_android(tmp_path, *, live: bool = False, lead_ms: float = 150, during=No
     result = asyncio.run(go())
     log.close()
     notifier.join(1)
-    return AndroidOutcome(result, open_at, app, driver, runner, notifier, tmp_path / "logs")
+    out = AndroidOutcome(result, open_at, app, driver, runner, notifier, tmp_path / "logs")
+    if invariants:
+        check_invariants(out, live)
+    return out
 
 
 def polling_actions(out: AndroidOutcome) -> list[int]:

@@ -348,12 +348,14 @@ def test_live_places_one_order_and_stops_at_pin(tmp_path):
 
 
 def _clear_before(calls, i: int) -> int:
-    """Indeks clear_toast milik klik ke-i: tepat sebelumnya, atau sebelum satu cek ulang tombol Beli (setelah
-    menunggu slot > 50 ms)."""
+    """Indeks clear_toast milik klik ke-i: tepat sebelumnya, atau (klik Beli) sebelum cek dialog crash/ANR (info_any)
+    dan satu cek ulang tombol Beli (setelah menunggu slot > 50 ms)."""
     j = i - 1
+    if calls[i][1] == "Beli Sekarang" and calls[j][0] == "info_any":
+        j -= 1
     if calls[j] == ("info", BUY_SEL) and calls[i][1] == "Beli Sekarang":
         j -= 1
-    assert calls[j] == ("clear_toast", ""), calls[max(0, i - 3):i + 1]
+    assert calls[j] == ("clear_toast", ""), calls[max(0, i - 4):i + 1]
     return j
 
 
@@ -391,7 +393,10 @@ def test_polling_hot_path_uses_single_object_queries_only(tmp_path, scenario):
     window = [(t, op, target) for t, op, target in _run_queries(out) if t0 <= t <= t1]
     assert window, "tidak ada kueri di jendela polling"
     clears = [i for i, (_, op, _) in enumerate(window) if op == "clear_toast"]
-    assert clears == ([len(window) - 1] if click is not None else []), clears  # hanya tepat sebelum klik
+    # hanya sebelum klik: clear_toast lalu satu cek dialog crash/ANR (info_any), lalu klik
+    assert clears == ([len(window) - 2] if click is not None else []), clears
+    if click is not None:
+        assert window[-1][1] == "info_any", window[-3:]
     queries = [(op, target) for _, op, target in window if op not in ("swipe_refresh", "start_url", "clear_toast")]
     one_object = SINGLE_OBJECT_OPS | {"info_any"}  # info_any = satu objek tanpa batas package (dialog crash/ANR)
     assert {op for op, _ in queries} <= one_object, {op for op, _ in queries} - one_object
@@ -552,7 +557,8 @@ def test_slow_clear_toast_does_not_trigger_button_reverify(tmp_path, monkeypatch
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
     calls = out.driver.calls
     first_click = next(i for i, (op, t) in enumerate(calls) if op == "click" and t == "Beli Sekarang")
-    assert calls[first_click - 1] == ("clear_toast", ""), calls[first_click - 3:first_click + 1]
+    assert calls[first_click - 1][0] == "info_any", calls[first_click - 3:first_click + 1]  # cek dialog sistem
+    assert calls[first_click - 2] == ("clear_toast", ""), calls[first_click - 3:first_click + 1]
     assert "buy_recheck" not in out.step_names()
 
 

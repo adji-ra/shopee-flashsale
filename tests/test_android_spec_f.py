@@ -659,7 +659,8 @@ LAUNCHER = "com.android.launcher3/.Launcher"
 
 
 @pytest.mark.parametrize("screen, front, texts, status, evidence", [
-    ("crashed", None, (), RunStatus.UNKNOWN_STATE, f"Shopee keluar dari foreground: {LAUNCHER}"),
+    # crash: dialog sistem "Shopee telah berhenti" (jendela package lain) terbaca lebih dulu lewat info_any
+    ("crashed", None, (), RunStatus.UNKNOWN_STATE, "dialog sistem 'Shopee telah berhenti' (crash/ANR)"),
     ("other_app", None, (), RunStatus.UNKNOWN_STATE, f"Shopee keluar dari foreground: {LAUNCHER}"),
     ("foreign", INCALL, CALL_TEXTS, RunStatus.UNKNOWN_STATE, f"Shopee keluar dari foreground: {INCALL}"),
     ("foreign", RECAPTCHA, (), RunStatus.VERIFICATION, f"aplikasi/activity asing di depan: {RECAPTCHA}"),
@@ -790,6 +791,103 @@ def test_persistent_anr_dialog_after_buy_is_unknown_state_without_order(tmp_path
         assert "price_guard_ok" in out.step_names() and "place_order_gate" not in out.step_names()
     _left_alone(out, out.app.events[-1])
     _hard_rules(out)
+
+
+class _BottomAnrApp(_AnrReadsApp):
+    """Dialog ANR gaya HiOS di bawah layar: tombol 'Tutup aplikasi' TEPAT di atas tombol Beli."""
+
+    def system_nodes(self) -> list[Node]:
+        nodes = super().system_nodes()
+        if not nodes:
+            return nodes
+        return [Node(text="Shopee tidak merespons", bounds=(60, 1380, 660, 1440)),
+                Node(text="Tutup aplikasi", bounds=(360, 1500, 720, 1612), clickable=True),
+                Node(text="Tunggu", bounds=(0, 1500, 360, 1612), clickable=True)]
+
+
+@BOTH
+@pytest.mark.parametrize("app_cls, window, outcome", [
+    (_AnrReadsApp, (0.0, 0.6), "continues"),
+    (_BottomAnrApp, (0.0, 3.0), "unknown_state"),
+], ids=["muncul_tepat_T_singkat", "muncul_tepat_T_di_atas_tombol_beli"])
+def test_anr_dialog_appearing_exactly_at_t_never_receives_the_buy_tap(tmp_path, monkeypatch, live, app_cls, window,
+                                                                       outcome):
+    """Regresi: dialog yang muncul < 0,5 s sebelum klik tidak tertangkap cek berkala (_guard). Cek dialog sistem
+    paksa tepat sebelum klik Beli: tidak ada tap selama dialog tampil (di HiOS tap akan mengenai 'Tutup
+    aplikasi' = aplikasi tertutup); dialog singkat -> klik setelah hilang; menetap -> UNKNOWN_STATE tanpa tap."""
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, live=live, anr_dialog=window, runner_attrs=attrs)
+    start, end = (_t(out) + int(x * 1000) for x in window)
+    assert [e for e in out.app.events if start <= e["t_server_ms"] < end] == [], "tidak ada aksi selama dialog"
+    if outcome == "continues":
+        expected = RunStatus.ORDER_PLACED_AWAIT_PIN if live else RunStatus.DRYRUN_OK
+        assert out.result.status == expected, out.result.message
+        assert _one_buy(out)["t_server_ms"] >= end
+        _hard_rules(out, ordered=live)
+    else:
+        _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+        assert out.kind("tap") == [] and out.kind("buy") == [], "nol tap (tombol 'Tutup aplikasi' di atas Beli)"
+        assert not out.runner.order_clicked
+        _hard_rules(out)
+
+
+@pytest.mark.parametrize("reload", ["swipe", "intent"])
+def test_anr_dialog_right_after_reload_not_tapped_after_waiting_for_slot(tmp_path, monkeypatch, reload):
+    """Regresi: dialog muncul T+0,55 s (tepat setelah reload pertama) dan menetap. Setelah menunggu slot gate,
+    runner tidak hanya memeriksa ulang tombol Beli tetapi juga dialog sistem -> tidak ada tap; UNKNOWN_STATE."""
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=_AnrReadsApp, live_update=False, anr_dialog=(0.55, 10.0),
+               runner_attrs=attrs, cfg={"android": {"reload": reload}})
+    _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+    assert out.kind("buy") == [] and out.kind("tap") == [], "nol tap selama dialog"
+    assert out.result.message.startswith(f"layar tidak dikenali > 1.5 s ({ANR_TEXT}"), out.result.message
+    _hard_rules(out)
+
+
+def test_anr_dialog_after_place_order_is_unknown_state_within_limit(tmp_path, monkeypatch):
+    """Regresi: Shopee macet setelah 'Buat Pesanan' (checkout masih terbaca di bawah dialog ANR). Penantian layar
+    PIN ikut memeriksa dialog sistem -> UNKNOWN ~1,5 s -> UNKNOWN_STATE dengan pesan wajib 'Pesanan MUNGKIN sudah
+    terbuat' (bukan menunggu batas alur 30 s); tepat satu pesanan, tanpa aksi lagi."""
+    base, setup = _anr_on_step("click_place_order", 30.0)
+
+    class HungAfterOrder(base):
+        def _handle(self, key: str, node: Node) -> None:
+            if key != "place_order":
+                return super()._handle(key, node)
+            self._event("order", self.payment_method)  # pesanan terkirim, tetapi aplikasi macet di checkout
+
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=HungAfterOrder, setup=setup, live=True, runner_attrs=attrs)
+    _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+    assert out.result.message == MAYBE_ORDERED_MSG
+    assert out.result.detail.startswith(f"UNKNOWN_STATE: layar tidak dikenali > 1.5 s ({ANR_TEXT}"), \
+        out.result.detail
+    dt = _step_t(out, "result") - int(out.app.window[0] * 1000)
+    assert 1500 <= dt <= 2700, f"UNKNOWN_STATE {dt} ms setelah dialog muncul (bukan batas alur 30 s)"
+    assert out.app.screen == "checkout"
+    assert [e["kind"] for e in out.app.events[out.app.events.index(out.kind("order")[0]):]] == ["order", "anr"]
+    out.app.events.remove(out.kind("anr")[0])  # penanda fake, bukan aksi runner
+    _hard_rules(out, maybe=True)
+
+
+@pytest.mark.parametrize("anr_s, outcome", [(0.6, "continues"), (5.0, "unknown_state")], ids=["singkat", "menetap"])
+def test_anr_dialog_when_cart_opens_delays_checkout_tap(tmp_path, monkeypatch, anr_s, outcome):
+    """Regresi: dialog ANR muncul saat layar keranjang terbuka. Tombol 'Checkout' keranjang tidak di-tap selama
+    dialog tampil; singkat -> lanjut setelah hilang (1 pesanan); menetap -> UNKNOWN_STATE tanpa checkout/pesanan."""
+    app_cls, setup = _anr_on_step("buy_ok", anr_s)
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, setup=setup, live=True, go_cart=True, runner_attrs=attrs)
+    start, end = (int(x * 1000) for x in out.app.window)
+    assert [e for e in out.app.events if start <= e["t_server_ms"] < end and e["kind"] != "anr"] == [], \
+        "tidak ada aksi selama dialog"
+    if outcome == "continues":
+        assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+        assert _step_t(out, "click_checkout") >= end
+        _hard_rules(out, ordered=True)
+    else:
+        _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+        assert "click_checkout" not in out.step_names() and out.kind("checkout") == []
+        _hard_rules(out)
 
 
 # ------------------------------------------------------------------ loading selamanya

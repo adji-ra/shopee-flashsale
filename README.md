@@ -330,8 +330,9 @@ python -m flashbuy precheck --config target.yaml --only android
   lambat → dihidupkan ulang sekali (peringatan); masih gagal → `ERROR`, run berhenti.
 - Layar menyala dan tidak terkunci. Saat `run`: `svc power stayon usb` selama run, nilai
   `stay_on_while_plugged_in` lama dikembalikan setelah run selesai (apa pun hasilnya).
-- Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi →
-  **PERINGATAN KERAS** + alarm (run tidak dihentikan; kalibrasi ulang + dry-run dulu).
+- Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi, atau tidak terbaca
+  sehingga tidak bisa dibandingkan → **PERINGATAN KERAS** + alarm (run tidak dihentikan; kalibrasi ulang +
+  dry-run dulu).
 - Halaman produk terbuka lewat intent tanpa diminta login, tombol Beli ditemukan, harga terbaca.
 - Latensi query: 10× `exists` + 3× `info`; peringatan bila p95 > 100 ms. Semua sampel ada di
   `logs/<run>/android-queries-precheck.csv`.
@@ -368,7 +369,9 @@ package/activity di depan:
   Shopee tanpa elemen yang dikenali; activity Shopee bernama captcha/verifikasi; aplikasi/activity asing
   selain `com.shopee.id` dan dialog sistem yang dikenal.
 - **UNKNOWN**: Shopee keluar dari foreground (launcher), crash, dialog ANR/crash di atas Shopee (dicek tanpa
-  batas package; selama dialog tampil tidak ada klik), telepon/keyboard/Phone Master di depan, atau
+  batas package, berkala tiap ≤ 0,5 s dan **tepat sebelum setiap tap yang mengikat**: Beli, pilih ulang
+  variasi, Checkout keranjang, konfirmasi sheet, "Buat Pesanan"; selama dialog tampil tidak ada tap, juga saat
+  menunggu layar PIN), telepon/keyboard/Phone Master di depan, atau
   layar tak dikenal. UNKNOWN > 1,5 s → `UNKNOWN_STATE`: dump + screenshot + activity disimpan, alarm,
   tanpa retry. Indikator loading ditunggu, tetapi > 10 s → `UNKNOWN_STATE`. Setelah "Buat Pesanan"
   pesannya "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual".
@@ -404,9 +407,10 @@ Keamanan klik:
   reaksi klik itu sendiri tetap terbaca.
 - Bottom sheet yang sudah terbuka sebelum klik Beli pertama ditutup dengan back (sekali; tidak tertutup →
   `ERROR`), tidak pernah dikonfirmasi tanpa pemilihan variasi.
-- Variasi yang dipilih di halaman produk saat arm diperiksa lagi setelah setiap reload (hanya bila status
-  terpilih chip terbaca); terlepas → dipilih ulang sekali lewat gate (aksi polling; chip dibaca ulang
-  setelah slot, bottom sheet yang ikut terbuka ditutup) sebelum harga lapis 1 dibaca.
+- Variasi yang dipilih di halaman produk saat arm diperiksa lagi setelah setiap reload: chip belum tampil →
+  ditunggu (harga belum dibaca, Beli belum diklik); terlepas, atau status terpilihnya tidak terbaca → dipilih
+  ulang sekali lewat gate (aksi polling; chip dibaca ulang setelah slot, bottom sheet yang ikut terbuka
+  ditutup) sebelum harga lapis 1 dibaca. Lapis 3 tetap memverifikasi variasi di checkout.
 - Sebelum konfirmasi bottom sheet: cek captcha/verifikasi (content-desc selalu, teks bila sempat memilih
   variasi).
 - Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"

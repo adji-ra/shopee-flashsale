@@ -555,8 +555,12 @@ def assert_toast_cleared_before_clicks(dev: Device) -> int:
     idx = [i for i, (op, target) in enumerate(calls) if op == "click" and target in TOAST_CLEARED_CLICKS]
     assert idx, "tidak ada klik Beli/konfirmasi/Buat Pesanan"
     for i in idx:
-        j = i - 1 if calls[i - 1] != ("info", "text='Beli Sekarang'") else i - 2  # cek ulang tombol setelah slot
-        assert calls[j] == ("clear_toast", ""), calls[i - 3:i + 1]
+        j = i - 1
+        if calls[i][1] == "Beli Sekarang" and calls[j][0] == "info_any":  # cek dialog crash/ANR tepat sebelum klik
+            j -= 1
+        if calls[j] == ("info", "text='Beli Sekarang'"):  # cek ulang tombol setelah menunggu slot
+            j -= 1
+        assert calls[j] == ("clear_toast", ""), calls[i - 4:i + 1]
     return len(idx)
 
 

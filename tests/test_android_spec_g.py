@@ -375,7 +375,8 @@ def test_stay_on_command_without_effect_is_warning_and_not_restored(tmp_path, mo
     ("tanpa_kalibrasi", "PERINGATAN - belum ada kalibrasi Android (memakai default teks)", False),
     ("resolusi_berubah", "PERINGATAN - versi sama (3.40.21), tetapi resolusi berubah: kalibrasi "
                          "'Physical size: 1080x2460', sekarang 'Physical size: 720x1612'", False),
-    ("versi_tak_terbaca", "PERINGATAN - ", None),  # teks/alarm sengaja tidak dipatok (lihat laporan bug)
+    ("versi_tak_terbaca", "PERINGATAN - PERINGATAN KERAS: versi Shopee tidak terbaca, tidak bisa dibandingkan "
+                          "dengan kalibrasi (3.40.21)", True),
 ])
 def test_app_version_vs_calibration_warns_but_never_stops_run(tmp_path, monkeypatch, case, row, alarm):
     """Versi berbeda = PERINGATAN KERAS + alarm `precheck_versi`; versi tak terbaca tidak boleh OK. Tidak pernah
@@ -390,14 +391,13 @@ def test_app_version_vs_calibration_warns_but_never_stops_run(tmp_path, monkeypa
     out = run_android(tmp_path, selectors=sel)
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message  # tidak pernah menghentikan run
     assert f"precheck versi vs kalibrasi: {row}" in _log(out)
-    if alarm is None:  # versi tak terbaca: dicatat kosong, bukan OK; paling banyak alarm versi (bukan stop)
-        assert out.runner.device_info["versionName"] == ""
-        assert set(out.events()) <= {"precheck_versi"}
-    else:
-        assert out.events() == (["precheck_versi"] if alarm else [])
-    if alarm:
+    assert out.events() == (["precheck_versi"] if alarm else [])
+    if case == "berubah":
         assert out.notifier.events[0]["message"].startswith("PERINGATAN KERAS: versi Shopee 3.40.21 berbeda")
         assert out.runner.device_info["versionName"] == "3.40.21"
+    if case == "versi_tak_terbaca":  # tidak pernah dilaporkan "sama": tidak bisa dibandingkan = PERINGATAN KERAS
+        assert out.runner.device_info["versionName"] == ""
+        assert out.notifier.events[0]["message"].startswith("PERINGATAN KERAS: versi Shopee tidak terbaca")
     _one_buy(out)
     _safe(out)
 
