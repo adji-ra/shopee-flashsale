@@ -452,11 +452,16 @@ python -m flashbuy timesync [--samples 5] [--ntp-host id.pool.ntp.org] [--url ht
 
 ## Tes
 
-`python -m pytest -q` menjalankan 1000 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
+`python -m pytest -q` menjalankan 1186 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
 headless, kalibrasi dengan Alt+klik yang disimulasikan, dan jalur Android di atas device palsu
 (`FakeDriver` + `tests/fake_android.py`, jam virtual) termasuk CLI, kalibrasi, pengaman harga, dan
-skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet). `FLASHBUY_HEADED=1` menjalankan browser
-headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`). Lint: `ruff check flashbuy tests`.
+skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet, dialog ANR, aplikasi asing).
+Jumlahnya besar karena parametrisasi: 489 fungsi tes, 188 di antaranya `@pytest.mark.parametrize`
+(misalnya setiap skenario dijalankan dry-run dan live, serta untuk kedua mode refresh) yang
+menghasilkan 885 kasus. Setiap run Android juga memeriksa invarian otomatis (0 klik "Buat Pesanan"
+saat dry-run, ≤ 1 pesanan saat live, polling di dalam jendela dan berjarak ≥ 400 ms).
+`FLASHBUY_HEADED=1` menjalankan browser headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`).
+Lint: `ruff check flashbuy tests`.
 
 ## Risiko
 
