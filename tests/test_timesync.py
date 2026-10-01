@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import format_datetime
 
 import pytest
@@ -55,7 +55,7 @@ class FakeShopee:
         self.clock.advance(self.rtt / 2)
         server = self.clock.time() + off
         self.clock.advance(self.rtt / 2)
-        return format_datetime(datetime.fromtimestamp(math.floor(server), timezone.utc), usegmt=True)
+        return format_datetime(datetime.fromtimestamp(math.floor(server), UTC), usegmt=True)
 
 
 def failing(exc: Exception):
@@ -122,7 +122,7 @@ def test_ntp_short_packet():
 
 def test_parse_http_date():
     assert parse_http_date("Sun, 27 Sep 2026 04:00:00 GMT") == int(
-        datetime(2026, 9, 27, 4, tzinfo=timezone.utc).timestamp())
+        datetime(2026, 9, 27, 4, tzinfo=UTC).timestamp())
 
 
 @pytest.mark.parametrize("offset", [0.0, 0.3725, -1.84, 12.999, -0.0005])
@@ -255,7 +255,7 @@ def test_wait_until_precise_with_lead(oversleep):
 
 def test_wait_until_accepts_aware_datetime(fake_clock):
     sc = ServerClock(0.0, fake_clock)
-    target = datetime.fromtimestamp(sc.now() + 2, timezone.utc)
+    target = datetime.fromtimestamp(sc.now() + 2, UTC)
     assert 0 <= sc.wait_until(target) < 1.0
 
 
@@ -348,6 +348,6 @@ def test_probe_head_then_get_fallback(monkeypatch, head_has_date, expected):
     assert conn.methods == expected
 
 
-def test_probe_requires_https():
+def test_probe_rejects_non_http():
     with pytest.raises(ValueError):
-        timesync.HttpDateProbe("http://shopee.co.id/")
+        timesync.HttpDateProbe("ftp://shopee.co.id/")

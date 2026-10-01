@@ -3,10 +3,16 @@ product_url: "https://shopee.co.id/..."
 variant: "128GB Hitam"        # opsional, pilih by teks
 start_time: "2026-10-10T00:00:00+07:00"
 payment: "ShopeePay"
+# Pengaman harga (WAJIB). Alat berhenti (PRICE_GUARD) bila harga/total melewati batas ini.
+max_item_price: 1500000       # harga flash maksimum per unit (Rupiah)
+max_total: 1550000            # total pembayaran maks, termasuk ongkir & biaya layanan
+expected_name: "Ponsel"       # opsional: potongan nama produk (tidak peka huruf besar/kecil)
 lead_ms: 150                  # opsional, bisa di-override --lead-ms
 web:
   enabled: true
   profile_dir: "C:/flashbuy/chrome-profile"   # profil terpisah, login manual sekali
+  channel: "chrome"           # Chrome terpasang; null = Chromium bawaan Playwright
+  block_media: false          # true = blokir gambar/video/font agar lebih cepat
 android:
   enabled: true
   serial: ""                  # kosong = device pertama
