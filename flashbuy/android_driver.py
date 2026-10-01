@@ -34,6 +34,16 @@ class DriverError(RuntimeError):
     """Kegagalan komunikasi dengan device / agent uiautomator2."""
 
 
+class AgentDead(DriverError):
+    """Agent uiautomator2 / transport adb tidak menjawab (mis. dibunuh HiOS); bisa dipulihkan dengan restart."""
+
+
+# Nama exception u2/adbutils/socket yang berarti agent atau transport mati (bukan "elemen tidak ada").
+_DEAD_ERRORS = {"HTTPError", "HTTPTimeoutError", "UiAutomationNotConnectedError", "ConnectionError",
+                "ConnectionResetError", "ConnectionRefusedError", "TimeoutError", "timeout", "AdbError",
+                "LaunchUiAutomationError", "BrokenPipeError"}
+
+
 @dataclass(frozen=True)
 class Sel:
     by: str
@@ -129,6 +139,10 @@ class AndroidDriver(Protocol):
 
     def screenshot(self, path: Path) -> bool: ...
 
+    def last_toast(self) -> str | None: ...  # Toast Android = jendela terpisah, tidak ada di pohon node
+
+    def clear_toast(self) -> None: ...
+
     def dump(self) -> str: ...
 
     def shell(self, cmd: list[str]) -> str: ...
@@ -196,7 +210,8 @@ def _disable_implicit_restart(d: Any) -> bool:
 class U2Driver:
     """Implementasi nyata di atas uiautomator2 3.x (tanpa atx-agent)."""
 
-    def __init__(self, serial: str = "", device: Any = None, rpc_timeout_s: float = RPC_TIMEOUT_S):
+    def __init__(self, serial: str = "", device: Any = None, rpc_timeout_s: float = RPC_TIMEOUT_S,
+                 package: str | None = None):
         if device is None:
             import uiautomator2 as u2
 
@@ -211,6 +226,7 @@ class U2Driver:
         self.d = device
         self.serial = serial or getattr(device, "serial", "") or ""
         self.rpc_timeout_s = rpc_timeout_s
+        self.package = package  # query dibatasi ke aplikasi ini (notifikasi/jendela sistem tidak ikut cocok)
         self._size: tuple[int, int] | None = None
 
     def _call(self, what: str, fn: Callable[[], Any]) -> Any:
@@ -219,28 +235,40 @@ class U2Driver:
         except DriverError:
             raise
         except Exception as e:  # noqa: BLE001 - semua error u2/adb dibungkus
-            if type(e).__name__ == "UiObjectNotFoundError":
+            name = type(e).__name__
+            if name == "UiObjectNotFoundError":
                 raise
-            raise DriverError(f"{what}: {type(e).__name__}: {e}") from e
+            cls = AgentDead if name in _DEAD_ERRORS or isinstance(e, (OSError, TimeoutError)) else DriverError
+            raise cls(f"{what}: {name}: {e}") from e
 
     def _rpc(self, method: str, *params: Any) -> Any:
         """Panggil jsonrpc agent dengan timeout per panggilan (bukan 300 s bawaan u2)."""
         return getattr(self.d.jsonrpc, method)(*params, http_timeout=self.rpc_timeout_s)
 
     def _selector(self, sel: Sel) -> Any:
-        return self.d(**sel.kwargs()).selector
+        kw = sel.kwargs()
+        if self.package:
+            kw["packageName"] = self.package
+        return self.d(**kw).selector
 
     def exists(self, sel: Sel) -> bool:
         return bool(self._call(f"exists {sel}", lambda: self._rpc("exist", self._selector(sel))))
 
     def info(self, sel: Sel) -> Node | None:
         def get() -> Node | None:
-            try:
-                node = Node.from_u2(self._rpc("objInfo", self._selector(sel)))
-            except Exception as e:  # noqa: BLE001
-                if type(e).__name__ == "UiObjectNotFoundError":
-                    return None
-                raise
+            for attempt in (1, 2):
+                try:
+                    node = Node.from_u2(self._rpc("objInfo", self._selector(sel)))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if type(e).__name__ == "UiObjectNotFoundError":
+                        return None
+                    # elemen dibangun ulang di antara find & getter (mis. tepat saat T): coba sekali lagi
+                    if "StaleObject" in str(e):
+                        if attempt == 1:
+                            continue
+                        return None
+                    raise
             # objInfo bisa jatuh ke jalur B (contains/startsWith tidak peka huruf): cek ulang di klien
             return node if node_matches(node, sel) else None
 
@@ -254,7 +282,8 @@ class U2Driver:
                 if type(e).__name__ == "UiObjectNotFoundError":
                     return []
                 raise
-            return [n for n in (Node.from_u2(i) for i in infos) if node_matches(n, sel)]
+            # elemen yang hilang di tengah iterasi server menjadi null di array
+            return [n for n in (Node.from_u2(i) for i in infos if i) if node_matches(n, sel)]
 
         return self._call(f"find_all {sel}", get)
 
@@ -303,6 +332,12 @@ class U2Driver:
     def screenshot(self, path: Path) -> bool:
         self._call("screenshot", lambda: self.d.screenshot(str(path)))
         return Path(path).exists()
+
+    def last_toast(self) -> str | None:
+        return self._call("getLastToast", lambda: self._rpc("getLastToast")) or None
+
+    def clear_toast(self) -> None:
+        self._call("clearLastToast", lambda: self._rpc("clearLastToast"))
 
     def dump(self) -> str:
         return self._call("dump_hierarchy", self.d.dump_hierarchy)  # hanya kalibrasi/diagnosa/status akhir
@@ -433,6 +468,12 @@ class TimedDriver:
     def screenshot(self, path: Path) -> bool:
         return self._timed("screenshot", path, lambda: self.inner.screenshot(path))
 
+    def last_toast(self) -> str | None:
+        return self._timed("last_toast", "", self.inner.last_toast)
+
+    def clear_toast(self) -> None:
+        return self._timed("clear_toast", "", self.inner.clear_toast)
+
     def dump(self) -> str:
         return self._timed("dump", "", self.inner.dump)
 
@@ -458,7 +499,7 @@ def node_matches(node: Node, sel: Sel) -> bool:
     if by == "resourceId":
         return node.rid == v
     if by == "resourceIdMatches":
-        return re.fullmatch(v, node.rid) is not None
+        return _jmatch(v, node.rid)
     if by == "className":
         return node.cls == v
     if by.startswith("text"):
@@ -473,8 +514,13 @@ def node_matches(node: Node, sel: Sel) -> bool:
     if kind == "StartsWith":
         return s.startswith(v)
     if kind == "Matches":
-        return re.fullmatch(v, s) is not None
+        return _jmatch(v, s)
     raise ValueError(by)
+
+
+def _jmatch(pattern: str, s: str) -> bool:
+    """Pattern.matches Java: cocok seluruh teks; \\s/\\w/\\b hanya ASCII (NBSP BUKAN \\s di Java)."""
+    return re.fullmatch(pattern, s, re.ASCII) is not None
 
 
 class FakeApp(Protocol):
@@ -508,10 +554,12 @@ class FakeDriver:
 
     def __init__(self, app: FakeApp, clock: Any, latency_s: float = 0.02, serial: str = "FAKE123",
                  props: dict[str, str] | None = None, wm_size: str = "Physical size: 720x1612",
-                 alive: bool = True):
+                 alive: bool = True, per_match_s: float | None = None):
         self.app = app
         self.clock = clock
         self.latency_s = latency_s
+        # info_list di server = ~16 pencarian pohon per elemen cocok: find_all jauh lebih mahal dari info
+        self.per_match_s = latency_s / 2 if per_match_s is None else per_match_s
         self.serial = serial
         self.props = props or {}
         self.wm_size = wm_size
@@ -539,9 +587,10 @@ class FakeDriver:
         return found[0] if found else None
 
     def find_all(self, sel: Sel) -> list[Node]:
-        self._rpc("find_all", sel)
         active = getattr(self.app, "active_nodes", self.app.nodes)
-        return [n for n in active() if node_matches(n, sel)]
+        found = [n for n in active() if node_matches(n, sel)]
+        self._rpc("find_all", sel, latency=self.latency_s + self.per_match_s * len(found))
+        return found
 
     def click(self, target: Sel | Node) -> bool:
         node = self.info(target) if isinstance(target, Sel) else target
@@ -579,6 +628,15 @@ class FakeDriver:
         self._rpc("screenshot", path, latency=0.2)
         Path(path).write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
         return True
+
+    def last_toast(self) -> str | None:
+        self._rpc("last_toast", latency=self.latency_s / 2)
+        return getattr(self.app, "last_toast", None)
+
+    def clear_toast(self) -> None:
+        self._rpc("clear_toast", latency=self.latency_s / 2)
+        if hasattr(self.app, "last_toast"):
+            self.app.last_toast = None
 
     def dump(self) -> str:
         self._rpc("dump", latency=0.4)

@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from flashbuy import selector_store, timesync
@@ -26,6 +27,7 @@ from flashbuy.config import (
 console = Console()
 
 OK_STATUSES = ("DRYRUN_OK", "ORDER_PLACED_AWAIT_PIN")
+LATE_START_S = 70  # run harus mulai paling lambat T-70 s (precheck + arm T-60 s di luar jendela polling)
 
 
 def _ms(v: float | None, signed: bool = False) -> str:
@@ -86,7 +88,7 @@ def _android_driver(cfg: TargetConfig):
     """Driver device nyata (diganti FakeDriver di tes)."""
     from flashbuy.android_driver import U2Driver
 
-    return U2Driver(cfg.android.serial)
+    return U2Driver(cfg.android.serial, package=cfg.android.package)
 
 
 def _android_selectors(path: str):
@@ -264,9 +266,9 @@ def print_result(result, open_at: float) -> None:
         table.add_row(name, f"{rel_ms:+,d} ms", detail)
     console.print(table)
     color = "green" if str(result.status) in OK_STATUSES else "red"
-    console.print(f"Status: [bold {color}]{result.status}[/] - {result.message}", highlight=False)
+    console.print(f"Status: [bold {color}]{result.status}[/] - {escape(result.message)}", highlight=False)
     if result.detail:
-        console.print(f"Detail: {result.detail}", highlight=False)
+        console.print(f"Detail: {escape(result.detail)}", highlight=False)
     for shot in result.screenshots:
         console.print(f"Screenshot: {shot}")
 
@@ -379,6 +381,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     if time.time() > cfg.start_epoch + POLL_WINDOW_AFTER_S:
         console.print(f"[red]start_time {cfg.start_time.isoformat()} sudah lewat.[/]")
+        return 2
+    if time.time() > cfg.start_epoch - LATE_START_S and not args.allow_local:
+        # precheck + buka halaman (T-60 s) di dalam jendela polling = aksi tanpa rate limit
+        console.print(f"[red]Terlambat: run harus dimulai paling lambat T-{LATE_START_S} s "
+                      "(precheck & buka halaman produk sebelum T-60 s).[/]")
+        return 2
+    if args.live and args.headless and not args.allow_local:
+        console.print("[red]--live tidak boleh --headless: browser live tidak pernah ditutup otomatis.[/]")
         return 2
     sel = selector_store.load(args.selectors) if platform == "web" else _android_selectors(args.selectors)
     mode = "[bold red]LIVE - pesanan sungguhan akan dibuat[/]" if args.live else "[bold green]DRY-RUN[/]"

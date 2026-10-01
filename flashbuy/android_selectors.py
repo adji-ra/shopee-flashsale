@@ -58,7 +58,6 @@ ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
     # Tombol konfirmasi di bottom sheet (teksnya sering sama: "Beli Sekarang").
     "sheet_confirm": [
         {"text": "Beli Sekarang"},
-        {"textContains": "Beli Sekarang"},
         {"text": "Konfirmasi"},
     ],
     "cart_marker": [
@@ -172,13 +171,16 @@ class AndroidSelectors:
         return re.compile(union(pats)) if pats else None
 
 
-_LEADING_FLAGS = re.compile(r"\(\?([imsux]+)\)")
+_LEADING_FLAGS = re.compile(r"(?:\(\?[imsux]+\))+")
 
 
 def scoped(pattern: str) -> str:
-    """`(?is)X` -> `(?is:X)` supaya bisa digabung dengan `|` (valid di regex Java & Python)."""
+    """`(?is)X` / `(?i)(?s)X` -> `(?is:X)` supaya bisa digabung dengan `|` (valid di regex Java & Python)."""
     m = _LEADING_FLAGS.match(pattern)
-    return f"(?{m.group(1)}:{pattern[m.end():]})" if m else f"(?:{pattern})"
+    if not m:
+        return f"(?:{pattern})"
+    flags = "".join(sorted(set(re.sub(r"[()?]", "", m.group(0)))))
+    return f"(?{flags}:{pattern[m.end():]})"
 
 
 def union(patterns: list[str]) -> str:
@@ -208,7 +210,7 @@ def to_sel(cand: dict, variant: str | None = None) -> Sel | None:
     if "{variant}" in value:
         if not variant:
             return None
-        value = value.replace("{variant}", variant if by != "textMatches" else re.escape(variant))
+        value = value.replace("{variant}", re.escape(variant) if by.endswith("Matches") else variant)
     return Sel(by, value)
 
 
@@ -242,11 +244,20 @@ def load(path: str | Path) -> AndroidSelectors:
     section = data.get(PLATFORM, {})
     for step, cands in section.get("steps", {}).items():
         for c in cands:
-            to_sel(c, "x")  # validasi format
+            sel_ = to_sel(c, "x")  # validasi format (+ regex bisa dikompilasi)
+            if sel_ is not None and sel_.by.endswith("Matches"):
+                try:
+                    re.compile(sel_.value)
+                except re.error as e:
+                    raise ValueError(f"selectors.json android.steps.{step}: regex tidak valid {sel_.value!r}: {e}") \
+                        from None
         sel.steps[step] = order_candidates(list(cands), sel.steps.get(step, []))
     for name, pats in section.get("markers", {}).items():
         for p in pats:
-            re.compile(p)
+            try:
+                re.compile(union([p]))
+            except re.error as e:
+                raise ValueError(f"selectors.json android.markers.{name}: regex tidak valid {p!r}: {e}") from None
         sel.markers[name] = [*pats, *[p for p in sel.markers.get(name, []) if p not in pats]]
     sel.urls.update(section.get("urls", {}))
     sel.calibrated = section.get("calibrated", {})

@@ -63,6 +63,11 @@ def order_counts(text: str | None) -> list[int]:
     return [int(n) for n in _ORDER_COUNT_RE.findall(normalize(text))]
 
 
+def _squash(text: str) -> str:
+    """Huruf kecil, hanya huruf & angka ("128GB, Hitam" ~ "128GB Hitam")."""
+    return re.sub(r"[\W_]+", "", normalize(text).lower())
+
+
 def rupiah(n: int | None) -> str:
     return "?" if n is None else "Rp" + f"{n:,}".replace(",", ".")
 
@@ -72,6 +77,7 @@ class Limits:
     max_item_price: int
     max_total: int
     expected_name: str | None = None
+    expected_variant: str | None = None  # bila diisi: teks variasi harus terlihat di baris produk checkout
 
 
 # --------------------------------------------------------------------------- lapis 1: produk
@@ -118,13 +124,18 @@ class CartVerdict:
     reason: str = ""
 
 
-def check_cart(rows: list[CartRow], target_name: str | None) -> CartVerdict:
-    """Tentukan baris yang harus di-uncheck. ok=True bila tepat 1 baris tercentang."""
+def check_cart(rows: list[CartRow], target_name: str | None, strict: bool = False) -> CartVerdict:
+    """Tentukan baris yang harus di-uncheck. ok=True bila tepat 1 baris tercentang.
+
+    strict (nama acuan dari expected_name): satu-satunya baris tercentang juga harus memuat nama acuan.
+    """
     checked = [i for i, r in enumerate(rows) if r.checked]
     if len(checked) == 1:
         qty = rows[checked[0]].qty
         if qty is not None and qty != 1:
             return CartVerdict(False, reason=f"kuantitas di keranjang {qty}, bukan 1")
+        if strict and target_name and not name_matches(rows[checked[0]].text, target_name):
+            return CartVerdict(False, reason=f"item tercentang bukan target (nama acuan {target_name!r})")
         return CartVerdict(True, reason="1 item tercentang")
     if not checked:
         return CartVerdict(False, reason="tidak ada item tercentang")
@@ -179,6 +190,8 @@ def check_checkout(snap: CheckoutSnapshot, limits: Limits) -> CheckoutVerdict:
         qty = parse_qty(snap.rows[0]) if len(snap.rows) == 1 else None
         amounts = [a for row in snap.rows for a in find_amounts(row)]
     elif counts:
+        if len(counts) != 1:  # beberapa grup "(N Produk)" = beberapa toko/produk
+            reasons.append(f"{len(counts)} grup pesanan (harus tepat 1)")
         qty = counts[0] if len(set(counts)) == 1 else None
         amounts = []
     else:
@@ -211,6 +224,11 @@ def check_checkout(snap: CheckoutSnapshot, limits: Limits) -> CheckoutVerdict:
         values["name_ok"] = name_matches(haystack, limits.expected_name)
         if not values["name_ok"]:
             reasons.append(f"nama produk tidak memuat {limits.expected_name!r}")
+    if limits.expected_variant:
+        haystack = " ".join(snap.rows) if snap.rows else snap.page_text
+        values["variant_ok"] = _squash(limits.expected_variant) in _squash(haystack)
+        if not values["variant_ok"]:
+            reasons.append(f"variasi {limits.expected_variant!r} tidak terlihat di baris produk")
 
     shipping, total = read_total(snap)
     values["shipping"], values["total"] = shipping, total

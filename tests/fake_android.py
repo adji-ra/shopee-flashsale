@@ -64,7 +64,10 @@ class AppScenario:
     screen_on: bool = True
     locked: bool = False
     stay_on: str = "3"
-    pin_title: str | None = "Masukkan PIN ShopeePay"  # None: layar PIN tanpa teks (hanya resource-id)
+    pin_title: str | None = "Masukkan PIN ShopeePay"
+    # "toast": pesan = Toast Android (jendela terpisah, hanya terbaca lewat getLastToast);
+    # "node": pesan in-app (overlay React Native) yang ada di pohon node
+    toast_mode: str = "toast"  # None: layar PIN tanpa teks (hanya resource-id)
 
 
 def _n(text: str = "", bounds=(0, 0, 0, 0), **kw) -> Node:
@@ -81,6 +84,7 @@ class FakeShopeeApp:
         self.payment_method = sc.payment_default
         self.list_choice: str | None = None
         self.toast: tuple[str, float] | None = None
+        self.last_toast: str | None = None  # getLastToast (sampai dihapus clearLastToast)
         self.loading_until: float | None = None
         self.after_loading: str | None = None
         self.checkout_at = 0.0
@@ -269,13 +273,13 @@ class FakeShopeeApp:
     def _confirm(self) -> None:
         sc = self.sc
         if sc.variant_required and sc.variants and not self.selected_variant:
-            self.toast = ("Silakan pilih variasi terlebih dahulu", self.now() + 1.5)
+            self._show_toast("Silakan pilih variasi terlebih dahulu")
             return
         if not self.sale_active() and not sc.button_enabled_before_open:
-            self.toast = ("Flash sale belum dimulai", self.now() + 1.5)
+            self._show_toast("Flash sale belum dimulai")
             return
         if sc.sold_out_on_confirm:
-            self.toast = ("Stok habis", self.now() + 1.5)
+            self._show_toast("Stok habis")
             self.sold_out = True
             self.screen = "product"
             return
@@ -286,6 +290,11 @@ class FakeShopeeApp:
             self.screen = "cart"
             return
         self._enter_checkout([item])
+
+    def _show_toast(self, text: str) -> None:
+        self.toast = (text, self.now() + 1.5)
+        if self.sc.toast_mode == "toast":
+            self.last_toast = text
 
     def _enter_checkout(self, items: list[tuple[str, int, int]]) -> None:
         self._event("checkout", str(items))
@@ -301,7 +310,8 @@ class FakeShopeeApp:
             self.screen, self.loading_until = self.after_loading or "product", None
         out = getattr(self, f"_r_{self.screen}")()
         if self.toast and self.now() < self.toast[1]:
-            out.append(("", _n(self.toast[0], (160, 1300, 560, 1350))))
+            if self.sc.toast_mode == "node":
+                out.append(("", _n(self.toast[0], (160, 1300, 560, 1350))))
         elif self.toast:
             self.toast = None
         return out

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Protocol
 
 from rich.console import Console
+from rich.text import Text
 
 from flashbuy.config import MIN_ACTION_INTERVAL_MS, POLL_WINDOW_AFTER_S, POLL_WINDOW_BEFORE_S
 from flashbuy.timesync import ServerClock, format_ts
@@ -175,6 +176,13 @@ class RateLimiter:
             self.history.append(slot)
             return slot
 
+    def touch(self, t: float) -> None:
+        """Aksi yang efeknya baru sampai di akhir (reload: gestur/intent) selesai pada waktu t:
+        slot berikutnya dihitung dari t, bukan dari awal aksi."""
+        with self._lock:
+            if self._last is None or t > self._last:
+                self._last = t
+
 
 class PollingGate:
     """RateLimiter + penjaga jendela T-1 s .. T+8 s untuk fase polling."""
@@ -228,11 +236,12 @@ class RunLog:
 
     def _line(self, level: str, text: str) -> None:
         line = f"{format_ts(self.clock.now())} [{self.platform}] {level} {text}"
-        self._file.write(line + "\n")
-        self._file.flush()
+        if not self._file.closed:  # thread runner yang dibatalkan bisa menulis sesudah log ditutup
+            self._file.write(line + "\n")
+            self._file.flush()
         style = {"WARN": "yellow", "ERROR": "red"}.get(level, "")
-        self.console.print(f"[{style}]{line}[/]" if style else line, markup=bool(style),
-                           highlight=False)
+        # teks dari layar/adb bisa memuat "[...]": jangan ditafsirkan sebagai markup Rich
+        self.console.print(Text(line, style=style), highlight=False)
 
     def mark(self, name: str, detail: str = "", t_ms: int | None = None) -> Step:
         step = Step(name, self.clock.now_ms() if t_ms is None else t_ms, detail)

@@ -314,8 +314,12 @@ class WebRunner:
                                           f"saldo {pricing.rupiah(balance)} terbaca, harga produk tidak terbaca "
                                           f"({price_text!r})"))
         else:
-            need = price + (shipping or 0)
+            # sebelum flash sale halaman bisa menampilkan harga normal; alat tidak membayar > max_item_price
+            unit = min(price, self.limits.max_item_price)
+            need = unit + (shipping or 0)
             note = "" if shipping is not None else " (ongkir tidak terbaca)"
+            if unit < price:
+                note += f" (harga tampil {pricing.rupiah(price)} dibatasi max_item_price)"
             res.items.append(PrecheckItem("saldo ShopeePay", balance >= need,
                                           f"saldo {pricing.rupiah(balance)} vs harga+ongkir "
                                           f"{pricing.rupiah(need)}{note}"))
@@ -661,7 +665,7 @@ class WebRunner:
                                                    "baris item tidak terbaca")
             self.log.warn("keranjang: baris item tidak terbaca; diputuskan di checkout (lapis 3)")
             return
-        verdict = pricing.check_cart(rows, target)
+        verdict = pricing.check_cart(rows, target, strict=bool(self.cfg.expected_name))
         if verdict.to_uncheck:
             for i in verdict.to_uncheck:
                 self._checkpoint()
@@ -672,7 +676,7 @@ class WebRunner:
                 self.log.mark("cart_uncheck", rows[i].text.splitlines()[0][:50])
             await asyncio.sleep(0.2)
             rows, counts = await self._read_cart()
-            verdict = pricing.check_cart(rows, target)
+            verdict = pricing.check_cart(rows, target, strict=bool(self.cfg.expected_name))
         if not verdict.ok:
             names = "; ".join(r.text.splitlines()[0][:40] for r in rows if r.checked)
             raise _Stop(RunStatus.PRICE_GUARD, f"keranjang: {verdict.reason} [{names}]")
