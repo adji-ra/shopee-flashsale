@@ -544,12 +544,13 @@ def test_l1_nbsp_prices_are_read_with_java_regex_semantics(tmp_path, monkeypatch
 
 
 def test_l1_price_read_in_hot_path_is_single_info_query(tmp_path, monkeypatch):
-    # hot path polling: hanya info/exists; harga = 1 info(textMatches RP_SHORT_MATCH) per iterasi, tanpa find_all
+    # hot path polling: hanya info/exists (+ clear_toast tepat sebelum klik); harga = 1 info(textMatches
+    # RP_SHORT_MATCH) per iterasi, tanpa find_all
     monkeypatch.setattr(android_harness, "FakeDriver", _StampedDriver)
-    out = run_android(tmp_path, button_enabled_before_open=True)
+    out = run_android(tmp_path, button_enabled_before_open=True, lead_ms=500)  # beberapa iterasi sebelum T
     _passed(out, live=False)
     start, click = out.result.step("poll_start").t_server_ms, out.result.step("click_buy").t_server_ms
-    hot = [(op, target) for t, op, target in out.driver.stamps if start <= t < click]
+    hot = [(op, target) for t, op, target in out.driver.stamps if start <= t < click and op != "clear_toast"]
     assert hot and {op for op, _ in hot} <= {"info", "exists"}, sorted({op for op, _ in hot})
     price_reads = hot.count(("info", str(Sel("textMatches", RP_SHORT_MATCH))))
     buy_reads = hot.count(("info", str(Sel("text", "Beli Sekarang"))))
@@ -830,10 +831,6 @@ def test_l3_variant_check_is_case_insensitive(tmp_path, monkeypatch, live):
     _passed(out, live)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: lapis 3 variasi dinormalisasi (huruf/angka saja) di pricing.check_checkout, tetapi "
-    "AndroidRunner._checkout_read hanya mengambil node yang memuat teks variasi PERSIS (regex .*256GB Biru.*); "
-    "'Variasi: 256GB, Biru' tidak pernah terbaca -> PRICE_GUARD palsu (fail-closed, live tidak bisa memesan)"))
 def test_l3_variant_check_normalizes_punctuation_end_to_end(tmp_path, monkeypatch):
     out = _run(tmp_path, monkeypatch, _variant_shown_app("Variasi: 256GB, Biru"), variants=VARIANTS,
                cfg={"variant": "256GB Biru"})

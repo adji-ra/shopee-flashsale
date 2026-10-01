@@ -40,6 +40,7 @@ _SHIPPING_ROW = re.compile(rf"(?is){SP}*(?:subtotal pengiriman|total ongkos kiri
 _PAYMENT_ROW = re.compile(rf"(?is){SP}*metode pembayaran{SP}*:?{SP}*(.*)")
 _SELECT_ALL_RE = re.compile(rf"(?i){SP}*(pilih{SP}+)?semua({SP}*\(\d+\))?{SP}*")
 _HAS_RP = re.compile(rf"Rp{SP}?\d", re.I)
+_VARIANT_LINE = re.compile(rf"{SP}*variasi\b", re.I)
 # ShopeePay yang benar-benar dipilih: "ShopeePay", "Saldo ShopeePay", "ShopeePay (Rp150.000)".
 # Tidak: "SPayLater", "ShopeePay Later", "ShopeePay (Saldo tidak cukup)", "ShopeePay + SPayLater".
 _SHOPEEPAY_OK = re.compile(rf"(?i){SP}*(saldo{SP}+)?shopeepay"
@@ -133,8 +134,9 @@ def checkout_snapshot(nodes: list[Node], total_rid: re.Pattern | None = None,
     """Bangun CheckoutSnapshot dari node teks layar checkout.
 
     Baris produk = satu per penanda kuantitas "xN". Teks baris = nama/variasi di kartu produk (di atas
-    penanda, maks _CARD_LINES baris, HANYA di kolom produk: kiri >= kolom harga - toleransi, sehingga nama
-    toko di header tidak ikut dicocokkan dengan expected_name) + harga satuan sebaris penanda + "xN".
+    penanda, maks _CARD_LINES baris, TANPA header toko - teks teratas yang lebih kiri dari teks di bawahnya, atau
+    bila tak terbedakan teks di kiri kolom harga/"Variasi" - sehingga nama toko tidak ikut dicocokkan dengan
+    expected_name) + harga satuan sebaris penanda + "xN".
     Total & ongkir: node ber-resource-id (testID, mis. labelTotalPayment) DITAMBAH pasangan label baris ->
     nilai di layar; semua harus konsisten.
     """
@@ -158,9 +160,18 @@ def checkout_snapshot(nodes: list[Node], total_rid: re.Pattern | None = None,
         elif len(price_nodes) > 1:
             tallest = max(n.height for n in price_nodes)
             price_nodes = [n for n in price_nodes if n.height == tallest]
-        col_left = min((n.bounds[0] for n in rp_nodes), default=m.bounds[0]) - _COLUMN_SLACK_PX
-        names = [n.label for n in sorted(card, key=lambda n: (n.bounds[1], n.bounds[0]))
-                 if not has_rp(n) and not is_qty(n) and n.bounds[0] >= col_left]
+        texts = sorted((n for n in card if not has_rp(n) and not is_qty(n)), key=lambda n: (n.bounds[1], n.bounds[0]))
+        above = [n for n in texts if vcenter(n) < m.bounds[1]]
+        if len(above) >= 2 and any(n.bounds[0] > above[0].bounds[0] + _COLUMN_SLACK_PX for n in above[1:]):
+            # teks teratas lebih kiri dari teks di bawahnya = header toko (nama produk menjorok karena gambar):
+            # dibuang; sisanya kolom produk (harga boleh menjorok ke kanan nama, mis. tanpa harga coret)
+            names = [n.label for n in texts if n is not above[0]]
+        else:
+            # header tidak bisa dibedakan (mis. bacaan sempit tanpa nama produk): kolom produk = kiri harga /
+            # baris "Variasi"; teks di kiri kolom itu (header toko) dibuang
+            anchors = [n.bounds[0] for n in rp_nodes] + [n.bounds[0] for n in texts if _VARIANT_LINE.match(n.label)]
+            col_left = min(anchors, default=m.bounds[0]) - _COLUMN_SLACK_PX
+            names = [n.label for n in texts if n.bounds[0] >= col_left]
         rows.append("\n".join([*names, *(p.label for p in price_nodes), m.label.strip()]))
         prev_bottom = m.bounds[3]
     return pricing.CheckoutSnapshot(

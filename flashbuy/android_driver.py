@@ -158,6 +158,7 @@ class AndroidDriver(Protocol):
 
 
 RPC_TIMEOUT_S = 5.0  # batas satu query/klik ke agent (default u2: 300 s, dan timeout socket tidak dipasang)
+SWIPE_STEPS = 60  # swipe_refresh 0,3 s (u2: 1 langkah = 5 ms)
 SLOW_RPC_TIMEOUT_S = 30.0  # dump/screenshot/shell
 
 
@@ -319,12 +320,13 @@ class U2Driver:
 
     def swipe_refresh(self) -> None:
         w, h = self.window_size()
-        # tarik pelan (bukan fling) dari 30% ke 75% tinggi layar; koordinat piksel bulat
-        self._call("swipe_refresh", lambda: self.d.swipe(int(w * 0.5), int(h * 0.30), int(w * 0.5), int(h * 0.75),
-                                                         duration=0.3))
+        # tarik pelan (bukan fling) dari 30% ke 75% tinggi layar, 0,3 s (= 60 langkah u2 @5 ms); koordinat bulat.
+        # Lewat jsonrpc langsung: d.swipe()/d.press() u2 memakai batas 300 s, bukan rpc_timeout_s.
+        self._call("swipe_refresh", lambda: self._rpc("swipe", int(w * 0.5), int(h * 0.30), int(w * 0.5),
+                                                      int(h * 0.75), SWIPE_STEPS))
 
     def press_back(self) -> None:
-        self._call("press back", lambda: self.d.press("back"))
+        self._call("press back", lambda: self._rpc("pressKey", "back"))
 
     def webview_present(self) -> bool:
         return self.exists(Sel("className", "android.webkit.WebView"))

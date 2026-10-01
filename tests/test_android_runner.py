@@ -40,7 +40,7 @@ ALLOWED_OPS = {"exists", "info", "find_all", "click", "current_app", "start_url"
                "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
 # Kueri satu objek (jalur A) - satu-satunya kueri yang boleh dipakai di hot path polling.
 SINGLE_OBJECT_OPS = {"info", "exists"}
-# Klik yang langsung diikuti clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
+# Klik yang tepat didahului clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
 TOAST_CLEARED_CLICKS = {"Beli Sekarang", "Buat Pesanan"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol.
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
@@ -347,9 +347,19 @@ def test_live_places_one_order_and_stops_at_pin(tmp_path):
     assert_polling_rules(out)
 
 
-def test_clear_toast_right_after_buy_confirm_and_order_clicks(tmp_path):
-    """clear_toast (agent saja) tepat setelah setiap klik Beli / konfirmasi sheet / Buat Pesanan, tidak di tempat
-    lain; last_toast hanya dibaca setelah ada klik (bukan bagian iterasi polling)."""
+def _clear_before(calls, i: int) -> int:
+    """Indeks clear_toast milik klik ke-i: tepat sebelumnya, atau sebelum satu cek ulang tombol Beli (setelah
+    menunggu slot > 50 ms)."""
+    j = i - 1
+    if calls[j] == ("info", BUY_SEL) and calls[i][1] == "Beli Sekarang":
+        j -= 1
+    assert calls[j] == ("clear_toast", ""), calls[max(0, i - 3):i + 1]
+    return j
+
+
+def test_clear_toast_right_before_buy_confirm_and_order_clicks(tmp_path):
+    """clear_toast (agent saja) tepat SEBELUM setiap klik Beli / konfirmasi sheet / Buat Pesanan, tidak di tempat
+    lain (toast reaksi klik itu sendiri tidak ikut terhapus); last_toast hanya dibaca setelah ada klik."""
     out = run_android(tmp_path, live=True, variants=VARIANTS, variant_prices=VARIANT_PRICES,
                       payment_default="COD - Cek Dulu", cfg={"variant": TARGET_VARIANT})
     assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
@@ -357,14 +367,12 @@ def test_clear_toast_right_after_buy_confirm_and_order_clicks(tmp_path):
     cleared = [i for i, (op, t) in enumerate(calls) if op == "click" and t in TOAST_CLEARED_CLICKS]
     labels = [calls[i][1] for i in cleared]
     assert labels == ["Beli Sekarang", "Beli Sekarang", "Buat Pesanan"], labels  # Beli, konfirmasi sheet, pesan
-    for i in cleared:
-        assert calls[i + 1] == ("clear_toast", ""), calls[i:i + 3]
     clears = [i for i, (op, _) in enumerate(calls) if op == "clear_toast"]
-    assert clears == [i + 1 for i in cleared], "clear_toast hanya tepat setelah klik Beli/konfirmasi/Buat Pesanan"
-    # klik lain (variasi, metode bayar, konfirmasi metode) tidak diikuti clear_toast
+    assert clears == [_clear_before(calls, i) for i in cleared], "clear_toast hanya tepat sebelum klik tersebut"
+    # klik lain (variasi, metode bayar, konfirmasi metode) tidak didahului clear_toast
     others = [i for i, (op, t) in enumerate(calls) if op == "click" and t not in TOAST_CLEARED_CLICKS]
     assert {calls[i][1] for i in others} >= {TARGET_VARIANT, "ShopeePay"}
-    assert all(calls[i + 1][0] != "clear_toast" for i in others)
+    assert all(calls[i - 1][0] != "clear_toast" for i in others)
     first_click = cleared[0]
     assert "last_toast" not in [op for op, _ in calls[:first_click]], "last_toast bukan bagian hot path polling"
     assert set(_ops(out)) <= ALLOWED_OPS
@@ -373,21 +381,28 @@ def test_clear_toast_right_after_buy_confirm_and_order_clicks(tmp_path):
 
 @pytest.mark.parametrize("scenario", [{}, {"sale_skew_ms": 9500}], ids=["click", "never_opens"])
 def test_polling_hot_path_uses_single_object_queries_only(tmp_path, scenario):
-    """Iterasi polling = info tombol Beli + satu info bahaya (captcha|verifikasi|PIN) + satu info harga;
-    tanpa find_all / dump / toast / diagnosa di jendela polling."""
+    """Iterasi polling = info tombol Beli + satu info bahaya (captcha|verifikasi|PIN|berakhir) + satu info harga;
+    cek pra-klik (content-desc bahaya + sheet) paling sering tiap 0,5 s; tanpa find_all / dump / baca toast /
+    diagnosa di jendela polling. Satu-satunya operasi agent: clear_toast tepat sebelum klik Beli."""
     out = run_android(tmp_path, **scenario)
     t0 = out.result.step("poll_start").t_server_ms
     click = out.result.step("click_buy")
     t1 = click.t_server_ms if click is not None else out.result.step("result").t_server_ms
     window = [(t, op, target) for t, op, target in _run_queries(out) if t0 <= t <= t1]
     assert window, "tidak ada kueri di jendela polling"
-    queries = [(op, target) for _, op, target in window if op not in ("swipe_refresh", "start_url")]
+    clears = [i for i, (_, op, _) in enumerate(window) if op == "clear_toast"]
+    assert clears == ([len(window) - 1] if click is not None else []), clears  # hanya tepat sebelum klik
+    queries = [(op, target) for _, op, target in window if op not in ("swipe_refresh", "start_url", "clear_toast")]
     assert {op for op, _ in queries} <= SINGLE_OBJECT_OPS, {op for op, _ in queries} - SINGLE_OBJECT_OPS
-    # setiap iterasi diawali info tombol Beli, diikuti paling banyak 3 kueri satu objek (bahaya, harga, sheet)
+    # setiap iterasi diawali info tombol Beli, diikuti paling banyak 3 kueri satu objek (bahaya, harga, sheet);
+    # iterasi dengan cek pra-klik +2 (content-desc bahaya, sheet), dan cek itu berjarak >= 0,5 s
     starts = [i for i, (_, target) in enumerate(queries) if target == BUY_SEL]
     assert len(starts) >= 3, queries[:6]
     for a, b in zip(starts, starts[1:], strict=False):
-        assert b - a - 1 <= 3, queries[a:b]
+        guard = any(t.startswith("descriptionMatches") for _, t in queries[a:b])
+        assert b - a - 1 <= (5 if guard else 3), queries[a:b]
+    guards = [t for t, op, target in window if target.startswith("descriptionMatches")]
+    assert guards and all(b - a >= 500 for a, b in zip(guards, guards[1:], strict=False)), guards
     if click is None:
         assert out.result.status == RunStatus.NOT_STARTED_TIMEOUT, out.result.message
     else:
@@ -463,13 +478,48 @@ def test_variant_required_without_config_variant_in_sheet_is_error(tmp_path, mon
     _assert_gated_rules(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_runner._attempt/_handle_sheet memanggil d.clear_toast() SETELAH d.click(); toast yang "
-    "dipicu klik itu sendiri dan sudah tercatat sebelum RPC clearLastToast sampai ke agent ikut terhapus "
-    "(race nyata di HP cepat; deterministik di FakeShopeeApp yang menampilkan toast saat tap). Reaksi "
-    "'Silakan pilih variasi' hilang -> dianggap 'tidak ada reaksi'/'sheet tidak bereaksi' -> Beli/konfirmasi "
-    "diulang lewat gate sampai T+8 s (5 klik) dan hasil NOT_STARTED_TIMEOUT, bukan ERROR 'wajib pilih "
-    "variasi'. Perbaikan: clear_toast SEBELUM klik"))
+@RELOAD
+def test_variant_on_page_reselected_once_after_reload(tmp_path, reload):
+    """Reload intent mengembalikan halaman ke variasi bawaan (harga variasi bawaan > maks). Variasi yang dipilih
+    di halaman produk saat arm dipilih ulang SEKALI setelah reload, lewat gate (aksi polling), sebelum lapis 1
+    membaca harga; swipe tidak melepas pilihan -> tidak diklik ulang."""
+    out = run_android(tmp_path, variants=VARIANTS, variants_on_page=True, sheet=False, live_update=False,
+                      flash_price=150_000, variant_prices={TARGET_VARIANT: 95_000},
+                      cfg={"variant": TARGET_VARIANT, "android": {"reload": reload}})
+    assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
+    taps = [e["t_server_ms"] for e in out.kind("variant")]
+    reselect = [s.detail for s in out.result.steps if s.name == "variant_selected"][1:]
+    if reload == "intent":
+        assert len(taps) == 2 and reselect == [f"{TARGET_VARIANT} (ulang setelah reload)"], (taps, reselect)
+        names = out.step_names()
+        assert names.index("reload") < len(names) - names[::-1].index("variant_selected") - 1 < names.index(
+            "click_buy")
+        last_reload = max(e["t_server_ms"] for e in out.kind("intent") if e["t_server_ms"] < taps[1])
+        assert taps[1] - last_reload >= 425, "pilih ulang = aksi polling lewat gate"
+        assert out.kind("buy")[0]["t_server_ms"] - taps[1] >= 425
+    else:
+        assert len(taps) == 1 and reselect == []
+    assert out.app.selected_variant == TARGET_VARIANT
+    assert "harga Rp95.000" in out.result.step("buy_ready").detail  # lapis 1 = harga variasi target
+    assert "harga=Rp95.000" in out.result.step("price_guard_ok").detail
+    assert len(out.kind("buy")) == 1
+    assert_polling_rules(out)
+    _no_order(out)
+
+
+def test_sheet_that_does_not_close_before_first_click_is_error_without_click(tmp_path):
+    def patch(runner, app) -> None:
+        _sheet_open_at_arm(runner, app)
+        app.on_back = lambda: app._event("back", app.screen)  # back tidak menutup sheet
+
+    out = run_android(tmp_path, live=True, cfg={"expected_name": LIVE_NAME}, during=_during_patch(patch))
+    assert out.result.status == RunStatus.ERROR, out.result.message
+    assert "tidak tertutup dengan back" in out.result.message
+    assert [e["detail"] for e in out.kind("back")] == ["sheet"], "back sekali, tanpa back berulang"
+    assert out.kind("buy") == [] and out.kind("confirm") == [] and out.kind("tap") == []
+    _no_order(out)
+
+
 @pytest.mark.parametrize("sheet", [True, False], ids=["sheet", "direct"])
 def test_reaction_toast_shown_before_clear_toast_is_not_lost(tmp_path, sheet):
     # FakeShopeeApp bawaan: Toast Android tercatat seketika saat tap (sebelum clear_toast runner)
@@ -482,9 +532,10 @@ def test_reaction_toast_shown_before_clear_toast_is_not_lost(tmp_path, sheet):
 
 @pytest.mark.parametrize("sheet", [True, False], ids=["sheet", "direct"])
 def test_lost_reaction_toast_never_reaches_checkout_and_keeps_polling_rules(tmp_path, sheet):
-    # pengaman yang tetap berlaku walau toast reaksi hilang (lihat tes xfail di atas)
-    out = run_android(tmp_path, variants=VARIANTS, variant_required=True, sheet=sheet)
-    assert out.result.status != RunStatus.DRYRUN_OK, out.result.message
+    """Reaksi klik tidak terbaca sama sekali (toast tidak sampai ke getLastToast maupun pohon node): klik ulang
+    hanya lewat gate (bukan klik ganda), tanpa checkout/variasi, berakhir saat jendela polling habis."""
+    out = run_android(tmp_path, variants=VARIANTS, variant_required=True, sheet=sheet, toast_mode="lost")
+    assert out.result.status == RunStatus.NOT_STARTED_TIMEOUT, out.result.message
     assert out.kind("checkout") == [] and out.app.selected_variant is None
     assert out.kind("variant") == [], "variasi tidak boleh dipilih tanpa config `variant`"
     _assert_gated_rules(out)
@@ -688,11 +739,6 @@ def test_pin_screen_after_buy_click_is_unknown_state_and_left_alone(tmp_path, li
         assert out.result.step("result").t_server_ms - buy["t_server_ms"] < 500, "segera, tanpa menunggu 1,5 s"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_runner._classify memeriksa resource-id pin_screen hanya di konteks 'after_order'; layar PIN "
-    "tanpa teks (hanya payment_password_field) yang muncul setelah klik Beli jadi UNKNOWN -> UNKNOWN_STATE "
-    "'layar tidak dikenali' setelah 1,5 s, tanpa pesan wajib 'Pesanan MUNGKIN sudah terbuat' dan "
-    "order_clicked=False (rancangan: PIN setelah Beli = mungkin sudah memesan)"))
 def test_pin_screen_without_text_after_buy_click_uses_mandatory_message(tmp_path):
     stop = threading.Event()
     out = run_android(tmp_path, pin_title=None, during=_during_patch(_pin_after_buy),
@@ -742,12 +788,6 @@ def test_sheet_never_reacting_reconfirms_only_within_window(tmp_path):
     _no_order(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_runner._wait_ready hanya menutup sheet (press_back) bila tombol Beli TIDAK ditemukan; "
-    "info (jalur A, semua jendela) tetap menemukan 'Beli Sekarang' halaman produk di belakang sheet, jadi "
-    "klik Beli pertama mendarat di tombol konfirmasi sheet -> sheet dikonfirmasi tanpa _handle_sheet "
-    "(variasi tidak dipilih, tanpa press_back). Live dengan variant diselamatkan lapis 3 (PRICE_GUARD); "
-    "rancangan: sheet terbuka sebelum klik pertama -> press_back, tanpa konfirmasi"))
 def test_sheet_open_before_first_click_is_closed_not_confirmed(tmp_path):
     out = run_android(tmp_path, variants=VARIANTS, variant_prices=VARIANT_PRICES, cfg={"variant": TARGET_VARIANT},
                       during=_during_patch(_sheet_open_at_arm))
@@ -815,7 +855,9 @@ def test_static_ui_reload_then_buy_respects_polling_rules(tmp_path, reload):
 
 
 def _buy_button_glitch_after_reload(move: bool):
-    """Tombol Beli hilang (atau bergeser) 0,3..0,9 s setelah reload saat sale - tepat saat runner menunggu slot."""
+    """Tombol Beli hilang 0,3..0,9 s setelah reload saat sale (tepat saat runner menunggu slot), atau bergeser
+    permanen mulai 0,3 s setelah reload (layout shift). Pergeseran yang kembali tepat di antara cek ulang dan
+    klik (satu RPC) tidak bisa dicegah alat mana pun, jadi tidak dimodelkan."""
 
     def patch(runner, app) -> None:
         orig = app._r_product
@@ -823,7 +865,8 @@ def _buy_button_glitch_after_reload(move: bool):
         def render():
             out = orig()
             ra = app.refreshed_at
-            if ra is None or ra < app.sc.open_at or not ra + 0.3 <= app.now() < ra + 0.9:
+            end = float("inf") if move else 0.9
+            if ra is None or ra < app.sc.open_at or not ra + 0.3 <= app.now() < ra + end:
                 return out
             if not move:
                 return [(k, n) for k, n in out if k != "buy"]
@@ -1040,11 +1083,6 @@ def test_challenge_at_arm_is_returned_by_attempt(tmp_path, screen, status):
     _no_order(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: AndroidRunner._arm_sync men-set stop_event bersama (_signal_stop) saat captcha/verifikasi di arm, "
-    "lalu _attempt memanggil _checkpoint() SEBELUM mengembalikan _arm_state -> runner menghentikan dirinya "
-    "sendiri: hasil ABORTED 'dihentikan oleh runner lain' alih-alih CAPTCHA/VERIFICATION (result.json, "
-    "ringkasan CLI, dan exit code salah melaporkan penyebab; alarm & stop sendiri sudah benar)"))
 @pytest.mark.parametrize("screen, status", [("captcha", RunStatus.CAPTCHA),
                                             ("verification", RunStatus.VERIFICATION)])
 def test_challenge_at_arm_with_shared_stop_event_reports_challenge_not_aborted(tmp_path, screen, status):

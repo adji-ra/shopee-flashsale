@@ -12,6 +12,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from flashbuy import selector_store, timesync
 from flashbuy.android_driver import DriverError
@@ -263,14 +264,15 @@ def print_result(result, open_at: float) -> None:
     for col in ("Langkah", "Δ T", "Detail"):
         table.add_column(col)
     for name, rel_ms, detail in step_offsets(result, open_at):
-        table.add_row(name, f"{rel_ms:+,d} ms", detail)
+        # detail = teks layar (nama item, pesan): Text, bukan markup Rich ("[/promo]" tidak boleh crash)
+        table.add_row(Text(name), f"{rel_ms:+,d} ms", Text(detail))
     console.print(table)
     color = "green" if str(result.status) in OK_STATUSES else "red"
     console.print(f"Status: [bold {color}]{result.status}[/] - {escape(result.message)}", highlight=False)
     if result.detail:
         console.print(f"Detail: {escape(result.detail)}", highlight=False)
     for shot in result.screenshots:
-        console.print(f"Screenshot: {shot}")
+        console.print(Text(f"Screenshot: {shot}"))
 
 
 async def _hand_over_browser(runner, live: bool, status, headless: bool,

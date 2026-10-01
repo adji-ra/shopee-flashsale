@@ -116,20 +116,34 @@ class AndroidCalibrator:
                 return cands
             self.say(f"  {step.key}: tidak ada kandidat unik untuk elemen itu; ulangi atau 'lewati'.")
 
+    def _active(self, hits: list[Node]) -> Node:
+        """Beberapa elemen cocok (mis. konfirmasi sheet & tombol Beli di belakangnya bertulisan sama): pilih
+        yang ada di jendela AKTIF (model yang sama dengan verifikasi & runner), paling bawah di layar."""
+        if len(hits) == 1:
+            return hits[0]
+        active = []
+        for n in hits:
+            for by, value in (("text", n.text), ("description", n.desc)):
+                if value and any(f.bounds == n.bounds for f in self.d.find_all(Sel(by, value))):
+                    active.append(n)
+                    break
+        pool = active or hits
+        return max(enumerate(pool), key=lambda t: (t[1].bounds[3], t[0]))[1]
+
     def _default_hit(self, step: CalStep, nodes: list[Node]) -> Node | None:
         for sel in self.sel.candidates(step.key, self.variant):
-            for n in nodes:
-                if node_matches(n, sel):
-                    return n
+            hits = [n for n in nodes if node_matches(n, sel)]
+            if hits:
+                return self._active(hits)
         return None
 
-    @staticmethod
-    def _typed_hit(typed: str, nodes: list[Node]) -> Node | None:
+    def _typed_hit(self, typed: str, nodes: list[Node]) -> Node | None:
         exact = [n for n in nodes if typed in (n.text.strip(), n.desc.strip())]
         if exact:
-            return exact[0]
+            return self._active(exact)
         low = typed.lower()
-        return next((n for n in nodes if low in n.text.lower() or low in n.desc.lower()), None)
+        loose = [n for n in nodes if low in n.text.lower() or low in n.desc.lower()]
+        return self._active(loose) if loose else None
 
     def _verify(self, step: CalStep, node: Node, cands: list[dict], res: AndroidCalResult) -> list[dict]:
         """Simpan hanya kandidat yang di device menemukan elemen yang sama sebagai hasil pertama."""

@@ -329,15 +329,19 @@ keranjang, checkout, PIN, habis, captcha/verifikasi, login, loading, aplikasi la
 
 Kecepatan:
 - Hot path hanya memakai query satu-elemen di device (`info`/`exists`, satu pencarian pohon):
-  per iterasi polling = tombol Beli + satu query bahaya (captcha/verifikasi/PIN) + harga. Klasifikasi
-  layar = rantai `exists`/`info` berprioritas dengan regex gabungan. **Bukan** `dump_hierarchy`
+  per iterasi polling = tombol Beli + satu query bahaya (captcha/verifikasi/PIN/"Flash Sale telah
+  berakhir") + harga. Cek yang jarang perlu (penanda bahaya di content-desc, bottom sheet yang sudah
+  terbuka sebelum klik pertama) paling sering tiap 0,5 s, dan segera setelah setiap klik. Klasifikasi
+  layar = rantai `exists`/`info` berprioritas dengan regex gabungan. Query penanda hanya mencocokkan
+  teks pendek (≤ 120 karakter, di regex device) dan bukan "Habis" polos (lencana chip variasi lain;
+  tombol "Habis" dicari terpisah), supaya elemen cocok pertama tidak menutupi penanda sesungguhnya. **Bukan** `dump_hierarchy`
   (dump hanya untuk kalibrasi, diagnosa, dan status akhir `android-<ts>-<status>.xml`), dan bukan
   `info_list`, yang di u2.jar melakukan ~16 pencarian pohon per elemen cocok. `find_all` hanya dipakai
   untuk bacaan sempit di langkah maju (sheet, checkout, keranjang).
 - Toast Android (jendela terpisah, tidak ada di pohon node) dibaca lewat `getLastToast`.
 - Latensi tiap query diukur dan ditulis setelah run ke log (ringkasan median/p95/maks) dan
   `android-queries-run.csv`. Target info/exists < 100 ms, find_all < 300 ms; lebih = peringatan.
-- Koneksi u2: timeout per RPC 5 s (bawaan u2 tidak menerapkan timeout socket), TCP_NODELAY, dan restart
+- Koneksi u2: timeout per RPC 5 s, termasuk swipe reload & back (bawaan u2 300 s), TCP_NODELAY, dan restart
   agent implisit u2 dimatikan: agent yang dibunuh HiOS terlihat sebagai error, lalu di-restart
   eksplisit (tercatat, maks 2× saat polling). Query dibatasi ke package `com.shopee.id`.
 - Tidak ada sleep tetap; semua penantian berbasis kondisi + timeout. Indikator loading
@@ -349,6 +353,12 @@ Keamanan klik:
   T-1..T+8 s). Reload dihitung dari saat gestur/intent **selesai**.
 - Bila sempat menunggu slot, tombol Beli dibaca ulang tepat sebelum diklik (layar bisa sudah
   berganti ke checkout; koordinat lama tidak pernah dipakai).
+- Toast lama dibersihkan (`clearLastToast`) **sebelum** klik Beli/konfirmasi/"Buat Pesanan", jadi toast
+  reaksi klik itu sendiri tetap terbaca.
+- Bottom sheet yang sudah terbuka sebelum klik Beli pertama ditutup dengan back (sekali; tidak tertutup →
+  `ERROR`), tidak pernah dikonfirmasi tanpa pemilihan variasi.
+- Variasi yang dipilih di halaman produk saat arm diperiksa lagi setelah setiap reload; terlepas →
+  dipilih ulang sekali lewat gate (aksi polling) sebelum harga lapis 1 dibaca.
 - Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"
   (`UNKNOWN_STATE` + pesan wajib + alarm).
 
@@ -359,8 +369,9 @@ Pembacaan harga di aplikasi (aksesibilitas Android tidak memberi tahu teks yang 
 - keranjang (lapis 2): teks ditempelkan ke checkbox terdekat; dengan `expected_name`, satu-satunya item
   tercentang pun harus target; centang ditunggu terbarui (≤ 2 s) setelah uncheck;
 - checkout (lapis 3): harga pada baris yang sama dengan penanda "x1" (harga coret sebaris yang lebih
-  kecil diabaikan; seri → diambil yang terbesar); nama dicocokkan hanya di kolom produk (bukan nama
-  toko); `variant` dari config harus terlihat di baris produk; "Total Pembayaran"/ongkir dari testID
+  kecil diabaikan; seri → diambil yang terbesar); nama dicocokkan di kartu produk tanpa header toko;
+  `variant` dari config harus terlihat di baris "Variasi" (bukan di nama produk; tanda baca/spasi
+  bebas); "Total Pembayaran"/ongkir dari testID
   (`labelTotalPayment`, `labelShippingFinalPrice`) **dan** label baris (harus diawali label, jadi badge
   "Gratis Ongkir" diabaikan), semua harus sama; stabil ≥ 100 ms, atau ≥ 1 s setelah ganti metode
   bayar/uncheck keranjang (server menghitung ulang total & promo);
@@ -403,4 +414,6 @@ headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`). Lint: `ruff check
 - Deteksi captcha/verifikasi berbasis teks/URL/selector. Teks lemah hanya dicari di
   dialog/toast agar deskripsi penjual tidak memicu stop palsu, sehingga captcha yang tampil
   tanpa dialog bisa terlewat. Karena itu tetap awasi layar.
+- Android: captcha yang hanya punya content-desc (tanpa teks) dicek paling sering tiap 0,5 s demi
+  kecepatan klik di T, jadi bisa ada satu klik Beli sebelum terdeteksi (berhenti sebelum konfirmasi).
 - Checkout `--live` memotong saldo ShopeePay sungguhan setelah Anda memasukkan PIN.

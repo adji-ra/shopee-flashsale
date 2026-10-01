@@ -258,10 +258,20 @@ class OverlayCaptchaApp(FakeShopeeApp):
         return out
 
 
+class DescCaptchaOverlayApp(FakeShopeeApp):
+    """Dialog captcha di atas halaman produk saat slot buka yang HANYA ber-content-desc (mis. WebView)."""
+
+    def _r_product(self):
+        out = super()._r_product()
+        if self.sale_active():
+            out.append(("", Node(desc="Geser untuk verifikasi", bounds=(100, 700, 620, 750))))
+        return out
+
+
 class _AsyncToastApp(FakeShopeeApp):
     """Toast Android ASINKRON seperti di HP (tap -> handler aplikasi -> NotificationManager -> event aksesibilitas):
-    baru tercatat di getLastToast `toast_delay_s` setelah tap, jadi clear_toast runner tepat setelah klik tidak
-    menghapusnya. clearLastToast hanya menghapus toast yang sudah tercatat. toast_mode="node": overlay in-app."""
+    baru tercatat di getLastToast `toast_delay_s` setelah tap (clear_toast runner terjadi sebelum klik).
+    clearLastToast hanya menghapus toast yang sudah tercatat. toast_mode="node": overlay in-app."""
 
     toast_delay_s = 0.06
 
@@ -425,22 +435,20 @@ def test_challenge_after_buy_stops_all_without_retry(tmp_path, live, flag, statu
 @pytest.mark.parametrize("as_desc", [False, True], ids=["text", "content_desc"])
 def test_challenge_texts_detected_in_text_or_content_desc(tmp_path, monkeypatch, flag, label, status, as_desc):
     """Teks challenge (text) -> CAPTCHA/VERIFICATION segera. Hanya content-desc (mis. WebView beraksesibilitas):
-    hot path hanya membaca text, jadi layar ini UNKNOWN; content-desc baru dibaca SEKALI oleh diagnosa saat
-    eskalasi -> UNKNOWN_STATE (juga stop semua + alarm + tanpa retry) dengan teksnya di pesan."""
+    dibaca di ujung rantai klasifikasi (sebelum layar dianggap UNKNOWN) -> status challenge yang sama, segera
+    (bukan menunggu jaring UNKNOWN 1,5 s), stop semua + alarm + tanpa retry."""
     attrs = _stop()
     out = _run(tmp_path, monkeypatch, app_cls=_text_screen_app(label, as_desc=as_desc), live=True,
                runner_attrs=attrs, **{flag: True})
     buy = _one_buy(out)
     dt = _step_t(out, "result") - buy["t_server_ms"]
     if as_desc:
-        assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
-        assert f"content-desc: {label[:30]}" in out.result.message
-        assert "> 1.5 s" in out.result.message
-        assert 1500 <= dt <= 2500, f"jaring UNKNOWN_STATE (1,5 s) setelah klik, dapat {dt} ms"
-        # diagnosa mahal hanya sekali (saat eskalasi), bukan tiap iterasi
-        desc_queries = [t for op, t in out.driver.calls if op == "find_all" and t.startswith("descriptionMatches")]
-        assert len(desc_queries) == 1, desc_queries
-        _alarmed(out, RunStatus.UNKNOWN_STATE)
+        assert out.result.status == status, out.result.message
+        assert "content-desc" in out.result.message and label[:40] in out.result.message
+        assert dt < 600, f"challenge di content-desc harus terdeteksi tanpa menunggu jaring UNKNOWN, dapat {dt} ms"
+        # tanpa diagnosa mahal (find_all content-desc) - cukup satu info descriptionMatches per klasifikasi
+        assert not [t for op, t in out.driver.calls if op == "find_all" and t.startswith("descriptionMatches")]
+        _alarmed(out, status)
     else:
         assert out.result.status == status, out.result.message
         assert label[:40] in out.result.message
@@ -482,8 +490,8 @@ def test_challenge_at_precheck_stops_all_without_raising(tmp_path, monkeypatch, 
 ])
 def test_challenge_when_opening_product_at_arm_stops_without_polling(tmp_path, monkeypatch, screen, status):
     """Captcha/verifikasi saat buka produk (T-60 s): alarm + stop_event SEGERA (saat arm, bukan menunggu T),
-    alarm hanya sekali, tanpa polling/klik, layar dibiarkan. Status akhir dengan stop_event bersama: lihat tes
-    xfail test_challenge_at_arm_with_shared_stop_event_reports_challenge_status."""
+    alarm hanya sekali, tanpa polling/klik, layar dibiarkan. Status akhir dengan stop_event bersama: lihat
+    test_challenge_at_arm_with_shared_stop_event_reports_challenge_status."""
     ev = _RecordingEvent()
     out = _run(tmp_path, monkeypatch, app_cls=_arm_screen_app(screen), setup=lambda r, a, d: ev.attach(r),
                live=True, runner_attrs={"stop_event": ev})
@@ -517,11 +525,6 @@ def test_challenge_at_arm_is_returned_by_attempt_and_alarms_once(tmp_path, monke
     _no_order(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: AndroidRunner._attempt memanggil _checkpoint() SEBELUM mengembalikan _arm_state/_arm_failure; arm "
-    "sendiri sudah men-set stop_event bersama (_signal_stop) saat captcha/verifikasi -> runner menganggap dirinya "
-    "dihentikan runner lain: hasil ABORTED 'dihentikan oleh runner lain' alih-alih CAPTCHA/VERIFICATION "
-    "(result.json/ringkasan salah melaporkan penyebab; alarm & stop sudah benar)"))
 @pytest.mark.parametrize("screen, status", [("captcha", RunStatus.CAPTCHA), ("verification", RunStatus.VERIFICATION)])
 def test_challenge_at_arm_with_shared_stop_event_reports_challenge_status(tmp_path, monkeypatch, screen, status):
     out = _run(tmp_path, monkeypatch, app_cls=_arm_screen_app(screen), live=True, runner_attrs=_stop())
@@ -658,7 +661,8 @@ def test_unknown_screen_after_buy_within_unknown_limit(tmp_path, live, flag, scr
     assert evidence in out.result.message
     buy = _one_buy(out)
     dt = _step_t(out, "result") - buy["t_server_ms"]
-    assert 500 <= dt <= 900, f"UNKNOWN_STATE harus ~0,5 s setelah klik, dapat {dt} ms"
+    # batas + paling lama ~2 iterasi klasifikasi UNKNOWN (10 query satu objek @20 ms) + diagnosa sekali
+    assert 500 <= dt <= 1000, f"UNKNOWN_STATE harus ~0,5 s setelah klik, dapat {dt} ms"
     assert "no_response" not in out.step_names(), "layar tak dikenal bukan 'tidak ada reaksi' (tanpa klik ulang)"
     # diagnosa (aplikasi aktif, WebView, content-desc) hanya sekali saat eskalasi
     after = _ops(out)[_ops(out).index("click"):]
@@ -752,7 +756,7 @@ def test_sold_out_message_with_sheet_still_open_stops_without_reconfirm(tmp_path
 
 
 def test_stale_toast_before_buy_click_is_not_read_as_reaction(tmp_path, monkeypatch):
-    """Toast lama ('Stok habis' dari sebelum T) masih tercatat di getLastToast: clear_toast tepat setelah klik
+    """Toast lama ('Stok habis' dari sebelum T) masih tercatat di getLastToast: clear_toast tepat sebelum klik
     Beli membuangnya, jadi tidak dibaca sebagai reaksi klik (bukan SOLD_OUT palsu)."""
     stale = "Stok habis"
     out = _run(tmp_path, monkeypatch, setup=lambda r, a, d: setattr(a, "last_toast", stale))
@@ -762,7 +766,7 @@ def test_stale_toast_before_buy_click_is_not_read_as_reaction(tmp_path, monkeypa
     _one_buy(out)
     ops = _ops(out)
     first_click = ops.index("click")
-    assert ops[first_click + 1] == "clear_toast"
+    assert "clear_toast" in ops[first_click - 2:first_click]  # sebelum klik (mungkin + cek ulang tombol)
     assert "last_toast" not in ops[:first_click], "toast tidak dibaca di hot path polling"
     assert "last_toast" in ops[first_click:], "reaksi klik dibaca dari kanal toast"
     assert out.app.last_toast is None
@@ -888,38 +892,48 @@ def test_flash_sale_banner_classification_all_contexts(tmp_path):
     log.close()
 
 
-def test_flash_sale_ended_banner_with_buy_button_stops_right_after_click(tmp_path, monkeypatch):
-    """Iterasi polling hanya membaca tombol Beli + satu query bahaya + harga (bukan banner). Banner 'telah
-    berakhir' dengan tombol Beli aktif & harga lolos lapis 1 -> paling banyak satu klik Beli, lalu SOLD_OUT
-    segera setelahnya (banner dibaca klasifikasi 'after_buy'), tanpa konfirmasi/checkout/klik ulang."""
+def test_flash_sale_ended_banner_with_buy_button_stops_without_click(tmp_path, monkeypatch):
+    """Query bahaya hot path ikut memuat penanda kuat 'Flash Sale telah/sudah berakhir': banner itu dengan tombol
+    Beli aktif & harga lolos lapis 1 -> SOLD_OUT segera saat slot buka, TANPA klik Beli (bukan setelah klik)."""
     attrs = _stop()
     out = _run(tmp_path, monkeypatch, app_cls=SaleEndedApp, live=True, runner_attrs=attrs)
     assert out.result.status == RunStatus.SOLD_OUT, out.result.message
     assert out.result.message == "teks 'Flash Sale telah berakhir'"
-    buy = _one_buy(out)
-    assert _step_t(out, "result") - buy["t_server_ms"] < 400
-    assert out.kind("confirm") == [] and out.kind("checkout") == []
-    assert out.app.events[-1] == buy, "tidak ada aksi lagi setelah habis terbaca"
-    assert not attrs["stop_event"].is_set()
-    assert_polling_rules(out)
+    assert out.kind("buy") == [] and out.kind("tap") == [] and "click" not in _ops(out)
+    assert _step_t(out, "result") - _t(out) < 300, "terbaca di iterasi polling pertama setelah slot buka"
+    assert polling_actions(out) == [], "tanpa reload/klik"
+    assert not attrs["stop_event"].is_set()  # SOLD_OUT bukan STOP_ALL
     _no_order(out)
 
 
 @pytest.mark.parametrize("reload", ["swipe", "intent"])
 def test_flash_sale_ended_with_normal_price_is_sold_out_without_click(tmp_path, monkeypatch, reload):
-    """Realistis: flash sale berakhir -> harga kembali normal (> max_item_price): lapis 1 tidak mengklik; setelah
-    reload (T+0,5 s) banner 'telah berakhir' terbaca -> SOLD_OUT tanpa klik Beli sama sekali."""
+    """Realistis: flash sale berakhir -> harga kembali normal (> max_item_price): lapis 1 tidak mengklik dan banner
+    'telah berakhir' terbaca langsung di query bahaya -> SOLD_OUT tanpa klik Beli dan tanpa reload."""
     out = _run(tmp_path, monkeypatch, app_cls=SaleEndedApp, live=True, flash_price=150_000,
                cfg={"android": {"reload": reload}})
     assert out.result.status == RunStatus.SOLD_OUT, out.result.message
     assert "berakhir" in out.result.message
     assert out.kind("buy") == [] and out.kind("tap") == []
     assert "click" not in _ops(out)
-    assert out.step_names().count("reload") == 1
-    assert_polling_rules(out)
-    acts = polling_actions(out)
-    assert len(acts) == 1 and acts[0] >= _t(out) + 500, "satu-satunya aksi polling = reload pertama T+0,5 s"
-    assert _step_t(out, "result") - acts[0] < 400
+    assert "reload" not in out.step_names() and polling_actions(out) == []
+    assert _step_t(out, "result") - _t(out) < 300
+    _no_order(out)
+
+
+def test_desc_only_captcha_overlay_on_product_page_stops_quickly(tmp_path, monkeypatch):
+    """Captcha yang hanya ber-content-desc dicek pra-klik paling lama tiap 0,5 s (bukan tiap iterasi, demi
+    kecepatan klik di T) dan SEGERA setelah klik: paling banyak SATU klik Beli, lalu CAPTCHA sebelum sheet
+    dikonfirmasi - walau dialog tidak menahan tap - tanpa klik ulang/konfirmasi/checkout, stop semua + alarm."""
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=DescCaptchaOverlayApp, live=True, runner_attrs=attrs)
+    assert out.result.status == RunStatus.CAPTCHA, out.result.message
+    assert out.result.message.startswith("content-desc teks 'Geser untuk verifikasi'")
+    assert len(out.kind("buy")) <= 1 and out.kind("confirm") == [] and out.kind("checkout") == []
+    assert "no_response" not in out.step_names()
+    assert _step_t(out, "result") - _t(out) < 1000
+    assert attrs["stop_event"].is_set()
+    _alarmed(out, RunStatus.CAPTCHA)
     _no_order(out)
 
 
@@ -931,12 +945,6 @@ def test_long_description_with_marker_words_is_not_a_challenge(tmp_path, monkeyp
     assert not out.runner.stop_event.is_set()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: AndroidRunner._wait_ready/_classify - query bahaya = SATU info(textMatches gabungan captcha|verifikasi|"
-    "PIN) yang hanya mengembalikan elemen cocok PERTAMA (urutan dokumen); filter MARKER_MAX_CHARS (120) baru "
-    "diterapkan di klien. Deskripsi produk panjang yang menyebut 'kode OTP' di atas dialog captcha menutupi "
-    "dialog itu -> Beli diklik di bawah captcha, sheet dikonfirmasi, dan (live) 'Buat Pesanan' diklik. "
-    "Perbaikan: batasi panjang di regex device (mis. (?=.{1,120}$)) atau periksa semua kecocokan"))
 def test_long_description_does_not_mask_captcha_dialog_on_product_page(tmp_path, monkeypatch):
     attrs = _stop()
     out = _run(tmp_path, monkeypatch, app_cls=_with_description(OverlayCaptchaApp), live=True, runner_attrs=attrs)
@@ -954,11 +962,6 @@ _MASKED_SOLD_OUT = pytest.mark.parametrize("scenario", [
 ], ids=["at_open", "on_confirm_toast", "on_confirm_node"])
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: AndroidRunner._classify - penanda pesan (sold_out|variant_required|error_toast|not_started) dibaca dengan "
-    "SATU info (elemen cocok pertama); chip variasi lain 'Habis' (bukan tombol, tidak dihitung _sold_counts) yang "
-    "lebih awal di pohon menutupi tombol 'Habis' / pesan 'Stok habis' sesudahnya -> UNKNOWN -> UNKNOWN_STATE palsu "
-    "setelah 1,5 s (stop SEMUA runner + alarm) alih-alih SOLD_OUT"))
 @_MASKED_SOLD_OUT
 def test_other_variant_chip_habis_does_not_mask_real_sold_out(tmp_path, scenario):
     out = run_android(tmp_path, variant_chip_sold_out=True, runner_attrs=_stop(), **scenario)
@@ -968,10 +971,11 @@ def test_other_variant_chip_habis_does_not_mask_real_sold_out(tmp_path, scenario
 
 @_MASKED_SOLD_OUT
 def test_other_variant_chip_habis_with_real_sold_out_never_retries_or_orders(tmp_path, scenario):
-    """Pengaman yang tetap berlaku walau sinyal habis tertutup chip (lihat xfail di atas): tanpa klik ulang Beli,
-    tanpa reload, tanpa konfirmasi ulang/checkout/pesanan; berhenti fail-closed (SOLD_OUT atau UNKNOWN_STATE)."""
+    """Live: chip variasi lain 'Habis' tidak menutupi sinyal habis -> SOLD_OUT tanpa klik ulang Beli, tanpa
+    reload, tanpa konfirmasi ulang/checkout/pesanan, tanpa stop-semua."""
     out = run_android(tmp_path, live=True, variant_chip_sold_out=True, runner_attrs=_stop(), **scenario)
-    assert out.result.status in (RunStatus.SOLD_OUT, RunStatus.UNKNOWN_STATE), out.result.message
+    assert out.result.status == RunStatus.SOLD_OUT, out.result.message
+    assert not out.runner.stop_event.is_set()
     assert len(out.kind("buy")) == (0 if scenario.get("sold_out") else 1) and out.kind("buy_disabled") == []
     assert len(out.kind("confirm")) == (0 if scenario.get("sold_out") else 1)
     assert out.kind("refresh") == [] and out.kind("checkout") == []
@@ -979,11 +983,6 @@ def test_other_variant_chip_habis_with_real_sold_out_never_retries_or_orders(tmp
     _no_order(out)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: AndroidRunner._classify - sama dengan di atas: chip variasi lain 'Habis' yang lebih awal di pohon "
-    "menutupi tombol 'Ingatkan Saya' (penanda not_started) karena hanya elemen cocok pertama yang dibaca; tanpa "
-    "banner 'dimulai dalam' halaman yang belum dibuka jadi UNKNOWN -> slot telat > 1,5 s memicu UNKNOWN_STATE "
-    "palsu (stop semua runner + alarm)"))
 def test_other_variant_chip_habis_does_not_mask_ingatkan_saya_late_slot(tmp_path):
     out = run_android(tmp_path, button_before_open="Ingatkan Saya", variant_chip_sold_out=True, flash_banner=False,
                       sale_skew_ms=2500, open_in_s=40, runner_attrs={"open_timeout_s": 1.0, **_stop()})

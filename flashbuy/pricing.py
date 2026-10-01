@@ -63,7 +63,7 @@ def order_counts(text: str | None) -> list[int]:
     return [int(n) for n in _ORDER_COUNT_RE.findall(normalize(text))]
 
 
-def _squash(text: str) -> str:
+def squash(text: str) -> str:
     """Huruf kecil, hanya huruf & angka ("128GB, Hitam" ~ "128GB Hitam")."""
     return re.sub(r"[\W_]+", "", normalize(text).lower())
 
@@ -115,6 +115,22 @@ class CartRow:
 
 def name_matches(text: str, name: str | None) -> bool:
     return bool(name) and normalize(name).lower() in normalize(text).lower()
+
+
+_VARIANT_LINE_RE = re.compile(r"\s*variasi\b", re.I)
+
+
+def variant_text(text: str, expected_name: str | None = None) -> str:
+    """Teks variasi pesanan: baris yang diawali "Variasi". Tanpa baris itu: baris selain nama produk
+    (baris pertama / yang memuat expected_name), harga, dan kuantitas. Nama produk TIDAK ikut, supaya judul
+    "Kaos Hitam Putih" tidak meloloskan variasi "Hitam" saat baris variasi menunjukkan "Putih"."""
+    lines = [ln for ln in normalize(text).splitlines() if ln.strip()]
+    labelled = [ln for ln in lines if _VARIANT_LINE_RE.match(ln)]
+    if labelled:
+        return "\n".join(labelled)
+    rest = [ln for ln in lines[1:] if not find_amounts(ln) and parse_qty(ln) is None
+            and not name_matches(ln, expected_name)]
+    return "\n".join(rest)
 
 
 @dataclass
@@ -225,8 +241,8 @@ def check_checkout(snap: CheckoutSnapshot, limits: Limits) -> CheckoutVerdict:
         if not values["name_ok"]:
             reasons.append(f"nama produk tidak memuat {limits.expected_name!r}")
     if limits.expected_variant:
-        haystack = " ".join(snap.rows) if snap.rows else snap.page_text
-        values["variant_ok"] = _squash(limits.expected_variant) in _squash(haystack)
+        haystack = variant_text(" \n".join(snap.rows) if snap.rows else snap.page_text, limits.expected_name)
+        values["variant_ok"] = bool(haystack) and squash(limits.expected_variant) in squash(haystack)
         if not values["variant_ok"]:
             reasons.append(f"variasi {limits.expected_variant!r} tidak terlihat di baris produk")
 

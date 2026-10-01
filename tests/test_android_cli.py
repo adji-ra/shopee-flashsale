@@ -515,13 +515,14 @@ def assert_safe_ops(dev: Device) -> None:
     no_forbidden_shell(dev)
 
 
-def assert_toast_cleared_after_clicks(dev: Device) -> int:
-    """clear_toast (operasi agent) tepat setelah setiap klik Beli / konfirmasi sheet / Buat Pesanan."""
+def assert_toast_cleared_before_clicks(dev: Device) -> int:
+    """clear_toast (operasi agent) tepat sebelum setiap klik Beli / konfirmasi sheet / Buat Pesanan."""
     calls = dev.driver.calls
     idx = [i for i, (op, target) in enumerate(calls) if op == "click" and target in TOAST_CLEARED_CLICKS]
     assert idx, "tidak ada klik Beli/konfirmasi/Buat Pesanan"
     for i in idx:
-        assert calls[i + 1] == ("clear_toast", ""), calls[i:i + 3]
+        j = i - 1 if calls[i - 1] != ("info", "text='Beli Sekarang'") else i - 2  # cek ulang tombol setelah slot
+        assert calls[j] == ("clear_toast", ""), calls[i - 3:i + 1]
     return len(idx)
 
 
@@ -617,12 +618,13 @@ def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
     assert out.dev.app.screen == "checkout", "aplikasi dibiarkan di checkout (tidak ditutup)"
     assert_safe_ops(out.dev)
     assert alarms == []
-    # klik Beli & konfirmasi sheet langsung diikuti clear_toast (operasi agent, tidak menyentuh aplikasi)
-    assert assert_toast_cleared_after_clicks(out.dev) == 2
-    # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists), tanpa find_all/toast/dump
+    # klik Beli & konfirmasi sheet tepat didahului clear_toast (operasi agent, tidak menyentuh aplikasi)
+    assert assert_toast_cleared_before_clicks(out.dev) == 2
+    # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists) + clear_toast sebelum klik,
+    # tanpa find_all/baca toast/dump
     t_poll, t_click = out.step("poll_start")["t_server_ms"], out.step("click_buy")["t_server_ms"]
     hot = {r["op"] for r in run_csv(out) if t_poll <= int(r["t_server_ms"]) <= t_click}
-    assert hot and hot <= {"info", "exists"}, hot
+    assert hot and hot <= {"info", "exists", "clear_toast"}, hot
     # log run: device props, latensi query precheck & run, screenshot + dump status akhir
     log = (out.run_dir / "android.log").read_text(encoding="utf-8")
     assert "device ro.product.model = TECNO BG6" in log and f"device wm size = {WM_SIZE}" in log
@@ -646,7 +648,7 @@ def test_run_android_live_e2e_stops_at_pin_and_leaves_app_open(tmp_path, device,
     _subsequence(out.step_names(), ["price_guard_ok", "place_order_gate", "click_place_order", "pin_screen"])
     assert alarms == ["ORDER_PLACED_AWAIT_PIN"]
     # Beli, konfirmasi sheet, Buat Pesanan: masing-masing langsung diikuti clear_toast
-    assert assert_toast_cleared_after_clicks(out.dev) == 3
+    assert assert_toast_cleared_before_clicks(out.dev) == 3
     # setelah klik "Buat Pesanan" tidak ada klik/tombol/intent lagi (layar PIN tidak disentuh)
     calls = out.dev.driver.calls
     after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
@@ -708,7 +710,7 @@ def test_run_android_variant_required_message_via_both_channels_is_error(tmp_pat
         assert out.dev.app.sc.toast_mode == "toast"
         assert out.dev.app.last_toast == VARIANT_TOAST, "pesan hanya ada di kanal getLastToast"
         assert "last_toast" in out.dev.ops()
-    assert_toast_cleared_after_clicks(out.dev)
+    assert_toast_cleared_before_clicks(out.dev)
     assert_safe_ops(out.dev)
     assert alarms == []
 
@@ -1100,12 +1102,6 @@ def test_calibrate_android_records_ordered_candidates_without_tapping(tmp_path, 
     assert_ordered(loaded.steps)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_calibrate tidak konsisten dengan model jendela aktif. Elemen dicari di dump (SEMUA jendela, "
-    "urutan dokumen) lalu diverifikasi dengan find_all (jendela AKTIF saja). Tombol konfirmasi bottom sheet "
-    "bertulisan sama dengan tombol 'Beli Sekarang' halaman produk di belakang sheet -> _default_hit/_typed_hit "
-    "memilih tombol di belakang sheet, semua kandidat gagal verifikasi (bounds beda), langkah sheet_confirm "
-    "diulang terus sampai pengguna mengetik 'lewati': resource-id konfirmasi sheet tidak pernah bisa direkam."))
 def test_calibrate_android_sheet_confirm_same_text_as_buy_button_behind_sheet(tmp_path, device, term):
     sel_path = tmp_path / "selectors.json"
     dev = device(time.time() + 3600, app_cls=CalibApp)
@@ -1210,12 +1206,6 @@ def test_run_android_console_warn_lines_keep_platform_tag(tmp_path, device, term
     assert step_lines and all("[android] STEP" in line for line in step_lines), step_lines
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: cli.print_result mengisi sel Detail tabel Timeline (detail langkah = teks layar: nama item keranjang, "
-    "pesan hasil) TANPA escape markup Rich (hanya baris Status/Detail yang di-escape). '[iPhone ...]' hilang dari "
-    "timeline; '[/promo] ...' melempar MarkupError sehingga print_result crash SEBELUM baris 'Status:' -> "
-    "traceback dari cli.main, ringkasan & 'Log:' tidak tercetak (di live: baris 'Status: UNKNOWN_STATE - "
-    "Pesanan MUNGKIN sudah terbuat' hilang dari ringkasan; masih ada di baris log RunLog & alarm)."))
 @pytest.mark.parametrize("case", ["tag_lowercase", "closing_tag_live"])
 def test_run_android_timeline_keeps_bracketed_screen_text(tmp_path, device, term, case):
     if case == "tag_lowercase":
@@ -1232,12 +1222,13 @@ def test_run_android_timeline_keeps_bracketed_screen_text(tmp_path, device, term
 
 def test_run_android_live_maybe_ordered_safety_holds_even_if_console_rendering_fails(tmp_path, device, term,
                                                                                      alarms):
-    """Teks layar '[/...' (nama item keranjang yang di-uncheck) boleh merusak ringkasan konsol (lihat xfail di
-    atas), tetapi keselamatan tetap: satu pesanan, alarm sekali, hasil + pesan wajib tersimpan & tampil di baris
-    log, aplikasi dibiarkan terbuka, tanpa retry. Lolos baik sebelum maupun sesudah bug konsol diperbaiki."""
+    """Teks layar '[/...' (nama item keranjang yang di-uncheck) tidak merusak ringkasan konsol, dan keselamatan
+    tetap: satu pesanan, alarm sekali, hasil + pesan wajib tersimpan & tampil di ringkasan dan baris log,
+    aplikasi dibiarkan terbuka, tanpa retry."""
     out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, go_cart=True,
                   cart_other_items=[(CLOSING_TAG_ITEM, 5_000, True)], unknown_after_order=True, catch=True)
-    assert out.rc in (1, None), out.text  # None = cli.main melempar (bug konsol di atas)
+    assert out.error is None and out.rc == 1, out.error or out.text
+    assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
     assert out.result["status"] == "UNKNOWN_STATE" and out.result["message"] == MAYBE_ORDERED_MSG
     assert [e["detail"] for e in out.dev.app.kind("cart_toggle")] == [CLOSING_TAG_ITEM], "item lain di-uncheck"
     assert len(out.buys()) == 1 and len(out.dev.app.kind("order")) == 1, "tepat satu pesanan, tanpa retry"

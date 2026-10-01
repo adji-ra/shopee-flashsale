@@ -64,10 +64,10 @@ class AppScenario:
     screen_on: bool = True
     locked: bool = False
     stay_on: str = "3"
-    pin_title: str | None = "Masukkan PIN ShopeePay"
+    pin_title: str | None = "Masukkan PIN ShopeePay"  # None: layar PIN tanpa teks (hanya resource-id)
     # "toast": pesan = Toast Android (jendela terpisah, hanya terbaca lewat getLastToast);
-    # "node": pesan in-app (overlay React Native) yang ada di pohon node
-    toast_mode: str = "toast"  # None: layar PIN tanpa teks (hanya resource-id)
+    # "node": pesan in-app (overlay React Native) yang ada di pohon node; "lost": tidak terbaca sama sekali
+    toast_mode: str = "toast"
 
 
 def _n(text: str = "", bounds=(0, 0, 0, 0), **kw) -> Node:

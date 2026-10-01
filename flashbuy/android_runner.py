@@ -25,7 +25,7 @@ import asyncio
 import re
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -48,6 +48,7 @@ from flashbuy.android_screen import (
     RP_ANY_MATCH,
     RP_SHORT_MATCH,
     SHIPPING_LABEL_MATCH,
+    SP,
     TOTAL_LABEL_MATCH,
     cart_rows,
     checkout_count,
@@ -94,6 +95,8 @@ KEEPALIVE_EVERY_S = 2.0  # cek agent uiautomator2 antara arm dan T
 KEEPALIVE_STOP_BEFORE_S = 3.0  # berhenti cek agent T-3 s (supaya tidak bersaing dengan hot path)
 MARKER_MAX_CHARS = 120  # penanda status hanya dicari di teks pendek (bukan deskripsi produk)
 MAX_AGENT_RESTARTS = 2  # restart agent maksimal saat polling (HiOS bisa membunuhnya)
+GUARD_FRESH_S = 0.5  # cek pra-klik (content-desc bahaya, sheet sebelum klik pertama) dianggap segar selama ini
+SHEET_CLOSE_S = 1.0  # sheet yang ditutup dengan back harus hilang dalam waktu ini
 UNKNOWN_DIAG_AFTER_S = 0.3  # diagnosa mahal (aplikasi aktif, content-desc) hanya saat UNKNOWN bertahan
 _NO_PRICE = "\u0000"
 
@@ -109,6 +112,25 @@ PAYMENT_METHOD_MATCH = (r"(?is).*(shopeepay|spaylater|\bcod\b|cek dulu|bayar di 
 BARE_SOLD_OUT = ("habis",)  # "Habis" polos: hanya dihitung bila berupa tombol (bukan lencana chip variasi)
 BOTTOM_BAR_FRACTION = 0.85  # pusat elemen di bawah 85% tinggi layar = area tombol bawah
 _PS_COMPETITORS = re.compile(r"io\.appium\S*|com\.github\.uiautomator\S*", re.I)
+
+
+VARIANT_LINE_MATCH = rf"(?is){SP}*variasi\b.*"  # baris "Variasi: ..." di checkout (dibaca lapis 3)
+_LOOSE_GAP = r"[\W_]*"  # tanda baca/spasi apa pun (Java & Python, ASCII)
+
+
+def _loose_match(text: str | None) -> str | None:
+    """Regex device: teks yang memuat `text` dengan tanda baca/spasi bebas di antara huruf & angka."""
+    chars = pricing.squash(text or "")
+    return rf"(?is).*{_LOOSE_GAP.join(re.escape(c) for c in chars)}.*" if chars else None
+
+
+DANGER = ("captcha", "verification", "pin")
+MESSAGES = ("sold_out", "variant_required", "error_toast", "not_started")
+# Query penanda di device: hanya teks pendek (bukan paragraf deskripsi produk) dan bukan "Habis" polos (lencana
+# chip variasi lain). Elemen cocok PERTAMA yang dikembalikan, jadi teks yang diabaikan klien tidak boleh
+# menutupi penanda sesungguhnya di belakangnya. "Habis" polos dicari terpisah (_bare_sold_out).
+_MARKER_PREFIX = (rf"(?=[\s\S]{{1,{MARKER_MAX_CHARS}}}$)"
+                  rf"(?!(?i:{SP}*(?:{'|'.join(map(re.escape, BARE_SOLD_OUT))}){SP}*)$)")
 
 
 class Screen(StrEnum):
@@ -194,6 +216,10 @@ class AndroidRunner:
         self._cand_cache: dict[str, list[Sel]] = {}
         self._union_cache: dict[tuple, Sel | None] = {}
         self._markers = {name: selectors.marker_re(name) for name in selectors.markers}
+        self._ended = tuple(p for p in selectors.marker("sold_out") if "berakhir" in p.lower())
+        self._guard_at = float("-inf")
+        self._recheck_variant = False
+        self._variant_on_page = False
         self._keepalive: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._alarmed: set[str] = set()
@@ -312,21 +338,51 @@ class AndroidRunner:
         pats = [r for step in steps for c in self._cands(step) if (r := text_regex(c)) is not None]
         return pats + [p for name in markers for p in self.sel.marker(name)]
 
-    def _union(self, steps: tuple[str, ...] = (), markers: tuple[str, ...] = (), extra: tuple[str, ...] = ()
-               ) -> Sel | None:
-        key = (steps, markers, extra)
+    def _union(self, steps: tuple[str, ...] = (), markers: tuple[str, ...] = (), extra: tuple[str, ...] = (),
+               short: bool = False, by: str = "textMatches") -> Sel | None:
+        """Satu selector regex gabungan. short=True: query penanda (teks pendek, bukan "Habis" polos)."""
+        key = (steps, markers, extra, short, by)
         if key not in self._union_cache:
             pats = [*self._patterns(steps, markers), *extra]
-            self._union_cache[key] = Sel("textMatches", union(pats)) if pats else None
+            rx = union(pats) if pats else None
+            if rx is not None and short:
+                rx = f"{_MARKER_PREFIX}(?:{rx})"
+            self._union_cache[key] = Sel(by, rx) if rx is not None else None
         return self._union_cache[key]
 
     def _rid_cands(self, *steps: str) -> list[Sel]:
         return [c for s in steps for c in self._cands(s) if c.by in ("resourceId", "resourceIdMatches")]
 
     def _first(self, steps: tuple[str, ...] = (), markers: tuple[str, ...] = ()) -> Node | None:
-        """Elemen pertama yang cocok salah satu pola (1 query info)."""
-        sel = self._union(steps, markers)
+        """Elemen pertama yang cocok salah satu pola (1 query info). Penanda: hanya teks pendek."""
+        sel = self._union(steps, markers, short=bool(markers) and not steps)
         return self.d.info(sel) if sel is not None else None
+
+    def _danger(self, buy: Node | None, context: str, by: str = "textMatches") -> Seen | None:
+        """Captcha / verifikasi / PIN / "Flash Sale telah berakhir" dalam 1 query (teks pendek saja).
+        Banner berakhir yang kebetulan lebih awal di pohon tidak boleh menutupi captcha: dicek ulang."""
+        def query(sel: Sel | None) -> Node | None:
+            n = self.d.info(sel)
+            # node cocok lewat content-desc: nilai penanda dari desc (label = text bila text tidak kosong)
+            return replace(n, text=n.desc) if n is not None and by != "textMatches" else n
+
+        n = query(self._union(markers=DANGER, extra=self._ended, short=True, by=by))
+        if n is None:
+            return None
+        seen = self._message_screen(n, buy, context)
+        if seen is not None and seen.screen == Screen.SOLD_OUT:
+            n2 = query(self._union(markers=DANGER, short=True, by=by))
+            if n2 is not None and (seen2 := self._message_screen(n2, buy, context)) is not None:
+                return seen2
+        return seen
+
+    def _bare_sold_out(self, context: str) -> Seen | None:
+        """Tombol "Habis" polos (bukan lencana chip variasi lain). find_all: semua kecocokan dinilai."""
+        pat = rf"(?i){SP}*(?:{'|'.join(map(re.escape, BARE_SOLD_OUT))}){SP}*"
+        for n in self.d.find_all(Sel("textMatches", pat)):
+            if self._sold_counts(n, None, context):
+                return Seen(Screen.SOLD_OUT, f"tombol {n.label!r}", n)
+        return None
 
     def _has(self, *steps: str) -> Node | None:
         """Ada elemen langkah ini? Kandidat teks digabung jadi satu info; resourceId hasil kalibrasi dicek terpisah."""
@@ -417,8 +473,7 @@ class AndroidRunner:
     def _classify(self, context: str = "any") -> Seen:
         """Rantai query berprioritas (info/exists, masing-masing satu pencarian), berhenti di yang pertama cocok."""
         t_obs = self._mono()  # waktu layar diamati (sebelum diagnosa lambat)
-        n = self._first(markers=("captcha", "verification", "pin"))
-        if n is not None and (seen := self._message_screen(n, None, context)) is not None:
+        if (seen := self._danger(None, context)) is not None:
             return self._observe(seen, t_obs)
         if context == "after_order" and (n := self._has("pin_screen")) is not None:
             return self._observe(Seen(Screen.PIN_SCREEN, f"resourceId {n.rid}", n), t_obs)
@@ -426,7 +481,7 @@ class AndroidRunner:
         if anchor is not None and anchor.screen in (Screen.CHECKOUT, Screen.CART):
             return self._observe(anchor, t_obs)
         buy = self._find("buy_button") if anchor is None else None
-        msg = self._first(markers=("sold_out", "variant_required", "error_toast", "not_started"))
+        msg = self._first(markers=MESSAGES)
         msg_seen = self._message_screen(msg, buy, context) if msg is not None else None
         # pesan (toast/dialog) diprioritaskan di atas SHEET: sheet yang tetap terbuka dengan "Silakan pilih
         # variasi"/"Stok habis"/"belum dimulai" harus terbaca sebagai pesan itu
@@ -444,10 +499,18 @@ class AndroidRunner:
             return self._observe(Seen(Screen.PRODUCT, "tombol Beli", buy), t_obs)
         if msg_seen is not None:  # tombol "Ingatkan Saya" / hitung mundur: belum mulai, bukan tak dikenal
             return self._observe(msg_seen, t_obs)
-        if (n := self._first(markers=("login",))) is not None:
-            return self._observe(Seen(Screen.LOGIN_REQUIRED, f"teks {n.label[:40]!r}", n), t_obs)
+        if (seen := self._danger(None, context, by="descriptionMatches")) is not None:  # mis. captcha WebView
+            seen.evidence = f"content-desc {seen.evidence}"
+            return self._observe(seen, t_obs)
         if self.d.exists(Sel("className", "android.widget.ProgressBar")):
             return self._observe(Seen(Screen.LOADING, "indikator loading"), t_obs)
+        # layar jarang (habis, login, PIN tanpa teks): sesudah LOADING agar iterasi menunggu loading tetap murah
+        if (seen := self._bare_sold_out(context)) is not None:
+            return self._observe(seen, t_obs)
+        if (n := self._first(markers=("login",))) is not None:
+            return self._observe(Seen(Screen.LOGIN_REQUIRED, f"teks {n.label[:40]!r}", n), t_obs)
+        if context != "after_order" and (n := self._has("pin_screen")) is not None:  # PIN tanpa teks
+            return self._observe(Seen(Screen.PIN_SCREEN, f"resourceId {n.rid}", n), t_obs)
         return self._observe(Seen(Screen.UNKNOWN, "tidak ada elemen yang dikenali"), t_obs)
 
     def _anchor(self) -> Seen | None:
@@ -793,7 +856,7 @@ class AndroidRunner:
             self.log.info(f"variasi {self.variant!r} belum tampil di halaman produk; dipilih di bottom sheet")
             return
         if opt.selected or opt.checked:
-            self._variant_ok = True
+            self._variant_ok = self._variant_on_page = True
             return
         if not opt.enabled:
             self.log.warn(f"variasi {self.variant!r} belum bisa dipilih")
@@ -804,6 +867,8 @@ class AndroidRunner:
         if self._has("sheet_marker") is not None:  # opsi membuka bottom sheet -> tutup, pilih ulang setelah Beli
             self.d.press_back()
             self.log.info("pilih variasi membuka bottom sheet; ditutup, dipilih ulang setelah klik Beli")
+        else:
+            self._variant_on_page = True  # dicek ulang setelah tiap reload saat polling
 
     # ------------------------------------------------------------------ attempt
 
@@ -835,11 +900,12 @@ class AndroidRunner:
     def _attempt(self, live: bool) -> tuple[RunStatus, str]:
         if self.open_at is None:
             raise RuntimeError("arm() belum dipanggil")
-        self._checkpoint()
+        # hasil arm dulu: arm sendiri yang men-set stop_event bersama saat captcha/verifikasi
         if self._arm_failure is not None:
             return self._arm_failure
         if self._arm_state is not None:
             return TERMINAL[self._arm_state.screen], f"saat membuka produk: {self._arm_state.evidence}"
+        self._checkpoint()
         clock = self.clock
         gate = PollingGate(clock, self.open_at, self.limiter)
         self.log.mark("poll_start")
@@ -866,9 +932,17 @@ class AndroidRunner:
                 self.limiter.touch(last_reload)  # efek reload ada di akhir gestur/intent
                 self.log.mark("reload")
                 self._blocked_price = _NO_PRICE
+                self._recheck_variant = self._variant_on_page
                 seen = self._wait_screen({Screen.PRODUCT, Screen.NOT_STARTED}, SETTLE_TIMEOUT_S, "product")
                 if seen.screen in TERMINAL:
                     return TERMINAL[seen.screen], seen.evidence
+                continue
+            if kind == "variant":  # variasi lepas setelah reload: pilih ulang (aksi polling, lewat gate)
+                if not gate.acquire_sync():
+                    return self._window_closed(clicks)
+                self._checkpoint()
+                self.d.click(info)
+                self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
                 continue
             stale = outcome.screen in (Screen.NOT_STARTED, Screen.ERROR_TOAST, Screen.VARIANT_REQUIRED)
             if kind in ("sheet", "progress"):  # sheet masih terbuka: konfirmasi ulang = aksi polling
@@ -885,6 +959,9 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 self._checkpoint()
+                # toast lama bukan reaksi klik ini: dibersihkan SEBELUM klik (toast reaksi klik tetap terbaca) dan
+                # sebelum cek ulang tombol, supaya jarak cek ulang -> klik sesingkat mungkin
+                self.d.clear_toast()
                 if self._mono() - t_wait > REVERIFY_AFTER_WAIT_S:
                     # sempat menunggu slot: layar bisa sudah berubah (mis. checkout) -> cek ulang tombolnya
                     fresh = self._find("buy_button")
@@ -893,7 +970,6 @@ class AndroidRunner:
                         continue
                 t_click = clock.now_ms()
                 self.d.click(btn)
-                self.d.clear_toast()  # toast lama tidak boleh dibaca sebagai reaksi klik ini
                 clicks += 1
                 if clicks == 1:
                     self.log.mark("buy_ready", price.describe(self.limits), t_ms=t_ready)
@@ -953,10 +1029,10 @@ class AndroidRunner:
         if not live:
             return RunStatus.DRYRUN_OK, "sampai checkout dengan ShopeePay & harga lolos; 'Buat Pesanan' TIDAK diklik"
 
+        self.d.clear_toast()
         t_click = clock.now_ms()
         self.order_clicked = True
         self.d.click(place)
-        self.d.clear_toast()
         self.log.mark("click_place_order", t_ms=t_click)
         outcome = self._wait_screen({Screen.PIN_SCREEN}, max(0.1, deadline - self._mono()), "after_order")
         if outcome.screen != Screen.PIN_SCREEN:
@@ -1008,10 +1084,11 @@ class AndroidRunner:
 
     def _wait_ready(self, gate: PollingGate, last_reload: float | None, clicks: int):
         """Tunggu tombol Beli aktif + harga valid. Per iterasi: info tombol Beli, satu query bahaya
-        (captcha/verifikasi/PIN), satu query harga; setelah ada klik, satu query penanda bottom sheet.
+        (captcha/verifikasi/PIN/sale berakhir), satu query harga; setelah ada klik, satu query penanda bottom
+        sheet. Cek pra-klik (_guard: content-desc bahaya, sheet sebelum klik pertama) bila sudah > 0,5 s.
 
         Return ("ready", (node, ProductPrice)) | ("sheet", None) | ("progress", Seen) | ("expired", None)
-        | ("reload", None) | ("stop", Seen).
+        | ("reload", None) | ("variant", Node) | ("stop", Seen).
         """
         while True:
             self._checkpoint()
@@ -1028,8 +1105,7 @@ class AndroidRunner:
                         return "stop", seen
                     if seen.screen == Screen.SHEET and not clicks:
                         # sheet terbuka sebelum klik Beli pertama (lapis 1 belum lolos): tutup, jangan konfirmasi
-                        self.d.press_back()
-                        self.log.warn("bottom sheet terbuka sebelum klik Beli; ditutup (back)")
+                        self._close_sheet()
                         continue
                     if seen.screen in _PROGRESS:
                         return ("sheet", None) if seen.screen == Screen.SHEET else ("progress", seen)
@@ -1042,16 +1118,16 @@ class AndroidRunner:
                         btn = seen.node
                 if btn is not None:
                     self._observe(Seen(Screen.PRODUCT, "tombol Beli", btn))
-                    danger = self._first(markers=("captcha", "verification", "pin"))
-                    if danger is not None and (seen := self._message_screen(danger, btn, "product")) is not None:
-                        if seen.screen == Screen.PIN_SCREEN:
-                            self.order_clicked = True
-                            raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
-                        return "stop", seen
+                    if (seen := self._danger(btn, "product")) is not None:
+                        return "stop", self._no_pin(seen)
                     if btn.label.strip().lower() in BARE_SOLD_OUT:
                         return "stop", Seen(Screen.SOLD_OUT, f"tombol {btn.label!r}", btn)
+                    if self._guard(clicks):
+                        continue  # sheet yang terbuka sebelum klik pertama sudah ditutup: baca ulang
                     ready = btn.enabled and not self._marker_of(btn, "not_started")
                     if ready:
+                        if self._recheck_variant and (opt := self._variant_after_reload()) is not None:
+                            return "variant", opt
                         price_text = self._read_price()
                         price = pricing.check_product_price(price_text, self.limits)
                         self._last_price = price
@@ -1073,6 +1149,51 @@ class AndroidRunner:
                     last_reload is None or now - last_reload >= RELOAD_EVERY_S):
                 return "reload", None
 
+    def _no_pin(self, seen: Seen) -> Seen:
+        """PIN saat polling (alat belum mengklik "Buat Pesanan"): pesanan mungkin sudah terbuat."""
+        if seen.screen == Screen.PIN_SCREEN:
+            self.order_clicked = True
+            raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
+        return seen
+
+    def _guard(self, clicks: int) -> bool:
+        """Cek yang tidak perlu tiap iterasi (dijalankan bila hasil terakhir > GUARD_FRESH_S; dipaksa segera
+        setelah klik Beli/konfirmasi dan di awal lapis 3): penanda bahaya di content-desc (mis. captcha di
+        WebView) dan, sebelum klik Beli pertama, bottom sheet yang sudah terbuka (info jalur A tetap menemukan
+        'Beli Sekarang' di belakang/di dalam sheet; klik akan mendarat di konfirmasi sheet tanpa pemilihan
+        variasi). True = sheet ditutup, ulangi iterasi."""
+        if self._mono() - self._guard_at < GUARD_FRESH_S:
+            return False
+        if (seen := self._danger(None, "product", by="descriptionMatches")) is not None:
+            seen = self._no_pin(seen)
+            raise _Stop(TERMINAL[seen.screen], f"content-desc {seen.evidence}")
+        if not clicks and self._has("sheet_marker") is not None:
+            self._close_sheet()
+            return True
+        self._guard_at = self._mono()
+        return False
+
+    def _close_sheet(self) -> None:
+        """Tutup bottom sheet yang terbuka sebelum klik Beli pertama (back), lalu pastikan sudah hilang."""
+        self.d.press_back()
+        self.log.warn("bottom sheet terbuka sebelum klik Beli; ditutup (back), tidak dikonfirmasi")
+        end = self._mono() + SHEET_CLOSE_S
+        while self._has("sheet_marker") is not None:
+            self._checkpoint()
+            if self._mono() >= end:
+                raise _Stop(RunStatus.ERROR, "bottom sheet terbuka sebelum klik Beli dan tidak tertutup dengan back")
+        self._guard_at = float("-inf")
+
+    def _variant_after_reload(self) -> Node | None:
+        """Reload bisa mengembalikan halaman ke variasi bawaan: harga lapis 1 lalu milik variasi lain. Variasi
+        yang dipilih di halaman produk saat arm diperiksa sekali per reload; belum terpilih -> dipilih ulang
+        lewat gate (aksi polling). Status chip tidak terbaca -> tidak diklik berulang (lapis 3 penentu)."""
+        self._recheck_variant = False
+        opt = self._find("variant_option", sticky=False)
+        if opt is None or opt.selected or opt.checked or not opt.enabled:
+            return None
+        return opt
+
     def _recover_agent(self, err: DriverError, gate: PollingGate) -> None:
         """Agent mati saat polling (HiOS): hidupkan ulang secara eksplisit (tercatat), maks MAX_AGENT_RESTARTS."""
         self.log.warn(f"agent uiautomator2 tidak menjawab saat polling (HiOS?): {err}")
@@ -1089,8 +1210,10 @@ class AndroidRunner:
         t_ref = t_click
         seen_clear = not stale
         sheet_done = confirm_done
+        self._guard_at = float("-inf")  # content-desc bahaya dicek segera setelah klik (bukan sebelum: kecepatan)
         while True:
             self._checkpoint()
+            self._guard(1)
             seen = self._classify("after_buy")
             st = seen.screen
             now = self._mono()
@@ -1153,9 +1276,9 @@ class AndroidRunner:
         confirm = self._pick("sheet_confirm", self._sheet_nodes("sheet_confirm")) or self._find("sheet_confirm")
         if confirm is None:
             raise _Stop(RunStatus.ERROR, "tombol konfirmasi di pilihan variasi tidak ditemukan")
+        self.d.clear_toast()
         t_click = self.clock.now_ms()
         self.d.click(confirm)
-        self.d.clear_toast()
         self.log.mark("click_sheet_confirm", "ulang (lewat gate)" if retry else "", t_ms=t_click)
 
     # ------------------------------------------------------------------ lapis 2: keranjang
@@ -1237,10 +1360,8 @@ class AndroidRunner:
         opt = None
         while self._mono() < end and opt is None:
             self._checkpoint()
-            danger = self._first(markers=("captcha", "verification", "pin"))
-            if danger is not None and (seen := self._message_screen(danger, None, "any")) is not None:
-                if seen.screen in TERMINAL:
-                    raise _Stop(TERMINAL[seen.screen], seen.evidence)
+            if (seen := self._danger(None, "any")) is not None and seen.screen in TERMINAL:
+                raise _Stop(TERMINAL[seen.screen], seen.evidence)
             node = self._find("payment_shopeepay")
             opt = node if node is not None and is_shopeepay(node.label) else None
         if opt is None:
@@ -1261,11 +1382,12 @@ class AndroidRunner:
             True
 
     def _checkout_read(self) -> list[Node]:
-        name_pat = (rf"(?is).*{re.escape(self.cfg.expected_name)}.*",) if self.cfg.expected_name else ()
-        var_pat = (rf"(?is).*{re.escape(self.variant)}.*",) if self.variant else ()
+        # nama & variasi diambil longgar (tanda baca/spasi bebas, seperti _squash di pricing): "Variasi: 256GB,
+        # Biru" tetap terbaca untuk variant "256GB Biru"; keputusan tetap di pricing.check_checkout
+        loose = tuple(p for p in map(_loose_match, (self.cfg.expected_name, self.variant)) if p)
         sel = self._union(("place_order",), ("captcha", "verification", "pin", "sold_out"),
                           (RP_ANY_MATCH, QTY_MATCH, TOTAL_LABEL_MATCH, SHIPPING_LABEL_MATCH, ORDER_COUNT_MATCH,
-                           PENDING_MATCH, *name_pat, *var_pat))
+                           PENDING_MATCH, VARIANT_LINE_MATCH, *loose))
         return self.d.find_all(sel)
 
     def _checkout_guard(self, changed: bool = False) -> pricing.CheckoutVerdict:
@@ -1281,8 +1403,10 @@ class AndroidRunner:
         snap = None
         shipping = total = None
         total_rid, shipping_rid = self._rid_regex("checkout_total"), self._rid_regex("checkout_shipping")
+        self._guard_at = float("-inf")  # minimal sekali cek content-desc bahaya di checkout sebelum memesan
         while True:
             self._checkpoint()
+            self._guard(1)
             t_read = self._mono()
             nodes = self._checkout_read()
             seen = self._classify_nodes(nodes, "any")

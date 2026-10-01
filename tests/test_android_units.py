@@ -455,11 +455,6 @@ def test_checkout_snapshot_shop_header_does_not_satisfy_expected_name():
     assert "nama produk tidak memuat 'Uji Coba'" in verdict.reasons
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: android_screen.checkout_snapshot - kolom produk = kiri teks Rp PALING KIRI di kartu - 12 px. Bila harga "
-    "coret tidak tampil dan harga jual menjorok ke kanan nama (tata letak FakeShopeeApp strike_in_checkout=False: "
-    "nama x=140, harga x=320), nama produk & 'Variasi: ...' dibuang dari baris -> cek expected_name/variasi selalu "
-    "gagal -> PRICE_GUARD untuk pesanan yang sah (fail-closed, tetapi live tidak pernah bisa memesan)."))
 def test_checkout_snapshot_keeps_name_when_price_column_is_indented(fake_clock):
     app = _checkout_app(fake_clock, strike_in_checkout=False)
     app.selected_variant = "Hitam"
@@ -480,11 +475,6 @@ def test_checkout_snapshot_expected_variant_must_be_in_product_row(variant, ok):
         assert f"variasi {variant!r} tidak terlihat di baris produk" in verdict.reasons
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: pricing.check_checkout - expected_variant dicari di SELURUH teks baris produk, termasuk nama produk. Judul "
-    "yang memuat teks variasi (mis. 'Kaos Polos Hitam Putih') membuat cek variasi lapis 3 selalu lolos walau baris "
-    "'Variasi:' menunjukkan variasi lain; padahal _handle_sheet menyerahkan chip yang tidak terbaca terpilih ke "
-    "lapis 3 ('diverifikasi di checkout')."))
 def test_checkout_variant_check_not_satisfied_by_product_name():
     snap = checkout_snapshot(_checkout((("Kaos Polos Hitam Putih", "Rp99.000", "x1"),), variation="Variasi: Putih"))
     assert snap.rows == ["Kaos Polos Hitam Putih\nVariasi: Putih\nRp99.000\nx1"]
@@ -1575,13 +1565,13 @@ class FakeU2Device:
         self.window_size_calls += 1
         return self.size
 
-    def swipe(self, fx, fy, tx, ty, duration=None, steps=None) -> None:
-        self.maybe_raise("swipe")
-        self.actions.append(("swipe", fx, fy, tx, ty, duration))
+    def _rpc_swipe(self, fx, fy, tx, ty, steps) -> bool:
+        self.actions.append(("swipe", fx, fy, tx, ty, steps))
+        return True
 
-    def press(self, key) -> None:
-        self.maybe_raise("press")
+    def _rpc_pressKey(self, key) -> bool:
         self.actions.append(("press", key))
+        return True
 
     def screenshot(self, filename=None):
         self.maybe_raise("screenshot")
@@ -1730,7 +1720,7 @@ def test_u2_info_retries_stale_object_once():
     ("app_current", lambda d: d.current_app()),
     ("shell", lambda d: d.shell(["getprop"])),
     ("swipe", lambda d: d.swipe_refresh()),
-    ("press", lambda d: d.press_back()),
+    ("pressKey", lambda d: d.press_back()),
     ("dump_hierarchy", lambda d: d.dump()),
     ("stop_uiautomator", lambda d: d.restart_agent()),
 ])
@@ -1876,11 +1866,11 @@ def test_u2_window_size_cached_and_swipe_refresh_pulls_down():
     drv.swipe_refresh()
     drv.swipe_refresh()
     assert dev.window_size_calls == 1
-    _, fx, fy, tx, ty, duration = dev.actions[0]
+    _, fx, fy, tx, ty, steps = dev.actions[0]
     assert (fx, fy, tx, ty) == (540, 738, 540, 1845)  # 30% -> 75% tinggi, koordinat piksel bulat
     assert all(isinstance(v, int) for v in (fx, fy, tx, ty))
     assert fy < ty  # tarik ke bawah = muat ulang
-    assert duration == pytest.approx(0.3)  # tarik pelan, bukan fling
+    assert steps == 60  # 60 langkah u2 x 5 ms = 0,3 s: tarik pelan, bukan fling
     assert drv.window_size() == (1080, 2460)
     assert dev.window_size_calls == 1
 
@@ -1923,32 +1913,10 @@ def test_u2_agent_alive_needs_ping_and_real_rpc():
     assert U2Driver(device=NoCheck()).agent_alive() is None  # tidak bisa dicek
 
 
-class _U2Gestures(FakeU2Device):
-    """swipe/press persis uiautomator2 3.7: `self.jsonrpc.swipe(..)` / `self.jsonrpc.pressKey(..)` TANPA http_timeout
-    (bawaan HTTP_TIMEOUT = 300 s; patch soket memakai timeout yang sama)."""
-
-    def swipe(self, fx, fy, tx, ty, duration=None, steps=None):
-        steps = int(duration * 200) if duration else 10
-        return self.jsonrpc.swipe(fx, fy, tx, ty, max(2, steps))
-
-    def press(self, key):
-        return self.jsonrpc.pressKey(key)
-
-    def _rpc_swipe(self, fx, fy, tx, ty, steps):
-        self.actions.append(("swipe", fx, fy, tx, ty, steps))
-        return True
-
-    def _rpc_pressKey(self, key):
-        self.actions.append(("press", key))
-        return True
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: U2Driver.swipe_refresh/press_back lewat d.swipe()/d.press() u2 yang memanggil jsonrpc TANPA http_timeout "
-    "-> batas 300 s bawaan u2 (soket ikut 300 s), bukan rpc_timeout_s. Reload default (android.reload='swipe') adalah "
-    "aksi polling di T-1..T+8 s: agent yang macet menggantung runner hingga 5 menit, bukan gagal dalam 5 s."))
 def test_u2_polling_gestures_bounded_by_rpc_timeout():
-    dev = _U2Gestures([BUY_INFO])
+    """Reload (swipe) & back adalah aksi polling: lewat jsonrpc dengan rpc_timeout_s, bukan d.swipe()/d.press()
+    u2 yang memakai batas 300 s (agent macet tidak boleh menggantung runner hingga 5 menit)."""
+    dev = FakeU2Device([BUY_INFO])
     drv = U2Driver(device=dev, rpc_timeout_s=2.0)
     drv.swipe_refresh()  # reload saat polling
     drv.press_back()  # menutup sheet yang terbuka sebelum klik Beli pertama
@@ -2225,3 +2193,76 @@ def test_fake_driver_toast_channel_is_agent_only(fake_clock):
     assert node_drv.exists(Sel("text", "Stok habis")) and node_drv.last_toast() is None  # overlay in-app = node
     fake_clock.advance(1.6)
     assert not node_drv.exists(Sel("text", "Stok habis"))  # overlay hilang sendiri setelah 1,5 s
+
+
+# ------------------------------------------------------------------ regex penanda & bacaan longgar (ronde 3)
+
+
+def _jfull(pattern: str, text: str) -> bool:
+    """Seperti textMatches/descriptionMatches di agent: regex cocok SELURUH teks (ASCII, seperti Java)."""
+    return re.fullmatch(pattern, text, re.ASCII) is not None
+
+
+@pytest.mark.parametrize("text, hit", [
+    ("Geser untuk verifikasi", True),
+    ("Masukkan kode OTP", True),
+    ("Flash Sale telah berakhir", True),
+    ("Flash Sale berakhir dalam 01:59:59", False),  # hitung mundur sale yang sedang berjalan
+    ("Produk original. " * 8 + "Cek kode OTP di situs resmi.", False),  # > 120 karakter: deskripsi
+    ("Habis", False),  # "Habis" polos: query terpisah (_bare_sold_out)
+])
+def test_danger_union_is_short_text_only_and_includes_sale_ended(text, hit):
+    runner = android_runner.AndroidRunner.__new__(android_runner.AndroidRunner)
+    runner.sel = android_selectors.defaults()
+    runner.variant = None
+    runner._cand_cache, runner._union_cache = {}, {}
+    runner._ended = tuple(p for p in runner.sel.marker("sold_out") if "berakhir" in p.lower())
+    sel = runner._union(markers=android_runner.DANGER, extra=runner._ended, short=True)
+    assert sel.by == "textMatches"
+    assert _jfull(sel.value, text) is hit, sel.value
+    desc = runner._union(markers=android_runner.DANGER, extra=runner._ended, short=True, by="descriptionMatches")
+    assert desc.by == "descriptionMatches" and desc.value == sel.value
+
+
+@pytest.mark.parametrize("text, hit", [
+    ("Stok habis", True), ("Ingatkan Saya", True), ("Silakan pilih variasi terlebih dahulu", True),
+    ("Habis", False), (" HABIS ", False), ("Habis ", False), ("Stok habis. " * 12, False),
+])
+def test_message_union_skips_bare_habis_chip_and_long_text(text, hit):
+    pat = android_runner._MARKER_PREFIX + "(?:" + android_selectors.union(
+        [p for name in android_runner.MESSAGES for p in android_selectors.defaults().marker(name)]) + ")"
+    assert _jfull(pat, text) is hit
+
+
+@pytest.mark.parametrize("wanted, text, hit", [
+    ("256GB Biru", "Variasi: 256GB, Biru", True),
+    ("256GB Biru", "Variasi: 256 GB  /  biru", True),
+    ("256GB Biru", "Variasi: 128GB, Biru", False),
+    ("Uji Coba", "Ponsel Uji-Coba 128GB Hitam", True),
+    ("Uji Coba", "Ponsel Uji 128GB Coba", False),
+])
+def test_loose_match_tolerates_punctuation_and_spacing(wanted, text, hit):
+    pat = android_runner._loose_match(wanted)
+    assert _jfull(pat, text) is hit
+    assert (pricing.squash(wanted) in pricing.squash(text)) is hit  # sama dengan aturan lapis 3
+    assert android_runner._loose_match("  ,. ") is None
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Kaos Polos Hitam Putih\nVariasi: Putih\nRp99.000\nx1", "Variasi: Putih"),
+    ("Kaos Polos Hitam Putih\nPutih, XL\nRp99.000\nx1", "Putih, XL"),  # tanpa label: selain nama/harga/qty
+    ("Kaos Polos Hitam Putih\nRp99.000\nx1", ""),  # tidak ada baris variasi -> kosong (fail-closed)
+])
+def test_variant_text_excludes_product_name(text, expected):
+    assert pricing.variant_text(text, "Kaos Polos") == expected
+
+
+def test_desc_danger_judged_on_content_desc_even_when_node_has_text(tmp_path):
+    """Node bertext lain ("Tutup") dengan content-desc captcha: query descriptionMatches menilai desc-nya."""
+    runner, app, _driver, log = _prepared(tmp_path)
+    orig = app._r_product
+    app._r_product = lambda: [*orig(), ("", Node(text="Tutup", desc="Geser untuk verifikasi", bounds=(0, 0, 9, 9)))]
+    seen = runner._danger(None, "product", by="descriptionMatches")
+    assert seen is not None and seen.screen == Screen.CAPTCHA, seen
+    assert runner._danger(None, "product") is None  # text "Tutup" bukan penanda
+    log.close()
