@@ -57,6 +57,8 @@ class AndroidConfig(_Strict):
     enabled: bool = True
     serial: str = ""  # kosong = device pertama
     package: str = "com.shopee.id"
+    # cara reload halaman produk saat polling: tarik-untuk-muat-ulang, atau buka ulang lewat intent VIEW
+    reload: Literal["swipe", "intent"] = "swipe"
 
 
 class TargetConfig(_Strict):

@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from flashbuy import selector_store, timesync
+from flashbuy.android_driver import DriverError
 from flashbuy.config import (
     DEFAULT_LEAD_MS,
     POLL_WINDOW_AFTER_S,
@@ -71,13 +72,37 @@ def _load(args: argparse.Namespace) -> TargetConfig:
     return load_config(args.config, allow_local=args.allow_local)
 
 
-def _need_web(args: argparse.Namespace, attr: str) -> bool:
+def _platform(args: argparse.Namespace, attr: str) -> str | None:
+    """'web' | 'android'; None (tanpa --only/--platform) = orchestrator, belum tersedia (tahap 4)."""
     value = getattr(args, attr)
-    if value != "web":
-        console.print(f"[yellow]Tahap 2: hanya jalur web yang tersedia (pakai --{attr} web). "
-                      "Android menyusul di tahap 3, orchestrator di tahap 4.[/]")
-        return False
-    return True
+    if value not in ("web", "android"):
+        console.print(f"[yellow]Pilih satu jalur dengan --{attr} web|android. Menjalankan keduanya sekaligus "
+                      "(orchestrator) menyusul di tahap 4.[/]")
+        return None
+    return value
+
+
+def _android_driver(cfg: TargetConfig):
+    """Driver device nyata (diganti FakeDriver di tes)."""
+    from flashbuy.android_driver import U2Driver
+
+    return U2Driver(cfg.android.serial)
+
+
+def _android_selectors(path: str):
+    from flashbuy import android_selectors
+
+    return android_selectors.load(path)
+
+
+def _print_precheck(pre, platform: str) -> None:
+    table = Table(title=f"Pre-check {platform}")
+    for col in ("Cek", "Status", "Detail"):
+        table.add_column(col)
+    for item in pre.items:
+        status = {True: "[green]OK[/]", False: "[red]GAGAL[/]", None: "[yellow]PERINGATAN[/]"}[item.ok]
+        table.add_row(item.name, status, item.detail)
+    console.print(table)
 
 
 # --------------------------------------------------------------------------- login
@@ -103,10 +128,23 @@ async def login_web(cfg: TargetConfig, sel: selector_store.SelectorSet, *, headl
     console.print("Browser ditutup; sesi tersimpan di profil.")
 
 
+def login_android(cfg: TargetConfig, driver) -> None:
+    """Buka aplikasi Shopee di HP; login dilakukan manual oleh pengguna (alat tidak mengetik apa pun)."""
+    driver.start_url(cfg.origin + "/", cfg.android.package)
+    console.print(f"Device {driver.serial or '(pertama)'}: aplikasi {cfg.android.package} dibuka.\n"
+                  "[bold]Login manual di HP (termasuk OTP bila diminta) dan pastikan ShopeePay aktif. "
+                  "Sesi aplikasi tersimpan di HP; tidak ada yang disimpan alat.[/]")
+
+
 def cmd_login(args: argparse.Namespace) -> int:
-    if not _need_web(args, "platform"):
+    platform = _platform(args, "platform")
+    if platform is None:
         return 2
-    asyncio.run(login_web(_load(args), selector_store.load(args.selectors), headless=args.headless))
+    cfg = _load(args)
+    if platform == "android":
+        login_android(cfg, _android_driver(cfg))
+        return 0
+    asyncio.run(login_web(cfg, selector_store.load(args.selectors), headless=args.headless))
     return 0
 
 
@@ -129,17 +167,33 @@ async def precheck_web(cfg: TargetConfig, sel: selector_store.SelectorSet, *, he
         log.close()
 
 
+async def precheck_android(cfg: TargetConfig, sel, driver, log_dir: Path):
+    from flashbuy.android_runner import AndroidRunner
+    from flashbuy.notifier import Notifier
+    from flashbuy.runner_base import RunLog
+
+    log = RunLog(log_dir, timesync.ServerClock(), "android", Console(stderr=True, quiet=True))
+    runner = AndroidRunner(cfg, sel, log=log, notifier=Notifier(cfg.notify_webhook), driver=driver)
+    try:
+        await runner.prepare()
+        return await runner.precheck()
+    finally:
+        await runner.close()
+        log.close()
+
+
 def cmd_precheck(args: argparse.Namespace) -> int:
-    if not _need_web(args, "only"):
+    platform = _platform(args, "only")
+    if platform is None:
         return 2
-    pre = asyncio.run(precheck_web(_load(args), selector_store.load(args.selectors), headless=args.headless))
-    table = Table(title="Pre-check web")
-    for col in ("Cek", "Status", "Detail"):
-        table.add_column(col)
-    for item in pre.items:
-        status = {True: "[green]OK[/]", False: "[red]GAGAL[/]", None: "[yellow]PERINGATAN[/]"}[item.ok]
-        table.add_row(item.name, status, item.detail)
-    console.print(table)
+    cfg = _load(args)
+    if platform == "android":
+        log_dir = Path("logs") / f"{time.strftime('%Y%m%d-%H%M%S')}-precheck"
+        pre = asyncio.run(precheck_android(cfg, _android_selectors(args.selectors), _android_driver(cfg), log_dir))
+        console.print(f"Log (info device & latensi query): {log_dir}")
+    else:
+        pre = asyncio.run(precheck_web(cfg, selector_store.load(args.selectors), headless=args.headless))
+    _print_precheck(pre, platform)
     return 0 if pre.ok else 1
 
 
@@ -166,10 +220,30 @@ async def calibrate_web(cfg: TargetConfig, url: str, selectors_path: Path, *, he
     return 0
 
 
+def calibrate_android(cfg: TargetConfig, driver, selectors_path: Path, *, prompt=input) -> int:
+    from flashbuy import android_selectors
+    from flashbuy.android_calibrate import AndroidCalibrator
+
+    result = AndroidCalibrator(driver, android_selectors.load(selectors_path), variant=cfg.variant,
+                               prompt=prompt, say=lambda s: console.print(s, highlight=False)).run()
+    meta = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device": driver.serial,
+            "skipped": result.skipped}
+    backup = android_selectors.save(selectors_path, result.steps, meta)
+    console.print(f"Tersimpan: [bold]{selectors_path}[/] (bagian android)" + (f" (backup: {backup})" if backup else ""))
+    for w in result.warnings:
+        console.print(f"[yellow]! {w}[/]")
+    return 0
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    if not _need_web(args, "platform"):
+    platform = _platform(args, "platform")
+    if platform is None:
         return 2
     cfg = _load(args)
+    if platform == "android":
+        console.print("[bold]Kalibrasi Android.[/] Gunakan produk biasa yang murah; Anda yang men-tap HP, "
+                      "alat hanya membaca layar (tidak pernah menekan 'Buat Pesanan').")
+        return calibrate_android(cfg, _android_driver(cfg), Path(args.selectors))
     url = args.url or cfg.product_url
     if not args.url:
         console.print("[yellow]--url tidak diisi; memakai product_url dari config. Sebaiknya kalibrasi "
@@ -254,12 +328,51 @@ async def run_web(cfg: TargetConfig, sel: selector_store.SelectorSet, *, live: b
             notifier.join(1)
 
 
+async def run_android(cfg: TargetConfig, sel, driver, *, live: bool, lead_ms: int, report: timesync.SyncReport,
+                      run_dir: Path, samples: int):
+    """Satu run Android. Aplikasi tidak pernah ditutup alat; layar dibiarkan apa adanya untuk pengguna."""
+    from flashbuy.android_runner import AndroidRunner
+    from flashbuy.notifier import Notifier
+    from flashbuy.runner_base import RunLog, RunStatus, keep_open
+    from flashbuy.session import run_single
+
+    clock = timesync.ServerClock(report.offset_s)
+    log = RunLog(run_dir, clock, "android", console)
+    notifier = Notifier(cfg.notify_webhook)
+    runner = AndroidRunner(cfg, sel, log=log, notifier=notifier, driver=driver)
+
+    def sync_fn() -> timesync.SyncReport:
+        return timesync.sync(samples=samples, http_url=cfg.origin + "/")
+
+    result = None
+    try:
+        result = await run_single(runner, open_at=cfg.start_epoch, live=live, lead_ms=lead_ms,
+                                  clock=clock, log=log, notifier=notifier, sync_fn=sync_fn)
+        print_result(result, cfg.start_epoch)
+        return result
+    finally:
+        status = result.status if result is not None else None
+        if status in (RunStatus.CAPTCHA, RunStatus.VERIFICATION):
+            console.print("[bold red]Captcha/verifikasi di HP dibiarkan apa adanya. Selesaikan manual; "
+                          "alat TIDAK akan retry.[/]")
+        if keep_open(live, status):
+            console.print("[bold]Aplikasi di HP dibiarkan terbuka apa adanya (alat tidak menutup aplikasi). "
+                          "Periksa/selesaikan manual (PIN, verifikasi, status pesanan).[/]")
+        await runner.close()
+        log.close()
+        notifier.join(1)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    if not _need_web(args, "only"):
+    platform = _platform(args, "only")
+    if platform is None:
         return 2
     cfg = _load(args)
     if args.live:
         require_live_ready(cfg)
+    if not getattr(cfg, platform).enabled:
+        console.print(f"[red]{platform}.enabled = false di config.[/]")
+        return 2
     lead_ms = cfg.lead_ms if args.lead_ms is None else args.lead_ms
     if not 0 <= lead_ms <= 1000:
         console.print("[red]--lead-ms harus 0..1000[/]")
@@ -267,10 +380,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if time.time() > cfg.start_epoch + POLL_WINDOW_AFTER_S:
         console.print(f"[red]start_time {cfg.start_time.isoformat()} sudah lewat.[/]")
         return 2
-    sel = selector_store.load(args.selectors)
+    sel = selector_store.load(args.selectors) if platform == "web" else _android_selectors(args.selectors)
     mode = "[bold red]LIVE - pesanan sungguhan akan dibuat[/]" if args.live else "[bold green]DRY-RUN[/]"
-    console.print(f"Mode: {mode} | T = {cfg.start_time.isoformat()} | lead {lead_ms} ms | "
+    console.print(f"Jalur {platform} | Mode: {mode} | T = {cfg.start_time.isoformat()} | lead {lead_ms} ms | "
                   f"selectors: {sel.source or 'default teks'}")
+    driver = _android_driver(cfg) if platform == "android" else None  # gagal konek -> berhenti sebelum timesync
 
     console.print("Timesync awal...")
     report = timesync.sync(samples=args.samples, http_url=cfg.origin + "/")
@@ -278,9 +392,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if report.primary is None:
         console.print("[red bold]Timesync gagal total; run dibatalkan.[/]")
         return 1
-    run_dir = Path("logs") / f"{time.strftime('%Y%m%d-%H%M%S')}-web"
-    result = asyncio.run(run_web(cfg, sel, live=args.live, lead_ms=lead_ms, report=report,
-                                 run_dir=run_dir, headless=args.headless, samples=args.samples))
+    run_dir = Path("logs") / f"{time.strftime('%Y%m%d-%H%M%S')}-{platform}"
+    if platform == "android":
+        result = asyncio.run(run_android(cfg, sel, driver, live=args.live, lead_ms=lead_ms, report=report,
+                                         run_dir=run_dir, samples=args.samples))
+    else:
+        result = asyncio.run(run_web(cfg, sel, live=args.live, lead_ms=lead_ms, report=report,
+                                     run_dir=run_dir, headless=args.headless, samples=args.samples))
     console.print(f"Log: {run_dir}")
     return 0 if str(result.status) in OK_STATUSES else 1
 
@@ -339,6 +457,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except ConfigError as e:
         console.print(f"[red]{e}[/]")
+        return 2
+    except DriverError as e:
+        console.print(f"[red]Android: {e}[/]\nCek kabel USB, izin USB debugging, dan `adb devices`.")
         return 2
     except KeyboardInterrupt:
         console.print("[red]Dibatalkan.[/]")
