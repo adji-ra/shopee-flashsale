@@ -32,7 +32,7 @@ from rich.console import Console
 
 from flashbuy import android_selectors, cli, notifier, timesync
 from flashbuy.android_calibrate import ANDROID_CAL_STEPS, AndroidCalibrator
-from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Sel, U2Driver
+from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Node, Sel, U2Driver
 from flashbuy.android_runner import AndroidRunner
 from flashbuy.android_screen import RP_ANY_MATCH, parse_dump
 from flashbuy.android_selectors import KIND_RANK
@@ -1281,6 +1281,21 @@ def test_calibrate_variant_s_lists_only_its_chip_and_typing_s_searches_not_skips
     chosen = cal._choose(step, nodes)
     assert chosen is not None and chosen != "skip" and "S" in chosen.text.upper(), chosen
     assert next(answers, None) is None, "kedua jawaban dipakai ('S' = cari, '1' = pilih)"
+
+
+@pytest.mark.parametrize("variant, chip", [
+    ("XL (Hitam)", "XL (Hitam) - sisa 3"), ("Paket A (2 pcs)", "Paket A (2 pcs)\nRp99.000"), ("L+", "L+ (stok 2)"),
+    ("S", "S"),
+])
+def test_calibrate_variant_keyword_with_punctuation_still_listed(variant, chip):
+    """Kata kunci variasi dicocokkan per kata tanpa \\b (yang tidak pernah cocok bila variasi diawali/diakhiri tanda
+    baca); 'S' tetap tidak cocok ke 'ShopeePay'/'Stok'."""
+    step = next(s for s in ANDROID_CAL_STEPS if s.key == "variant_option")
+    nodes = [Node(text=chip, bounds=(20, 1090, 250, 1140), clickable=True),
+             Node(text="ShopeePay", bounds=(20, 200, 300, 240)), Node(text="Stok: 25", bounds=(20, 300, 300, 340))]
+    cal = AndroidCalibrator(SimpleNamespace(find_all=lambda sel: []), android_selectors.defaults(), variant=variant,
+                            prompt=lambda m: "", say=lambda m: None)
+    assert [n.text for n in cal._listed(step, nodes)] == [chip]
 
 
 # ------------------------------------------------------------------ ringkasan hasil di konsol

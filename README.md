@@ -332,7 +332,8 @@ python -m flashbuy precheck --config target.yaml --only android
   lambat → dihidupkan ulang sekali (peringatan); masih gagal → `ERROR`, run berhenti.
 - Layar menyala dan tidak terkunci. Saat `run`: `svc power stayon usb` selama run, nilai
   `stay_on_while_plugged_in` lama dikembalikan setelah run selesai (apa pun hasilnya, juga saat Ctrl+C di
-  tengah precheck). Gagal dikembalikan → alarm + petunjuk mengembalikan manual.
+  tengah precheck). Gagal dikembalikan → alarm + petunjuk mengembalikan manual. Nilai semula tidak
+  terbaca → `svc` tidak dikirim (peringatan), supaya pengaturan pengguna tidak tertimpa.
 - Aplikasi Shopee terpasang, `versionName` dicatat. Berbeda dari versi saat kalibrasi, tidak terbaca, atau
   kalibrasi lama tanpa versi tercatat, sehingga tidak bisa dibandingkan → **PERINGATAN KERAS** + alarm (run
   tidak dihentikan; kalibrasi ulang + dry-run dulu).
@@ -372,8 +373,9 @@ package/activity di depan:
   dialog/bottom sheet/toast (teks panjang = deskripsi produk diabaikan), juga di content-desc; WebView
   Shopee tanpa elemen yang dikenali; activity Shopee bernama captcha/verifikasi; aplikasi/activity asing
   selain `com.shopee.id` dan dialog sistem yang dikenal. Setelah klik, halaman Shopee yang tidak berubah
-  atau spinner > 0,5 s juga dicek package di depan: jendela asing berbentuk dialog (halaman di bawahnya
-  tetap terbaca) → VERIFICATION, tanpa klik ulang di atasnya.
+  atau spinner > 0,5 s, dan setiap reload, didahului cek package di depan (adb dumpsys; tidak dipakai
+  sebelum klik pertama atau setelah reaksi toast Shopee): jendela asing berbentuk dialog → VERIFICATION,
+  tanpa klik ulang/reload di atasnya.
 - **UNKNOWN**: Shopee keluar dari foreground (launcher), crash, dialog ANR/crash di atas Shopee (dicari di
   luar package Shopee dan SystemUI, jadi judul produk/ulasan "tidak merespons" dan notifikasi bukan dialog;
   berkala tiap ≤ 0,5 s dan **tepat sebelum setiap tap**: Beli, reload, pilih/pilih ulang variasi, konfirmasi
@@ -423,8 +425,11 @@ Keamanan klik:
   ditutup) sebelum harga lapis 1 dibaca. Lapis 3 tetap memverifikasi variasi di checkout.
 - Sebelum konfirmasi bottom sheet: cek captcha/verifikasi (content-desc selalu, teks bila sempat memilih
   variasi atau konfirmasi ulang setelah menunggu slot).
-- Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat dianggap "pesanan mungkin terbuat"
-  (`UNKNOWN_STATE` + pesan wajib + alarm).
+- Layar PIN yang muncul tanpa klik "Buat Pesanan" dari alat (saat polling, setelah Beli, atau di langkah
+  keranjang/checkout/metode bayar) dianggap "pesanan mungkin terbuat" (`UNKNOWN_STATE` + pesan wajib +
+  alarm + stop semua).
+- Saat arm, dialog crash/ANR di atas chip variasi ditunggu hilang (≤ 2 s) sebelum chip di-tap; masih ada →
+  dipilih saat polling lewat gate. Back untuk menutup sheet tidak dikirim selama dialog tampil.
 
 Pembacaan harga di aplikasi (aksesibilitas Android tidak memberi tahu teks yang dicoret):
 - harga produk (lapis 1): teks Rp pendek **pertama** yang terlihat (harga utama berada di atas harga
@@ -462,13 +467,13 @@ python -m flashbuy timesync [--samples 5] [--ntp-host id.pool.ntp.org] [--url ht
 
 ## Tes
 
-`python -m pytest -q` menjalankan 1226 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
+`python -m pytest -q` menjalankan 1253 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
 headless, kalibrasi dengan Alt+klik yang disimulasikan, dan jalur Android di atas device palsu
 (`FakeDriver` + `tests/fake_android.py`, jam virtual) termasuk CLI, kalibrasi, pengaman harga, dan
 skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet, dialog ANR, aplikasi asing).
-Jumlahnya besar karena parametrisasi: 515 fungsi tes, 198 di antaranya `@pytest.mark.parametrize`
+Jumlahnya besar karena parametrisasi: 527 fungsi tes, 206 di antaranya `@pytest.mark.parametrize`
 (misalnya setiap skenario dijalankan dry-run dan live, serta untuk kedua mode refresh) yang
-menghasilkan 909 kasus. Setiap run Android juga memeriksa invarian otomatis (0 klik "Buat Pesanan"
+menghasilkan 932 kasus. Setiap run Android juga memeriksa invarian otomatis (0 klik "Buat Pesanan"
 saat dry-run, ≤ 1 pesanan saat live, polling di dalam jendela dan berjarak ≥ 400 ms).
 `FLASHBUY_HEADED=1` menjalankan browser headed (di Linux tanpa layar: `xvfb-run -a python -m pytest`).
 Lint: `ruff check flashbuy tests`.

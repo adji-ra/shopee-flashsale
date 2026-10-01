@@ -166,7 +166,7 @@ class AndroidCalibrator:
         if query is not None:
             keys = [re.compile(re.escape(query.lower()))]
         else:  # variasi (mis. "S", "M") dicocokkan per kata, bukan potongan teks lain
-            keys = [re.compile(rf"\b{re.escape(self.variant.lower())}\b" if k == "{variant}" else re.escape(k))
+            keys = [re.compile(rf"(?<!\w){re.escape(self.variant.lower())}(?!\w)" if k == "{variant}" else re.escape(k))
                     for k in step.keywords if k and (k != "{variant}" or self.variant)]
         out: list[Node] = []
         if query is None:

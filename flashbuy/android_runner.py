@@ -103,6 +103,7 @@ MARKER_MAX_CHARS = 120  # penanda status hanya dicari di teks pendek (bukan desk
 MAX_AGENT_RESTARTS = 2  # restart agent maksimal saat polling (HiOS bisa membunuhnya)
 GUARD_FRESH_S = 0.5  # cek pra-klik (content-desc bahaya, sheet sebelum klik pertama) dianggap segar selama ini
 SHEET_CLOSE_S = 1.0  # sheet yang ditutup dengan back harus hilang dalam waktu ini
+ARM_DIALOG_WAIT_S = 2.0  # arm: dialog crash/ANR di atas chip variasi ditunggu hilang paling lama sekian
 _NO_PRICE = "\u0000"
 
 DEVICE_PROPS = (
@@ -251,6 +252,7 @@ class AndroidRunner:
         self._fg: tuple[float, AppInfo | None, str, bool | None] | None = None
         self._stay_lock = threading.Lock()  # svc stayon (thread precheck) vs pengembalian di close()
         self._front_blocked = False  # aplikasi lain di depan pada cek terakhir: cek berikutnya tanpa cache
+        self._guard_hit: Seen | None = None  # layar yang ditunggu, ditemukan _guard (mis. PIN ber-content-desc)
         self._dialog_logged = ""
         self.hold_screen_on = False  # run: svc power stayon usb selama run (diset CLI), dikembalikan di close()
         self._stay_restore: str | None = None  # nilai stay_on_while_plugged_in sebelum run
@@ -578,7 +580,11 @@ class AndroidRunner:
         """(aplikasi/activity di depan, error, ada WebView Shopee); ikut cache _front_app."""
         app, err = self._front_app()
         if self._fg[3] is None:
-            self._fg = (*self._fg[:3], app is not None and app.package == self.package and self.d.webview_present())
+            try:
+                webview = app is not None and app.package == self.package and self.d.webview_present()
+            except DriverError as e:  # galat sesaat: layar tetap UNKNOWN (jaring 1,5 s), bukan ERROR
+                webview, err = False, str(e)
+            self._fg = (self._fg[0], self._fg[1], err, webview)
         return app, err, bool(self._fg[3])
 
     def _outside(self, app: AppInfo) -> Seen:
@@ -705,8 +711,10 @@ class AndroidRunner:
             self._checkpoint()
             # dialog crash/ANR di atas layar yang masih terbaca (mis. checkout setelah "Buat Pesanan") = UNKNOWN
             # (jaring 1,5 s), bukan layar di bawahnya
+            self._guard_hit = None
             if not self._guard(1, allow=targets):
-                seen = self._classify(context)
+                # PIN ber-content-desc di atas checkout: _guard melihatnya, _classify bisa berhenti di anchor
+                seen = self._observe(self._guard_hit) if self._guard_hit is not None else self._classify(context)
                 if seen.screen in targets or seen.screen in TERMINAL:
                     return seen
             if self._mono() >= end:
@@ -910,6 +918,11 @@ class AndroidRunner:
         usb = stay.isdigit() and int(stay) & 2
         if usb:
             return PrecheckItem("layar tetap menyala", True, f"stay_on_while_plugged_in={stay} (USB sudah termasuk)")
+        if self.hold_screen_on and not stay.isdigit():  # nilai semula tak diketahui: jangan diubah
+            return PrecheckItem("layar tetap menyala", None,
+                                f"stay_on_while_plugged_in tidak terbaca ({stay or 'kosong'}); `svc power stayon usb` "
+                                "TIDAK dikirim (nilai semula tidak bisa dikembalikan) - aktifkan Opsi Pengembang > "
+                                "Tetap aktif manual")
         if not self.hold_screen_on:
             short = not timeout.isdigit() or int(timeout) < 15 * 60_000
             return PrecheckItem("layar tetap menyala", None if short else True,
@@ -917,7 +930,7 @@ class AndroidRunner:
                                 "alat memasang `svc power stayon usb` dan mengembalikannya setelah selesai")
         with self._stay_lock:  # close() (Ctrl+C) tidak boleh menyelip di antara cek batal & svc
             self._checkpoint()
-            self._stay_restore = stay if stay.isdigit() else "0"  # dikembalikan begitu svc terkirim
+            self._stay_restore = stay  # dikembalikan begitu svc terkirim
             self._shell("svc", "power", "stayon", "usb")
         now = self._shell("settings", "get", "global", "stay_on_while_plugged_in").strip()
         if not now.isdigit():
@@ -1120,14 +1133,22 @@ class AndroidRunner:
         if not opt.enabled:
             self.log.warn(f"variasi {self.variant!r} belum bisa dipilih")
             return
-        if self._dialog_blocks_click():
-            self.log.warn(f"dialog sistem di atas halaman produk; variasi {self.variant!r} dipilih di bottom sheet")
-            return
+        end = self._mono() + ARM_DIALOG_WAIT_S
+        while self._dialog_blocks_click():  # dialog crash/ANR di atas chip: tunggu hilang, jangan tap
+            self._checkpoint()
+            if self._mono() >= end:
+                # dipilih lewat gate saat polling (chip dibaca ulang), atau di bottom sheet setelah Beli
+                self._variant_on_page = self._recheck_variant = True
+                self.log.warn(f"dialog sistem di atas halaman produk > {ARM_DIALOG_WAIT_S:.0f} s; variasi "
+                              f"{self.variant!r} dipilih saat polling (lewat gate)")
+                return
+            opt = self._find("variant_option", sticky=False) or opt
         self.d.click(opt)
         self.log.mark("variant_selected", self.variant)
         self._variant_ok = True
         if self._has("sheet_marker") is not None:  # opsi membuka bottom sheet -> tutup, pilih ulang setelah Beli
-            self.d.press_back()
+            if not self._dialog_blocks_click():  # back saat dialog tampil mengenai dialog; sheet ditutup saat polling
+                self.d.press_back()
             self.log.info("pilih variasi membuka bottom sheet; ditutup, dipilih ulang setelah klik Beli")
             return
         # dicek ulang setelah tiap reload saat polling (status chip tak terbaca: dipilih ulang sekali per reload)
@@ -1196,9 +1217,17 @@ class AndroidRunner:
                 outcome = info
                 break
             if kind == "reload":
+                # setelah klik: reaksi berupa jendela asing? (dumpsys, sebelum menunggu slot = tumpang-tindih)
+                if clicks and self._foreign_guard(force=True):
+                    continue
+                t_wait = self._mono()
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 self._checkpoint()
+                if self._mono() - t_wait > REVERIFY_AFTER_WAIT_S and self._dialog_blocks_click():
+                    continue  # dialog crash/ANR muncul saat menunggu slot: gestur/intent tidak dikirim
+                if gate.expired():
+                    return self._window_closed(clicks)
                 last_reload = clock.now()  # jadwal reload (T+0,5 s lalu tiap 2 s) dihitung dari AWAL reload
                 self._reload()
                 self.limiter.touch(clock.now())  # efek reload ada di akhir gestur/intent: slot berikutnya dari sini
@@ -1213,7 +1242,7 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 self._checkpoint()
-                self._reselect_variant()
+                self._reselect_variant(gate)
                 self.limiter.touch(clock.now())  # seperti reload: slot berikutnya dihitung dari akhir aksi ini
                 continue
             stale = outcome.screen in (Screen.NOT_STARTED, Screen.ERROR_TOAST, Screen.VARIANT_REQUIRED)
@@ -1349,9 +1378,7 @@ class AndroidRunner:
             node = self._find(step)
             if node is not None:
                 return node
-            seen = self._classify("any")
-            if seen.screen in TERMINAL:
-                raise _Stop(TERMINAL[seen.screen], seen.evidence)
+            self._halt(self._classify("any"))
         return None
 
     def _reload(self) -> None:
@@ -1385,8 +1412,8 @@ class AndroidRunner:
                 return "expired", None
             reloadable = True
             try:
-                if clicks and self._foreign_guard():
-                    continue  # aplikasi lain di depan setelah klik: jangan klik ulang di atasnya
+                if self._front_blocked and self._foreign_guard():
+                    continue  # aplikasi lain masih di depan: jangan klik ulang/reload di atasnya
                 btn = self._find("buy_button")
                 if btn is not None and clicks and self._has("sheet_marker") is not None:
                     return "sheet", None  # klik sebelumnya membuka sheet: konfirmasi lewat gate
@@ -1450,12 +1477,18 @@ class AndroidRunner:
                     continue  # dialog crash/ANR: gestur/intent reload tidak dikirim selama dialog tampil
                 return "reload", None
 
-    def _no_pin(self, seen: Seen) -> Seen:
-        """PIN saat polling (alat belum mengklik "Buat Pesanan"): pesanan mungkin sudah terbuat."""
+    def _no_pin(self, seen: Seen, when: str = "saat polling") -> Seen:
+        """PIN sebelum alat mengklik "Buat Pesanan": pesanan mungkin sudah terbuat -> UNKNOWN_STATE + alarm."""
         if seen.screen == Screen.PIN_SCREEN:
             self.order_clicked = True
-            raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
+            raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul {when} ({seen.evidence})")
         return seen
+
+    def _halt(self, seen: Seen) -> None:
+        """Langkah maju sebelum "Buat Pesanan": status stop -> _Stop; layar PIN -> pesanan mungkin terbuat."""
+        self._no_pin(seen, "sebelum alat mengklik 'Buat Pesanan'")
+        if seen.screen in TERMINAL:
+            raise _Stop(TERMINAL[seen.screen], seen.evidence)
 
     def _guard(self, clicks: int, allow: set[Screen] | frozenset[Screen] = frozenset()) -> bool:
         """Cek yang tidak perlu tiap iterasi (dijalankan bila hasil terakhir > GUARD_FRESH_S; dipaksa segera
@@ -1470,6 +1503,8 @@ class AndroidRunner:
             return False
         if (seen := self._danger(None, "product", by="descriptionMatches")) is not None:
             if seen.screen in allow:
+                seen.evidence = f"content-desc {seen.evidence}"
+                self._guard_hit = seen
                 return False
             seen = self._no_pin(seen)
             raise _Stop(TERMINAL[seen.screen], f"content-desc {seen.evidence}")
@@ -1513,18 +1548,25 @@ class AndroidRunner:
         tidak ikut dihitung)."""
         self._unknown_since = self._loading_since = None
 
-    def _close_sheet(self) -> None:
-        """Tutup bottom sheet yang terbuka sebelum klik Beli pertama (back), lalu pastikan sudah hilang."""
+    def _close_sheet(self) -> bool:
+        """Tutup bottom sheet yang terbuka sebelum klik Beli pertama (back), lalu pastikan sudah hilang.
+        False = dialog crash/ANR tampil (back tidak dikirim, atau bisa tertelan dialog): pemanggil mencoba lagi
+        setelah dialog hilang; jaring UNKNOWN 1,5 s berlaku."""
+        if self._dialog_blocks_click():
+            return False
         self.d.press_back()
         self.log.warn("bottom sheet terbuka sebelum klik Beli; ditutup (back), tidak dikonfirmasi")
         end = self._mono() + SHEET_CLOSE_S
         while self._has("sheet_marker") is not None:
             self._checkpoint()
+            if self._dialog_blocks_click():
+                return False
             if self._mono() >= end:
                 raise _Stop(RunStatus.ERROR, "bottom sheet terbuka sebelum klik Beli dan tidak tertutup dengan back")
         self._guard_at = float("-inf")
+        return True
 
-    def _reselect_variant(self) -> None:
+    def _reselect_variant(self, gate: PollingGate | None = None) -> None:
         """Klik ulang chip variasi (slot gate sudah dipakai). Chip dibaca ulang (koordinat lama tidak dipakai),
         bahaya dicek dulu; bila chip ternyata membuka bottom sheet, sheet ditutup dan variasi dipilih di sheet
         setelah klik Beli (tidak dicek ulang lagi)."""
@@ -1537,6 +1579,8 @@ class AndroidRunner:
         if self._dialog_blocks_click():
             self._recheck_variant = True  # dicoba lagi setelah dialog hilang
             return
+        if gate is not None and gate.expired():
+            return  # aksi polling: tidak setelah T+8 s
         self.d.click(opt)
         self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
         if self._has("sheet_marker") is not None:
@@ -1598,6 +1642,7 @@ class AndroidRunner:
                         continue  # konfirmasi ditahan dialog sistem: coba lagi saat dialog hilang
                     sheet_done = True
                     t_ref = t_act = self._mono()
+                    first_loading = None  # spinner setelah konfirmasi = rentang loading baru
                     seen_clear = False  # toast lama di sheet diabaikan sebentar
                 elif now - t_ref > NO_RESPONSE_S:
                     if self._foreign_guard(force=True):
@@ -1693,9 +1738,7 @@ class AndroidRunner:
         if any(self._local(step, nodes) is not None for step in steps):
             self._recognized()
             return
-        seen = self._classify("any")
-        if seen.screen in TERMINAL:
-            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._halt(self._classify("any"))
 
     def _cart_guard(self) -> bool:
         """Lapis 2. Return True bila keranjang diubah (uncheck) -> total checkout perlu waktu dihitung ulang."""
@@ -1739,9 +1782,7 @@ class AndroidRunner:
     def _read_cart(self):
         # langkah maju: baca semua teks agar nama item ikut terbaca
         nodes = self._snapshot()
-        seen = self._classify_nodes(nodes, "any")
-        if seen.screen in TERMINAL:
-            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._halt(self._classify_nodes(nodes, "any"))
         self._still_there("cart_marker", nodes)
         boxes = self.d.find_all(Sel("className", "android.widget.CheckBox"))
         return cart_rows(boxes, nodes), checkout_count(nodes)
@@ -1752,9 +1793,7 @@ class AndroidRunner:
         nodes = self.d.find_all(self._union(("place_order", "payment_shopeepay", "payment_confirm"),
                                             ("captcha", "verification", "pin"),
                                             (PAYMENT_LABEL_MATCH, PAYMENT_METHOD_MATCH)))
-        seen = self._classify_nodes(nodes, "any")
-        if seen.screen in TERMINAL:
-            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._halt(self._classify_nodes(nodes, "any"))
         self._still_there(("place_order", "payment_shopeepay"), nodes)
         return nodes, payment_value(nodes)
 
@@ -1776,8 +1815,8 @@ class AndroidRunner:
         opt = None
         while self._mono() < end and opt is None:
             self._checkpoint()
-            if (seen := self._danger(None, "any")) is not None and seen.screen in TERMINAL:
-                raise _Stop(TERMINAL[seen.screen], seen.evidence)
+            if (seen := self._danger(None, "any")) is not None:
+                self._halt(seen)
             node = self._find("payment_shopeepay")
             opt = node if node is not None and is_shopeepay(node.label) else None
         if opt is None:
@@ -1827,9 +1866,7 @@ class AndroidRunner:
                 continue
             t_read = self._mono()
             nodes = self._checkout_read()
-            seen = self._classify_nodes(nodes, "any")
-            if seen.screen in TERMINAL:
-                raise _Stop(TERMINAL[seen.screen], seen.evidence)
+            self._halt(self._classify_nodes(nodes, "any"))
             self._still_there("place_order", nodes)
             snap = checkout_snapshot(nodes, total_rid, shipping_rid)
             shipping, total = pricing.read_total(snap)
@@ -1858,9 +1895,7 @@ class AndroidRunner:
         terbuang). Baca SEKALI semua teks layar (mahal, hanya di jalur gagal ini), susun ulang baris produk, dan
         nilai ulang dengan total/ongkir yang sudah stabil. Tetap fail-closed: verdict baru harus lolos semua cek."""
         nodes = self._snapshot()
-        seen = self._classify_nodes(nodes, "any")
-        if seen.screen in TERMINAL:
-            raise _Stop(TERMINAL[seen.screen], seen.evidence)
+        self._halt(self._classify_nodes(nodes, "any"))
         full = checkout_snapshot(nodes, total_rid, shipping_rid)
         verdict = pricing.check_checkout(pricing.CheckoutSnapshot(rows=full.rows, totals=snap.totals,
                                                                   shippings=snap.shippings,

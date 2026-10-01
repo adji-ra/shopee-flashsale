@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import re
 import threading
 
@@ -25,7 +26,7 @@ import pytest
 from flashbuy import android_selectors
 from flashbuy.android_driver import DriverError, FakeDriver, Node, Sel, U2Driver
 from flashbuy.android_runner import LOADING_LIMIT_S, SYSTEM_DIALOG_MATCH
-from flashbuy.runner_base import RunStatus
+from flashbuy.runner_base import MAYBE_ORDERED_MSG, RunStatus
 from tests.android_harness import polling_actions, run_android
 from tests.conftest import FakeClock
 from tests.fake_android import AppScenario, FakeShopeeApp
@@ -625,3 +626,301 @@ def test_legacy_calibration_without_app_version_is_strong_warning(tmp_path):
     assert ("precheck versi vs kalibrasi: PERINGATAN - PERINGATAN KERAS: kalibrasi tanpa versi Shopee tercatat "
             "(versi sekarang 3.40.21), tidak bisa dibandingkan") in _log_text(out)
     assert out.events() == ["precheck_versi"]
+
+
+# ------------------------------------------------------------------ review putaran 2 (delta perbaikan)
+
+
+class _SpinnerAroundSheetApp(FakeShopeeApp):
+    """Beli -> spinner `loading_after_buy_ms` -> sheet -> konfirmasi -> spinner `post_s` -> checkout."""
+
+    post_s = 7.0
+
+    def _enter_checkout(self, items) -> None:
+        super()._enter_checkout(items)
+        self.loading_until, self.after_loading, self.screen = self.now() + self.post_s, "checkout", "loading"
+
+
+@pytest.mark.parametrize("pre_ms, post_s", [(4000, 7.0), (300, 9.9)], ids=["4s_7s", "0.3s_9.9s"])
+def test_spinners_before_and_after_sheet_each_get_their_own_loading_budget(tmp_path, monkeypatch, pre_ms, post_s):
+    """Sheet = layar progres yang dikenali: spinner setelah konfirmasi tidak dihitung dari spinner sebelum sheet
+    (masing-masing < 10 s, jumlahnya > 10 s) -> checkout normal, bukan UNKNOWN_STATE."""
+    app_cls = type("App", (_SpinnerAroundSheetApp,), {"post_s": post_s})
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, loading_after_buy_ms=pre_ms)
+    _ok(out, False)
+    _one_buy(out)
+    _hard_rules(out)
+
+
+class _RejectUntilApp(FakeShopeeApp):
+    """Tombol Beli aktif sejak T, tetapi server menolak tap sampai T+1,2 s (toast 'Flash sale belum dimulai')."""
+
+    def _tap_buy(self, node: Node) -> None:
+        if node.enabled and self.now() < self.sc.open_at + 1.2:
+            self._event("buy")
+            self._show_toast("Flash sale belum dimulai")
+            return
+        super()._tap_buy(node)
+
+
+def test_retry_after_shopee_toast_reads_no_foreground_package(tmp_path, monkeypatch):
+    """Klik ulang setelah toast Shopee (Shopee jelas di depan): tanpa adb dumpsys (current_app, mahal di HP) di
+    jalur kritis antara klik; jarak klik ulang tetap dekat 425 ms."""
+
+    def setup(runner, app, driver):
+        orig = driver._rpc
+        driver._rpc = lambda op, target="", latency=None: orig(op, target, 0.25 if op == "current_app" else latency)
+
+    out = _run(tmp_path, monkeypatch, app_cls=_RejectUntilApp, setup=setup, button_enabled_before_open=True,
+               flash_price=99_000, normal_price=99_000)
+    _ok(out, False)
+    buys = [e["t_server_ms"] for e in out.kind("buy")]
+    assert len(buys) >= 3, buys
+    assert all(b - a <= 650 for a, b in zip(buys, buys[1:], strict=False)), buys
+    ops = [op for t, op, _ in _queries(out) if buys[0] <= t <= _step_t(out, "buy_ok")]
+    assert "current_app" not in ops, "current_app di antara klik ulang"
+    _hard_rules(out)
+
+
+def _queries(out) -> list[tuple[int, str, str]]:
+    with (out.log_dir / "android-queries-run.csv").open(encoding="utf-8", newline="") as f:
+        return [(int(r[0]), r[1], r[2]) for r in list(csv.reader(f))[1:]]
+
+
+class _BlankThenSheetApp(FakeShopeeApp):
+    """Setelah Beli: layar kosong 0,3 s (transisi), lalu bottom sheet."""
+
+    def _tap_buy(self, node: Node) -> None:
+        self._event("buy")
+        self.blank_until, self.screen = self.now() + 0.3, "blank"
+
+    def _render(self):
+        if self.screen == "blank" and self.now() >= self.blank_until:
+            self.screen = "sheet"
+        return super()._render()
+
+    def _r_blank(self):
+        return []
+
+
+def test_transient_webview_query_error_on_unknown_screen_is_not_fatal(tmp_path, monkeypatch):
+    """Galat sesaat pada cek WebView (layar transisi kosong) = layar tak terbaca (jaring UNKNOWN), bukan ERROR."""
+
+    def setup(runner, app, driver):
+        orig, state = driver.webview_present, {"n": 0}
+
+        def webview():
+            state["n"] += 1
+            if state["n"] == 1 and app.screen == "blank":
+                raise DriverError("JSONRPCError: transient")
+            return orig()
+
+        driver.webview_present = webview
+
+    out = _run(tmp_path, monkeypatch, app_cls=_BlankThenSheetApp, setup=setup)
+    _ok(out, False)
+    _one_buy(out)
+    _hard_rules(out)
+
+
+@BOTH
+def test_anr_appearing_as_arm_reads_variant_chip_waits_then_selects(tmp_path, monkeypatch, live):
+    """Chip variasi di halaman produk, tanpa bottom sheet; dialog ANR muncul tepat saat arm membaca chip: chip
+    tidak di-tap selama dialog, dipilih setelah dialog hilang (dulu: tidak pernah dipilih -> PRICE_GUARD)."""
+
+    def setup(runner, app, driver):
+        app.runner = runner
+        orig = driver.info
+
+        def info(sel):
+            if app.window is None and sel == Sel("text", "Biru") and app.now() < app.sc.open_at:
+                app.window = (app.now(), app.now() + 0.6)
+            return orig(sel)
+
+        driver.info = info
+
+    app_cls = type("App", (_AnrAfterStepApp,), {"trigger": "__never__"})
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, setup=setup, live=live, variants=["Merah", "Biru"],
+               variants_on_page=True, sheet=False, cfg={"variant": "Biru"})
+    _ok(out, live)
+    _quiet_in(out, out.app.window)
+    variant = out.kind("variant")
+    assert [e["detail"] for e in variant] == ["Biru"] and variant[0]["t_server_ms"] < _t(out)
+    assert variant[0]["t_server_ms"] >= int(out.app.window[1] * 1000)
+    _hard_rules(out, ordered=live)
+
+
+class _DialogFrontAfterErrorApp(FakeShopeeApp):
+    """Klik Beli -> halaman galat (tanpa tombol Beli); 0,2 s kemudian jendela verifikasi asing berbentuk dialog di
+    depan (halaman galat tetap terbaca)."""
+
+    def _tap_buy(self, node: Node) -> None:
+        self._event("buy")
+        self.t_front, self.screen = self.now() + 0.2, "errorpage"
+
+    def _r_errorpage(self):
+        return [("", Node(text="Detail Produk", bounds=(100, 60, 500, 110))),
+                ("", Node(text="Gagal memuat. Coba lagi nanti", bounds=(100, 700, 620, 760)))]
+
+    def _front(self) -> bool:
+        return getattr(self, "t_front", None) is not None and self.now() >= self.t_front
+
+    @property
+    def package(self) -> str:
+        return RECAPTCHA.split("/")[0] if self._front() else super().package
+
+    def activity(self) -> str:
+        return RECAPTCHA.split("/", 1)[1] if self._front() else super().activity()
+
+
+@pytest.mark.parametrize("reload", ["swipe", "intent"])
+def test_foreign_window_after_click_blocks_reload(tmp_path, monkeypatch, reload):
+    """Reload setelah klik (halaman galat) didahului cek package di depan: jendela verifikasi asing -> VERIFICATION
+    tanpa reload (intent reload akan menutupi layar verifikasi, swipe akan mengenai jendela itu)."""
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=_DialogFrontAfterErrorApp, runner_attrs=attrs,
+               cfg={"android": {"reload": reload}})
+    _stopped(out, attrs, RunStatus.VERIFICATION)
+    assert out.result.message == f"aplikasi/activity asing di depan: {RECAPTCHA}"
+    buy = _one_buy(out)
+    assert out.app.events[-1] == buy, "tidak ada reload/aksi setelah klik"
+    _hard_rules(out)
+
+
+class _PinOverlayApp(FakeShopeeApp):
+    """'Buat Pesanan' -> PIN ShopeePay sebagai overlay di atas checkout; judulnya HANYA content-desc (tanpa teks,
+    tanpa resource-id), node checkout tetap ada di pohon."""
+
+    def _handle(self, key: str, node: Node) -> None:
+        if key != "place_order":
+            return super()._handle(key, node)
+        self._event("order", self.payment_method)
+        self.pin_overlay = True
+
+    def _r_checkout(self):
+        out = super()._r_checkout()
+        if getattr(self, "pin_overlay", False):
+            out.append(("", Node(desc="Masukkan PIN ShopeePay", bounds=(0, 600, 720, 1612))))
+        return out
+
+
+def test_content_desc_pin_overlay_over_checkout_is_order_placed(tmp_path, monkeypatch):
+    out = _run(tmp_path, monkeypatch, app_cls=_PinOverlayApp, live=True)
+    assert out.result.status == RunStatus.ORDER_PLACED_AWAIT_PIN, out.result.message
+    order = out.kind("order")
+    assert len(order) == 1 and out.app.events[-1] == order[0], "tidak ada aksi setelah 'Buat Pesanan'"
+    assert _step_t(out, "pin_screen") - order[0]["t_server_ms"] <= 700
+
+
+class _PinInsteadOfListApp(FakeShopeeApp):
+    """Tap baris 'Metode Pembayaran' memunculkan layar PIN (sebelum alat mengklik 'Buat Pesanan')."""
+
+    def _handle(self, key: str, node: Node) -> None:
+        if key == "payment_row":
+            self._event("pin_shown")
+            self.screen = "pin"
+            return
+        super()._handle(key, node)
+
+
+@BOTH
+def test_pin_screen_during_checkout_steps_is_maybe_ordered_stop(tmp_path, monkeypatch, live):
+    """Layar PIN sebelum 'Buat Pesanan' dari alat (langkah maju): pesanan mungkin terbuat -> UNKNOWN_STATE + pesan
+    wajib + alarm + stop semua (dulu: ERROR 'opsi ShopeePay tidak ditemukan' tanpa alarm)."""
+    attrs = _stop()
+    out = _run(tmp_path, monkeypatch, app_cls=_PinInsteadOfListApp, live=live, runner_attrs=attrs,
+               payment_default="COD - Cek Dulu")
+    _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+    assert out.result.message == MAYBE_ORDERED_MSG
+    assert "layar PIN muncul sebelum alat mengklik 'Buat Pesanan'" in out.result.detail, out.result.detail
+    assert out.kind("order") == [] and out.app.events[-1]["kind"] == "pin_shown", "tidak ada aksi di layar PIN"
+
+
+@pytest.mark.parametrize("skew_ms", [5000, 7900, 7930])
+def test_variant_reselect_after_reload_never_after_t_plus_8s(tmp_path, monkeypatch, skew_ms):
+    """Pilih ulang variasi setelah reload = aksi polling: tidak di-tap setelah T+8 s walaupun slot gate <= T+8 s
+    (skew 7900/7930: slot T+7,94..7,99 s, dulu tap mendarat T+8,02..8,06 s). Kontrol 5000: dipilih ulang."""
+    out = run_android(tmp_path, variants=["Merah", "Biru"], variants_on_page=True, sheet=False,
+                      sale_skew_ms=skew_ms, cfg={"variant": "Biru", "android": {"reload": "intent"}})
+    taps = [e["t_server_ms"] - _t(out) for e in out.kind("variant") if e["t_server_ms"] >= _t(out) - 1000]
+    assert all(t <= 8000 for t in taps), taps
+    if skew_ms == 5000:
+        assert taps and out.result.status == RunStatus.DRYRUN_OK, (taps, out.result.message)
+    _hard_rules(out)
+
+
+@pytest.mark.parametrize("start_s", [0.70, 0.76, 0.80, 0.85])
+def test_anr_appearing_while_waiting_for_reload_slot_blocks_reload(tmp_path, monkeypatch, start_s):
+    """Klik Beli -> halaman galat -> keputusan reload -> dialog ANR muncul saat menunggu slot gate: gestur/intent
+    reload tidak dikirim selama dialog tampil."""
+    app_cls = type("App", (_DialogFrontAfterErrorApp,), {"_front": lambda self: False,
+                                                         "on_refresh": FakeShopeeApp.on_refresh})
+
+    def refresh(self):
+        if self.screen == "errorpage":
+            self._event("refresh")
+            self.screen = "product"
+
+    app_cls.on_refresh = refresh
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, anr_dialog=(start_s, start_s + 1.0), sale_skew_ms=300)
+    window = (out.open_at + start_s, out.open_at + start_s + 1.0)
+    acts = [a for a in polling_actions(out) if window[0] * 1000 <= a < window[1] * 1000]
+    assert acts == [], "reload/klik selama dialog ANR"
+    assert out.kind("refresh"), "reload dikirim setelah dialog hilang"
+    _hard_rules(out)
+
+
+class _AutoSheetApp(FakeShopeeApp):
+    """Pada T+`at` bottom sheet tanpa teks 'Beli Sekarang' terbuka sendiri, bersamaan dengan dialog ANR menetap.
+    Back saat dialog tampil tertelan dialog (ANR tidak bisa dibatalkan)."""
+
+    at = 0.0
+
+    def _render(self):
+        if self.screen == "product" and self.now() >= self.sc.open_at + self.at and not self.kind("auto_sheet"):
+            self._event("auto_sheet")
+            self.screen = "autosheet"
+        return super()._render()
+
+    def _r_autosheet(self):
+        return [("", Node(text="Detail Produk", bounds=(100, 60, 500, 110))),
+                ("", Node(text="Jumlah", bounds=(20, 1300, 200, 1340))),
+                ("", Node(text="Konfirmasi", bounds=(0, 1500, 720, 1612), clickable=True))]
+
+    def on_back(self) -> None:
+        if self.anr_active():
+            self._event("back_on_anr")
+            return
+        super().on_back()
+        if self.screen == "autosheet":
+            self.screen = "product"
+
+
+@pytest.mark.parametrize("at", [-0.04, -0.01, 0.02, 0.05])
+def test_sheet_and_anr_together_before_first_buy_no_back_into_dialog(tmp_path, monkeypatch, at):
+    """Sheet + dialog ANR menetap muncul bersamaan sebelum klik Beli pertama: tidak ada back ke dialog;
+    UNKNOWN_STATE (jaring 1,5 s), bukan ERROR 'sheet tidak tertutup'."""
+    attrs = _stop()
+    app_cls = type("App", (_AutoSheetApp,), {"at": at})
+    out = _run(tmp_path, monkeypatch, app_cls=app_cls, anr_dialog=(at, at + 5.0), runner_attrs=attrs)
+    _stopped(out, attrs, RunStatus.UNKNOWN_STATE)
+    assert out.kind("back_on_anr") == [] and out.kind("back") == []
+    assert out.kind("buy") == [] and out.kind("tap") == []
+    _hard_rules(out)
+
+
+class _StayReadFailsApp(FakeShopeeApp):
+    def shell(self, cmd: list[str]) -> str:
+        if " ".join(cmd) == "settings get global stay_on_while_plugged_in" and not self.kind("stay_read_failed"):
+            self._event("stay_read_failed")
+            raise DriverError("adb: device offline")
+        return super().shell(cmd)
+
+
+def test_unreadable_original_stay_on_is_never_changed(tmp_path, monkeypatch):
+    """Nilai semula stay_on_while_plugged_in tidak terbaca: svc TIDAK dikirim (nilai pengguna, mis. 'Tetap aktif'
+    = 7, tidak boleh diganti lalu 'dikembalikan' ke 0)."""
+    out = _run(tmp_path, monkeypatch, app_cls=_StayReadFailsApp, stay_on="7", runner_attrs={"hold_screen_on": True})
+    _ok(out, False)
+    assert _stay(out) == [] and out.app.sc.stay_on == "7"
+    assert "`svc power stayon usb` TIDAK dikirim" in _log_text(out)
