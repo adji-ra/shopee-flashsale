@@ -63,6 +63,11 @@ def order_counts(text: str | None) -> list[int]:
     return [int(n) for n in _ORDER_COUNT_RE.findall(normalize(text))]
 
 
+def squash(text: str) -> str:
+    """Huruf kecil, hanya huruf & angka ("128GB, Hitam" ~ "128GB Hitam")."""
+    return re.sub(r"[\W_]+", "", normalize(text).lower())
+
+
 def rupiah(n: int | None) -> str:
     return "?" if n is None else "Rp" + f"{n:,}".replace(",", ".")
 
@@ -72,6 +77,7 @@ class Limits:
     max_item_price: int
     max_total: int
     expected_name: str | None = None
+    expected_variant: str | None = None  # bila diisi: teks variasi harus terlihat di baris produk checkout
 
 
 # --------------------------------------------------------------------------- lapis 1: produk
@@ -111,6 +117,22 @@ def name_matches(text: str, name: str | None) -> bool:
     return bool(name) and normalize(name).lower() in normalize(text).lower()
 
 
+_VARIANT_LINE_RE = re.compile(r"\s*variasi\b", re.I)
+
+
+def variant_text(text: str, expected_name: str | None = None) -> str:
+    """Teks variasi pesanan: baris yang diawali "Variasi". Tanpa baris itu: baris selain nama produk
+    (baris pertama / yang memuat expected_name), harga, dan kuantitas. Nama produk TIDAK ikut, supaya judul
+    "Kaos Hitam Putih" tidak meloloskan variasi "Hitam" saat baris variasi menunjukkan "Putih"."""
+    lines = [ln for ln in normalize(text).splitlines() if ln.strip()]
+    labelled = [ln for ln in lines if _VARIANT_LINE_RE.match(ln)]
+    if labelled:
+        return "\n".join(labelled)
+    rest = [ln for ln in lines[1:] if not find_amounts(ln) and parse_qty(ln) is None
+            and not name_matches(ln, expected_name)]
+    return "\n".join(rest)
+
+
 @dataclass
 class CartVerdict:
     ok: bool
@@ -118,13 +140,18 @@ class CartVerdict:
     reason: str = ""
 
 
-def check_cart(rows: list[CartRow], target_name: str | None) -> CartVerdict:
-    """Tentukan baris yang harus di-uncheck. ok=True bila tepat 1 baris tercentang."""
+def check_cart(rows: list[CartRow], target_name: str | None, strict: bool = False) -> CartVerdict:
+    """Tentukan baris yang harus di-uncheck. ok=True bila tepat 1 baris tercentang.
+
+    strict (nama acuan dari expected_name): satu-satunya baris tercentang juga harus memuat nama acuan.
+    """
     checked = [i for i, r in enumerate(rows) if r.checked]
     if len(checked) == 1:
         qty = rows[checked[0]].qty
         if qty is not None and qty != 1:
             return CartVerdict(False, reason=f"kuantitas di keranjang {qty}, bukan 1")
+        if strict and target_name and not name_matches(rows[checked[0]].text, target_name):
+            return CartVerdict(False, reason=f"item tercentang bukan target (nama acuan {target_name!r})")
         return CartVerdict(True, reason="1 item tercentang")
     if not checked:
         return CartVerdict(False, reason="tidak ada item tercentang")
@@ -179,6 +206,8 @@ def check_checkout(snap: CheckoutSnapshot, limits: Limits) -> CheckoutVerdict:
         qty = parse_qty(snap.rows[0]) if len(snap.rows) == 1 else None
         amounts = [a for row in snap.rows for a in find_amounts(row)]
     elif counts:
+        if len(counts) != 1:  # beberapa grup "(N Produk)" = beberapa toko/produk
+            reasons.append(f"{len(counts)} grup pesanan (harus tepat 1)")
         qty = counts[0] if len(set(counts)) == 1 else None
         amounts = []
     else:
@@ -211,6 +240,11 @@ def check_checkout(snap: CheckoutSnapshot, limits: Limits) -> CheckoutVerdict:
         values["name_ok"] = name_matches(haystack, limits.expected_name)
         if not values["name_ok"]:
             reasons.append(f"nama produk tidak memuat {limits.expected_name!r}")
+    if limits.expected_variant:
+        haystack = variant_text(" \n".join(snap.rows) if snap.rows else snap.page_text, limits.expected_name)
+        values["variant_ok"] = bool(haystack) and squash(limits.expected_variant) in squash(haystack)
+        if not values["variant_ok"]:
+            reasons.append(f"variasi {limits.expected_variant!r} tidak terlihat di baris produk")
 
     shipping, total = read_total(snap)
     values["shipping"], values["total"] = shipping, total

@@ -6,7 +6,7 @@ payment: "ShopeePay"
 # Pengaman harga (WAJIB). Alat berhenti (PRICE_GUARD) bila harga/total melewati batas ini.
 max_item_price: 1500000       # harga flash maksimum per unit (Rupiah)
 max_total: 1550000            # total pembayaran maks, termasuk ongkir & biaya layanan
-expected_name: "Ponsel"       # opsional: potongan nama produk (tidak peka huruf besar/kecil)
+expected_name: "Ponsel"       # potongan nama produk (tidak peka huruf besar/kecil); WAJIB untuk --live
 lead_ms: 150                  # opsional, bisa di-override --lead-ms
 web:
   enabled: true
@@ -17,4 +17,5 @@ android:
   enabled: true
   serial: ""                  # kosong = device pertama
   package: "com.shopee.id"
+  reload: "swipe"             # reload produk saat polling: "swipe" (tarik ke bawah) | "intent" (buka ulang URL)
 notify_webhook: ""            # opsional

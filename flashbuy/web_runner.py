@@ -21,7 +21,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from flashbuy import pricing, selector_store
-from flashbuy.config import FLOW_TIMEOUT_S, TargetConfig, WebConfig
+from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, WebConfig, require_live_ready
 from flashbuy.guards import ENABLED_JS, MIN_IFRAME_PX, TERMINAL, Classification, Guard, PageState
 from flashbuy.notifier import Notifier
 from flashbuy.runner_base import (
@@ -34,6 +34,7 @@ from flashbuy.runner_base import (
     RunLog,
     RunResult,
     RunStatus,
+    after_order_click,
     always_allow,
 )
 from flashbuy.selector_store import SelectorSet
@@ -313,8 +314,12 @@ class WebRunner:
                                           f"saldo {pricing.rupiah(balance)} terbaca, harga produk tidak terbaca "
                                           f"({price_text!r})"))
         else:
-            need = price + (shipping or 0)
+            # sebelum flash sale halaman bisa menampilkan harga normal; alat tidak membayar > max_item_price
+            unit = min(price, self.limits.max_item_price)
+            need = unit + (shipping or 0)
             note = "" if shipping is not None else " (ongkir tidak terbaca)"
+            if unit < price:
+                note += f" (harga tampil {pricing.rupiah(price)} dibatasi max_item_price)"
             res.items.append(PrecheckItem("saldo ShopeePay", balance >= need,
                                           f"saldo {pricing.rupiah(balance)} vs harga+ongkir "
                                           f"{pricing.rupiah(need)}{note}"))
@@ -395,6 +400,11 @@ class WebRunner:
 
     async def attempt(self, clock: ServerClock, live: bool) -> RunResult:
         self.clock = clock
+        if live:
+            try:
+                require_live_ready(self.cfg)
+            except ConfigError as e:
+                return await self._finish(RunStatus.ERROR, str(e), live)
         self._tracking = True
         self._unknown_since = None
         try:
@@ -602,6 +612,13 @@ class WebRunner:
                     return c
             else:
                 seen_clear = True
+            if st == PageState.UNKNOWN:
+                # halaman tak dikenal (bisa tantangan yang tidak terbaca): jangan klik ulang/reload di atasnya;
+                # jaring UNKNOWN_STATE (_observe) yang memutuskan
+                if elapsed > self.flow_timeout_s:
+                    return Classification(PageState.UNKNOWN, "timeout")
+                await asyncio.sleep(POLL_S)
+                continue
             if self._nav_pending:
                 if elapsed > self.flow_timeout_s:
                     return Classification(PageState.UNKNOWN, "timeout")
@@ -655,7 +672,7 @@ class WebRunner:
                                                    "baris item tidak terbaca")
             self.log.warn("keranjang: baris item tidak terbaca; diputuskan di checkout (lapis 3)")
             return
-        verdict = pricing.check_cart(rows, target)
+        verdict = pricing.check_cart(rows, target, strict=bool(self.cfg.expected_name))
         if verdict.to_uncheck:
             for i in verdict.to_uncheck:
                 self._checkpoint()
@@ -666,7 +683,7 @@ class WebRunner:
                 self.log.mark("cart_uncheck", rows[i].text.splitlines()[0][:50])
             await asyncio.sleep(0.2)
             rows, counts = await self._read_cart()
-            verdict = pricing.check_cart(rows, target)
+            verdict = pricing.check_cart(rows, target, strict=bool(self.cfg.expected_name))
         if not verdict.ok:
             names = "; ".join(r.text.splitlines()[0][:40] for r in rows if r.checked)
             raise _Stop(RunStatus.PRICE_GUARD, f"keranjang: {verdict.reason} [{names}]")
@@ -736,10 +753,11 @@ class WebRunner:
     # ------------------------------------------------------------------ akhir
 
     async def _finish(self, status: RunStatus, message: str, live: bool) -> RunResult:
-        if self.order_clicked and status != RunStatus.ORDER_PLACED_AWAIT_PIN:
-            message = f"'Buat Pesanan' SUDAH diklik, cek status pesanan secara manual! ({message})"
-        self.log.mark("result", f"{status}: {message}")
-        result = RunResult(self.name, status, message, live, steps=list(self.log.steps))
+        detail = ""
+        if self.order_clicked:
+            status, message, detail = after_order_click(status, message)
+        self.log.mark("result", f"{status}: {message}" + (f" ({detail})" if detail else ""))
+        result = RunResult(self.name, status, message, live, steps=list(self.log.steps), detail=detail)
         if status in STOP_ALL_STATUSES and self.stop_event is not None:
             self.stop_event.set()
         if status in ALARM_STATUSES or self.order_clicked:

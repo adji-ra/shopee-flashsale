@@ -57,6 +57,8 @@ class AndroidConfig(_Strict):
     enabled: bool = True
     serial: str = ""  # kosong = device pertama
     package: str = "com.shopee.id"
+    # cara reload halaman produk saat polling: tarik-untuk-muat-ulang, atau buka ulang lewat intent VIEW
+    reload: Literal["swipe", "intent"] = "swipe"
 
 
 class TargetConfig(_Strict):
@@ -125,6 +127,13 @@ class TargetConfig(_Strict):
     def origin(self) -> str:
         parts = urlsplit(self.product_url)
         return f"{parts.scheme}://{parts.netloc}"
+
+
+def require_live_ready(cfg: TargetConfig) -> None:
+    """Syarat tambahan mode --live: `expected_name` wajib (pengaman nama produk di keranjang & checkout)."""
+    if not cfg.expected_name:
+        raise ConfigError("mode --live ditolak: `expected_name` wajib diisi di target.yaml "
+                          "(potongan nama produk, mis. \"Ponsel X 128GB\")")
 
 
 def load_config(path: str | Path, *, allow_local: bool = False) -> TargetConfig:
