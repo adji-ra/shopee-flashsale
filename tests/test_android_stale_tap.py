@@ -225,3 +225,46 @@ def test_unsafe_buy_selector_is_rejected_by_precheck_and_never_tapped(tmp_path, 
     assert app.kind("tap") == [] and app.kind("order") == []
     with pytest.raises(Exception, match="tidak diketuk"):  # klik selector dengan selector itu ditolak
         runner._tap_selector("buy_button", Node(text="Beli Sekarang", via=(android_selectors.to_sel(cand), None)))
+
+
+# ------------------------------------------------------------------ elemen berubah saat diklik di server
+
+
+def _stale_on(label_part: str, times: int = 1):
+    """Klik selector berikutnya yang selectornya memuat `label_part` gagal di server dengan StaleObjectException
+    (elemen dibangun ulang di antara pencarian & klik, SEBELUM gesture): tidak ada ketukan."""
+    from flashbuy.android_driver import SelectorStale
+
+    class StaleDriver(FakeDriver):
+        left = times
+
+        def _rpc(self, op: str, target: object = "", latency: float | None = None) -> None:
+            if op == "click_sel" and label_part in str(target) and self.left > 0:
+                self.left -= 1
+                self.fail_next.append(SelectorStale(f"click_sel {target}: elemen berubah saat diklik"))
+            return super()._rpc(op, target, latency)
+
+    return StaleDriver
+
+
+def test_stale_element_on_buy_tap_is_not_tapped_and_reclassified(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "FakeDriver", _stale_on("Beli"))
+    out = harness.run_android(tmp_path, live=False, sheet=False)
+    assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
+    assert ("click_sel", "text='Beli Sekarang'") in out.driver.calls, "klik selector pertama gagal di server"
+    assert len(out.kind("buy")) == 1 and out.kind("order") == []
+
+
+def test_stale_element_on_place_order_tap_is_maybe_ordered(tmp_path, monkeypatch):
+    """"Buat Pesanan" + error server: tetap dianggap mungkin terketuk (pesan wajib), bukan "tidak diketuk"."""
+    monkeypatch.setattr(harness, "FakeDriver", _stale_on("Buat Pesanan"))
+    out = harness.run_android(tmp_path, live=True, sheet=False, invariants=False)
+    assert out.result.status == RunStatus.UNKNOWN_STATE and out.result.message == MAYBE_ORDERED_MSG
+    assert out.runner.order_clicked
+
+
+def test_agent_restart_reapplies_selector_click_setup_at_once(tmp_path):
+    out = harness.run_android(tmp_path, driver_kw={"alive": False})
+    ops = [op for op, _ in out.driver.calls]
+    i = ops.index("restart_agent")
+    assert "configure" in ops[i + 1:ops.index("click")], "tunggu implisit dimatikan lagi segera setelah restart"

@@ -39,6 +39,7 @@ from flashbuy.android_driver import (
     DriverError,
     Node,
     Sel,
+    SelectorStale,
     TimedDriver,
     U2Driver,
     node_matches,
@@ -94,6 +95,7 @@ CHECKBOX_SEL = Sel("className", "android.widget.CheckBox")  # centang item keran
 TAP_STEPS = ("buy_button", "variant_option", "sheet_confirm", "cart_checkout", "payment_change", "payment_shopeepay",
              "payment_confirm")
 FORWARD_RETRIES = 3  # ketukan langkah maju yang elemennya hilang saat diketuk: klasifikasi ulang & coba lagi
+PRE_SALE_BANNER = re.compile(r"(?i)dimulai\s+dalam")  # banner hitung mundur flash sale (bukan Toast "belum dimulai")
 STALE_TOAST_S = 0.4  # toast/banner lama yang masih tampil diabaikan selama ini
 FIRST_RELOAD_S = 0.5  # belum siap (tombol/harga) di T+0,5 s -> reload pertama
 RELOAD_EVERY_S = 2.0  # reload berikutnya tiap 2 s (tetap lewat RateLimiter & jendela)
@@ -567,14 +569,15 @@ class AndroidRunner:
             return self._observe(msg_seen, t_obs)
         if context in ("after_buy", "after_order") and (toast := self._toast_screen(context)) is not None:
             return self._observe(toast, t_obs)
+        # rehearsal (pra-sale): banner hitung mundur "Flash Sale dimulai dalam .." selalu tampil, bukan reaksi
+        # klik Beli. Pesan "belum dimulai" sungguhan (Toast: _toast_screen di atas; overlay teks) tetap terbaca.
+        pre_sale = (self.rehearsal and msg_seen is not None and msg_seen.screen == Screen.NOT_STARTED
+                    and msg_seen.node is not None and PRE_SALE_BANNER.search(msg_seen.node.label) is not None)
         if anchor is not None:  # SHEET
-            # rehearsal (pra-sale): teks "dimulai dalam" = banner hitung mundur yang selalu tampil, bukan reaksi
-            # klik; Toast "belum dimulai" sungguhan tetap tertangkap _toast_screen di atas
-            pre_sale = self.rehearsal and msg_seen is not None and msg_seen.screen == Screen.NOT_STARTED
             if msg_seen is not None and context == "after_buy" and not pre_sale:
                 return self._observe(msg_seen, t_obs)
             return self._observe(anchor, t_obs)
-        if context == "after_buy" and msg_seen is not None:  # "belum dimulai" di halaman produk
+        if context == "after_buy" and msg_seen is not None and not pre_sale:  # "belum dimulai" di halaman produk
             return self._observe(msg_seen, t_obs)
         if buy is not None:
             return self._observe(self._product(buy), t_obs)
@@ -816,7 +819,7 @@ class AndroidRunner:
         else:
             self.log.warn(f"agent uiautomator2 {why}; menghidupkan ulang")
             try:
-                self.d.restart_agent()
+                self._restart_agent()
                 ok, why2 = self._agent_healthy()
             except DriverError as e:
                 ok, why2 = False, str(e)
@@ -1178,7 +1181,7 @@ class AndroidRunner:
         alive = self.d.agent_alive()
         if alive is False:
             self.log.warn(f"{when}: agent uiautomator2 mati (HiOS?), menghidupkan ulang")
-            self.d.restart_agent()
+            self._restart_agent()
             self.log.info(f"{when}: agent hidup lagi ({self.d.agent_alive()})")
 
     async def _keepalive_loop(self) -> None:
@@ -1665,7 +1668,13 @@ class AndroidRunner:
             self.d.click(node)
             return True
         sel, instance = self._tap_selector(step, node)
-        return self.d.click_sel(sel, instance)
+        try:
+            return self.d.click_sel(sel, instance)
+        except SelectorStale as e:
+            if step == "place_order":
+                raise  # tetap dianggap mungkin terketuk -> pesan wajib "Pesanan MUNGKIN sudah terbuat"
+            self.log.warn(f"{e}; tidak diketuk, layar diklasifikasi ulang")
+            return False
 
     def _tap_selector(self, step: str, node: Node) -> tuple[Sel, int | None]:
         """Selector untuk mengetuk `node` lewat klik selector: selector langkah ini yang menemukannya (via), atau
@@ -1773,7 +1782,14 @@ class AndroidRunner:
             raise err
         self._agent_restarts += 1
         self.log.warn(f"restart agent #{self._agent_restarts}")
+        self._restart_agent()
+
+    def _restart_agent(self) -> None:
+        """Restart agent + (mode selector) matikan lagi tunggu implisit sekarang, bukan di dalam ketukan pertama
+        sesudahnya (agent baru = Configurator bawaan)."""
         self.d.restart_agent()
+        if self.tap_mode == "selector":
+            self.d.configure_selector_click()
 
     def _after_buy(self, stale: bool, confirm_done: bool = False) -> Seen:
         """Tunggu reaksi klik Beli/konfirmasi. 'Tidak bereaksi' hanya bila halaman produk TIDAK berubah

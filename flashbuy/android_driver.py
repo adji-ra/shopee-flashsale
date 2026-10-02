@@ -46,6 +46,12 @@ class AgentDead(DriverError):
     """Agent uiautomator2 / transport adb tidak menjawab (mis. dibunuh HiOS); bisa dipulihkan dengan restart."""
 
 
+class SelectorStale(DriverError):
+    """Klik selector gagal karena elemen dibangun ulang / hilang di antara pencarian dan klik di server
+    (StaleObjectException / NullPointerException), SEBELUM gesture dikirim. Pemanggil mengklasifikasi ulang;
+    untuk "Buat Pesanan" tetap diperlakukan sebagai mungkin terketuk (aman)."""
+
+
 # Nama exception u2/adbutils/socket yang berarti agent atau transport mati (bukan "elemen tidak ada").
 _DEAD_ERRORS = {"HTTPError", "HTTPTimeoutError", "UiAutomationNotConnectedError", "ConnectionError",
                 "ConnectionResetError", "ConnectionRefusedError", "TimeoutError", "timeout", "AdbError",
@@ -379,6 +385,8 @@ class U2Driver:
             except Exception as e:  # noqa: BLE001
                 if type(e).__name__ == "UiObjectNotFoundError":
                     return False  # tidak ditemukan di device: tidak ada ketukan
+                if "StaleObject" in str(e) or "NullPointerException" in str(e):
+                    raise SelectorStale(f"click_sel {sel}: elemen berubah saat diklik ({type(e).__name__})") from e
                 raise
             return True  # server menjawab (true/false): ketukan dianggap TERJADI (aman untuk "Buat Pesanan")
 
@@ -828,6 +836,7 @@ class FakeDriver:
         self._rpc("restart_agent", latency=2.0)
         self.restarts += 1
         self.alive = True
+        self.no_wait = False  # agent baru: Configurator bawaan (tunggu implisit)
 
     def window_size(self) -> tuple[int, int]:
         m = re.search(r"(\d+)x(\d+)", self.wm_size)

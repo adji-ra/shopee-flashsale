@@ -639,15 +639,17 @@ python -m flashbuy timesync [--samples 5] [--ntp-host id.pool.ntp.org] [--url ht
 
 ## Tes
 
-`python -m pytest -q` menjalankan 1387 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
+`python -m pytest -q` menjalankan 1443 tes (tanpa xfail): unit, mock end-to-end web dengan Chromium
 headless, kalibrasi dengan Alt+klik yang disimulasikan, jalur Android di atas device palsu
 (`FakeDriver` + `tests/fake_android.py`, jam virtual) termasuk CLI, kalibrasi, pengaman harga, dan
 skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet, dialog ANR, aplikasi asing), serta
 orchestrator dengan **kedua jalur berjalan bersamaan** (mock web + Playwright dan FakeDriver di jam nyata):
 lock pemenang (tepat 1 "Buat Pesanan"), stop global (0 tap setelah stop), pemenang yang sudah mengklik tetap
 sampai PIN, PRICE_GUARD satu jalur, precheck satu/dua gagal, rate limit per jalur, lock antar-proses (proses
-kedua ditolak), dan setiap baris `doctor` (PASS/WARN/FAIL, termasuk versi Shopee berubah & selector lama).
-Jumlahnya besar karena parametrisasi: 586 fungsi tes, 217 di antaranya diparametrisasi (misalnya setiap
+kedua ditolak), setiap baris `doctor` (PASS/WARN/FAIL, termasuk versi Shopee berubah & selector lama), mode ketuk
+Android (layar berganti ke checkout tepat di antara baca & ketuk: `selector` → 0 ketukan "Buat Pesanan"), dan
+rehearsal web & Android (sampai checkout, 0 "Buat Pesanan" di semua skenario, termasuk PIN setelah Beli).
+Jumlahnya besar karena parametrisasi: 620 fungsi tes, 227 di antaranya diparametrisasi (misalnya setiap
 skenario dijalankan dry-run dan live, serta untuk kedua mode refresh). Setiap run Android juga memeriksa
 invarian otomatis (0 klik "Buat Pesanan" saat dry-run, ≤ 1 pesanan saat live, polling di dalam jendela dan
 berjarak ≥ 400 ms).

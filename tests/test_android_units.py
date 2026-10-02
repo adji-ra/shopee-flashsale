@@ -2404,3 +2404,18 @@ def test_u2_find_all_and_info_record_via_for_selector_click():
     sel = Sel("text", "Beli Sekarang")
     assert drv.info(sel).via == (sel, None)
     assert [n.via for n in drv.find_all(sel)] == [(sel, 0), (sel, 1)]
+
+
+
+@pytest.mark.parametrize("err", [STALE, "Unknown RPC error: -32001 java.lang.NullPointerException: Attempt to invoke"])
+def test_u2_click_sel_server_stale_or_npe_is_selector_stale(err):
+    """Elemen dibangun ulang / hilang di antara pencarian & klik di server (sebelum gesture): SelectorStale, bukan
+    DriverError umum; pemanggil mengklasifikasi ulang (untuk "Buat Pesanan": tetap mungkin terketuk)."""
+    from flashbuy.android_driver import SelectorStale
+
+    drv, dev = _u2()
+    drv.click_sel(Sel("text", "Beli Sekarang"))  # konfigurasi dulu
+    dev.fail_once["click"] = [RPCUnknownError(err, None, "trace")]
+    with pytest.raises(SelectorStale):
+        drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert [a[0] for a in dev.actions] == ["click_sel"], "hanya ketukan pertama yang terjadi"

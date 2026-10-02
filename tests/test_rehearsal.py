@@ -226,6 +226,32 @@ def test_android_rehearsal_pin_after_buy_is_maybe_ordered_without_place_order(tm
     _no_android_order(app, driver)
 
 
+class _SlowSheetApp(FakeShopeeApp):
+    """Bottom sheet baru tampil 300 ms setelah ketuk Beli (animasi/jaringan); halaman produk dengan banner
+    "Flash Sale dimulai dalam .." masih terlihat sementara itu."""
+
+    _pending: float | None = None
+
+    def _tap_buy(self, node):
+        super()._tap_buy(node)
+        if self.screen == "sheet":
+            self.screen, self._pending = "product", self.now() + 0.3
+
+    def _render(self):
+        if self._pending is not None and self.now() >= self._pending:
+            self.screen, self._pending = "sheet", None
+        return super()._render()
+
+
+def test_android_rehearsal_pre_sale_banner_is_not_a_reaction_to_buy(tmp_path, monkeypatch):
+    """Pra-sale: banner hitung mundur "dimulai dalam" selalu tampil; bukan reaksi "belum dimulai" atas klik Beli
+    (baik saat halaman produk masih terlihat maupun saat sheet terbuka)."""
+    rep, _, app, driver, _ = android_rehearse(tmp_path, monkeypatch, app_cls=_SlowSheetApp)
+    assert rep.ok, (rep.status, rep.failed, [(s.name, s.detail) for s in rep.steps])
+    assert any("Flash Sale dimulai dalam" in n.text for n in app.nodes() if n.text) or app.screen != "product"
+    _no_android_order(app, driver)
+
+
 def test_android_rehearsal_missing_buy_button_names_the_step(tmp_path):
     rep, _, app, driver, _ = android_rehearse(tmp_path, button_before_open="Ingatkan Saya",
                                               button_enabled_before_open=False)
