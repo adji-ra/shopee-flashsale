@@ -29,7 +29,7 @@ BOTH = pytest.mark.parametrize("live", [False, True], ids=["dry", "live"])
 MAIN_PRICE = (20, 610, 400, 690)  # harga utama halaman produk (FakeShopeeApp._r_product)
 STRIKE_PRICE = (420, 640, 600, 670)  # harga coret halaman produk (lebih kecil)
 DECOY = (20, 300, 700, 500)  # banner/voucher bernominal di atas harga utama (lebih tinggi)
-BAR_TOTAL = (300, 1550, 510, 1595)  # nilai "Total Pembayaran" di bar bawah checkout (testID labelTotalPayment)
+BAR_TOTAL = (300, 1550, 510, 1595)  # nilai "Total Pembayaran" di bar bawah checkout (testID fake_total_value)
 PRICE_RID = "com.shopee.id:id/tv_price"
 TARGET = "Ponsel Uji Coba 128GB"
 OTHER = "Kabel Data USB-C"
@@ -297,13 +297,13 @@ class _CheckoutPromoTexts(FakeShopeeApp):
 
 
 def _shipping_testid_app(value: int):
-    """Nilai ongkir ber-testID (labelShippingFinalPrice) terpisah dari pasangan label "Subtotal Pengiriman"."""
+    """Nilai ongkir ber-resource-id (hasil kalibrasi) (fake_shipping_value) terpisah dari pasangan label "Subtotal Pengiriman"."""
 
     class _ShippingTestId(FakeShopeeApp):
         def _r_checkout(self):
-            out = [(k, dataclasses.replace(n, rid="") if n.rid == "labelShippingFinalPrice" else n)
+            out = [(k, dataclasses.replace(n, rid="") if n.rid == "fake_shipping_value" else n)
                    for k, n in super()._r_checkout()]
-            out.append(("", Node(text=rupiah(value), bounds=(500, 1000, 700, 1030), rid="labelShippingFinalPrice")))
+            out.append(("", Node(text=rupiah(value), bounds=(500, 1000, 700, 1030), rid="fake_shipping_value")))
             return out
 
     return _ShippingTestId
@@ -747,7 +747,7 @@ def test_l3_total_mismatch_between_total_labels(tmp_path, monkeypatch, live):
 @BOTH
 @pytest.mark.parametrize("testid_value, ok", [(10_000, True), (15_000, False)], ids=["agree", "disagree"])
 def test_l3_shipping_testid_and_label_pair_must_agree(tmp_path, monkeypatch, live, testid_value, ok):
-    # ongkir = nilai testID labelShippingFinalPrice DITAMBAH nilai pasangan label "Subtotal Pengiriman"
+    # ongkir = nilai resource-id fake_shipping_value DITAMBAH nilai pasangan label "Subtotal Pengiriman"
     out = _run(tmp_path, monkeypatch, _shipping_testid_app(testid_value), live=live)
     if ok:
         _passed(out, live)

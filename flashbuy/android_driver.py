@@ -461,6 +461,13 @@ class TimedDriver:
         self._mono = monotonic
         self._server_ms = server_ms
         self._lock = threading.Lock()  # satu query pada satu waktu (keepalive vs runner)
+        # dipanggil sebelum SETIAP aksi ke layar (tap, gestur, back, intent); boleh melempar untuk membatalkan
+        # (orchestrator: stop global / batal dicek sebelum tiap tap)
+        self.before_action: Callable[[str], None] | None = None
+
+    def _act(self, op: str) -> None:
+        if self.before_action is not None:
+            self.before_action(op)
 
     def _timed(self, op: str, target: object, fn: Callable[[], Any]) -> Any:
         with self._lock:
@@ -484,6 +491,7 @@ class TimedDriver:
         return self._timed("find_all", sel, lambda: self.inner.find_all(sel))
 
     def click(self, target: Sel | Node) -> bool:
+        self._act("click")
         label = target if isinstance(target, Sel) else f"node {target.label[:30]!r}"
         return self._timed("click", label, lambda: self.inner.click(target))
 
@@ -494,12 +502,15 @@ class TimedDriver:
         return self._timed("current_app", "", self.inner.current_app)
 
     def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        self._act("start_url")
         return self._timed("start_url", url, lambda: self.inner.start_url(url, package, wait))
 
     def swipe_refresh(self) -> None:
+        self._act("swipe_refresh")
         return self._timed("swipe_refresh", "", self.inner.swipe_refresh)
 
     def press_back(self) -> None:
+        self._act("press_back")
         return self._timed("press_back", "", self.inner.press_back)
 
     def webview_present(self) -> bool:

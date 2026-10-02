@@ -88,7 +88,7 @@ from flashbuy.android_selectors import (
     union,
 )
 from flashbuy.pricing import Limits
-from tests.android_harness import make_android
+from tests.android_harness import FAKE_CALIBRATED_STEPS, calibrated_selectors, make_android
 from tests.conftest import FakeClock
 from tests.fake_android import AppScenario, FakeShopeeApp
 
@@ -96,8 +96,8 @@ L = Limits(max_item_price=100_000, max_total=120_000, expected_name="Uji Coba")
 # regex baris label yang dipakai android_screen (label harus di AWAL teks; grup terakhir = nilai inline)
 TOTAL_RE = _TOTAL_ROW
 SHIPPING_RE = _SHIPPING_ROW
-TOTAL_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_total"][0]["resourceIdMatches"])
-SHIPPING_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_shipping"][0]["resourceIdMatches"])
+TOTAL_RID = re.compile(FAKE_CALIBRATED_STEPS["checkout_total"][0]["resourceIdMatches"])  # resource-id "kalibrasi"
+SHIPPING_RID = re.compile(FAKE_CALIBRATED_STEPS["checkout_shipping"][0]["resourceIdMatches"])
 TARGET = "Ponsel Uji Coba 128GB"
 OTHER = "Kabel Data USB-C"
 BOX = "android.widget.CheckBox"
@@ -420,7 +420,7 @@ def test_checkout_snapshot_testid_and_label_values_must_agree(fake_clock):
     assert pricing.check_checkout(snap, L).ok
 
     # testID berbeda dengan label (mis. total belum diperbarui) -> tidak terbaca (fail-closed), bukan pilih salah satu
-    tampered = [replace(n, text="Rp119.000") if n.rid == "labelTotalPayment" else n for n in nodes]
+    tampered = [replace(n, text="Rp119.000") if n.rid == "fake_total_value" else n for n in nodes]
     snap = checkout_snapshot(tampered, TOTAL_RID, SHIPPING_RID)
     assert snap.totals == ["Rp119.000", "Rp109.000", "Rp119.000"]  # testID, label rincian, label bar bawah
     assert pricing.read_total(snap)[1] is None
@@ -433,8 +433,8 @@ def test_checkout_snapshot_testid_and_label_values_must_agree(fake_clock):
 
 def test_checkout_snapshot_testid_only_values():
     nodes = [_n(TARGET, (140, 300, 700, 340)), _n("Rp99.000", (140, 395, 300, 430)), _n("x1", (640, 398, 700, 428)),
-             _n("Rp10.000", (500, 900, 700, 930), rid="com.shopee.id:id/labelShippingFinalPrice"),
-             _n("Rp109.000", (300, 1550, 510, 1595), rid="labelTotalPayment")]
+             _n("Rp10.000", (500, 900, 700, 930), rid="com.shopee.id:id/fake_shipping_value"),
+             _n("Rp109.000", (300, 1550, 510, 1595), rid="fake_total_value")]
     snap = checkout_snapshot(nodes, TOTAL_RID, SHIPPING_RID)
     assert (snap.totals, snap.shippings) == (["Rp109.000"], ["Rp10.000"])
     assert pricing.check_checkout(snap, L).ok
@@ -911,29 +911,36 @@ def test_default_step_lists_of_redesign():
     assert s["buy_button"] == [{"text": "Beli Sekarang"}, {"description": "Beli Sekarang"}]
     assert s["variant_option"] == [{"text": "{variant}"}, {"description": "{variant}"}]
     assert s["sheet_confirm"] == [{"text": "Beli Sekarang"}, {"text": "Konfirmasi"}]
-    assert s["cart_checkout"][0] == {"resourceIdMatches": "(.*:id/)?labelButtonCheckout"}
+    assert s["cart_checkout"][0] == {"textMatches": "Checkout(\\s*\\(\\d+\\))?"}
     assert s["product_price"] == []  # kosong = teks Rp pendek pertama (RP_SHORT_MATCH)
     for step in ("checkout_total", "checkout_shipping", "pin_screen"):
-        assert s[step] and all(set(c) == {"resourceIdMatches"} for c in s[step]), step
+        assert s[step] == [], step  # kosong = pasangan label / penanda teks; resource-id hanya dari kalibrasi
     # tombol yang men-tap (aksi) tidak pernah memakai kandidat substring
     for step in ("buy_button", "sheet_confirm", "place_order", "variant_option"):
         assert all(not k.endswith("Contains") for c in s[step] for k in c), step
 
 
+def test_defaults_contain_no_resource_ids():
+    """Aturan tahap 4: selector resource-id hanya dari kalibrasi di device nyata; default alat = teks terlihat."""
+    for step, cands in ANDROID_DEFAULT_STEPS.items():
+        assert not [c for c in cands if any(k.startswith("resourceId") for k in c)], step
+
+
 @pytest.mark.parametrize("step, rid, ok", [
-    ("checkout_total", "labelTotalPayment", True),  # testID React Native mentah
-    ("checkout_total", "com.shopee.id:id/labelTotalPayment", True),
-    ("checkout_total", "labelTotalPaymentDiscount", False),
-    ("checkout_shipping", "labelShippingFinalPrice", True),
-    ("checkout_shipping", "labelShippingPrice", False),
-    ("cart_checkout", "labelButtonCheckout", True),
-    ("cart_checkout", "com.shopee.id:id/labelButtonCheckout", True),
-    ("pin_screen", "com.shopee.id:id/payment_password_field", True),
-    ("pin_screen", "com.shopee.id:id/keyboard_number_view", True),
-    ("pin_screen", "com.shopee.id:id/payment_password_hint", False),
+    ("checkout_total", "fake_total_value", True),  # resource-id mentah tanpa awalan package
+    ("checkout_total", "com.shopee.id:id/fake_total_value", True),
+    ("checkout_total", "fake_total_value_discount", False),
+    ("checkout_shipping", "fake_shipping_value", True),
+    ("checkout_shipping", "fake_shipping_price", False),
+    ("cart_checkout", "fake_cart_checkout", True),
+    ("cart_checkout", "com.shopee.id:id/fake_cart_checkout", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_field", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_keypad", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_hint", False),
 ])
-def test_default_resource_id_steps_match_intended_ids(step, rid, ok):
-    cands = [c for c in android_selectors.defaults().candidates(step) if c.by.startswith("resourceId")]
+def test_calibrated_resource_id_steps_match_intended_ids(step, rid, ok):
+    """resource-id hasil kalibrasi (FAKE_CALIBRATED_STEPS) cocok ke seluruh id, dengan/tanpa awalan package."""
+    cands = [c for c in calibrated_selectors().candidates(step) if c.by.startswith("resourceId")]
     assert cands, step
     assert any(node_matches(_n(rid=rid), c) for c in cands) is ok
 
@@ -1010,7 +1017,7 @@ def test_load_rejects_invalid_android_section(tmp_path, section, match):
 @pytest.mark.parametrize("cand", [
     {"textMatches": "Checkout(("},
     {"descriptionMatches": "[Checkout"},
-    {"resourceIdMatches": "(.*:id/labelButtonCheckout"},
+    {"resourceIdMatches": "(.*:id/fake_cart_checkout"},
     {"textMatches": "(?i).*{variant}(.*"},  # divalidasi setelah {variant} diisi
     {"textMatches": "Checkout(?i)"},  # flag global di tengah ditolak
 ])
@@ -1028,7 +1035,7 @@ def test_load_accepts_valid_selector_regex_and_variant_template(tmp_path):
     assert sel.candidates("variant_option", "1+1") == [
         Sel("text", "1+1"), Sel("textMatches", "(?i)(?s)1\\+1"), Sel("description", "1+1")]  # urut jenis
     assert sel.candidates("cart_checkout")[:2] == [Sel("resourceIdMatches", ".*:id/btn_checkout"),
-                                                   Sel("resourceIdMatches", "(.*:id/)?labelButtonCheckout")]
+                                                   Sel("textMatches", "Checkout(\\s*\\(\\d+\\))?")]
 
 
 def test_save_new_file_without_backup(tmp_path):
@@ -1379,11 +1386,11 @@ def test_sel_kinds_and_rendering():
     (Sel("resourceId", "buy"), _n(rid="com.shopee.id:id/buy"), False),
     (Sel("className", "android.widget.CheckBox"), _n(cls=BOX), True),
     (Sel("className", "CheckBox"), _n(cls=BOX), False),
-    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="labelTotalPayment"), True),
-    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="com.shopee.id:id/labelTotalPayment"), True),
-    (Sel("resourceIdMatches", "labelTotal"), _n(rid="labelTotalPayment"), False),  # seluruh resource-id
-    (Sel("resourceIdMatches", ".*"), _n("labelTotalPayment"), True),  # rid kosong pun cocok ".*"
-    (Sel("resourceIdMatches", "labelTotalPayment"), _n("labelTotalPayment"), False),  # bukan teks
+    (Sel("resourceIdMatches", "(.*:id/)?fake_total_value"), _n(rid="fake_total_value"), True),
+    (Sel("resourceIdMatches", "(.*:id/)?fake_total_value"), _n(rid="com.shopee.id:id/fake_total_value"), True),
+    (Sel("resourceIdMatches", "fake_total"), _n(rid="fake_total_value"), False),  # seluruh resource-id
+    (Sel("resourceIdMatches", ".*"), _n("fake_total_value"), True),  # rid kosong pun cocok ".*"
+    (Sel("resourceIdMatches", "fake_total_value"), _n("fake_total_value"), False),  # bukan teks
     # regex Java: \s, \w, \b hanya ASCII -> NBSP bukan spasi (karena itu android_screen menulis SP eksplisit)
     (Sel("textMatches", r"Rp\s99\.000"), _n("Rp 99.000"), True),
     (Sel("textMatches", r"Rp\s99\.000"), _n("Rp\u00a099.000"), False),

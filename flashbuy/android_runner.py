@@ -61,6 +61,7 @@ from flashbuy.android_screen import (
 )
 from flashbuy.android_selectors import AndroidSelectors, text_regex, union
 from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, require_live_ready
+from flashbuy.control import CANCEL_MESSAGE
 from flashbuy.notifier import Notifier
 from flashbuy.runner_base import (
     ALARM_STATUSES,
@@ -220,7 +221,9 @@ class AndroidRunner:
         self.notifier = notifier
         self.before_place_order = before_place_order
         self.limiter = limiter or RateLimiter()
-        self.stop_event = stop_event  # asyncio.Event / threading.Event
+        self.stop_event = stop_event  # stop global: threading.Event / orchestrator StopView
+        self.cancel_event = None  # orchestrator: jalur lain memenangkan lock -> berhenti polling
+        self.latency: dict[str, float] = {}  # latensi query precheck (median/p95/maks ms) untuk doctor
         self.variant = cfg.variant
         self.package = cfg.android.package
         self._raw_driver = driver
@@ -313,6 +316,7 @@ class AndroidRunner:
         if raw is None:
             raw = await asyncio.to_thread(lambda: U2Driver(self.cfg.android.serial, package=self.package))
         self.d = TimedDriver(raw, self._mono, lambda: self._clock.now_ms())
+        self.d.before_action = self._checkpoint  # stop global/abort dicek sebelum SETIAP aksi ke layar
         try:
             self._screen_h = (await asyncio.to_thread(self.d.window_size))[1]
         except DriverError as e:
@@ -330,11 +334,21 @@ class AndroidRunner:
         self._stop_keepalive()
         await asyncio.to_thread(self._restore_stay_awake)
 
-    def _checkpoint(self) -> None:
-        if self._abort_reason is None and self.stop_event is not None and self.stop_event.is_set():
-            self._abort_reason = "dihentikan oleh runner lain"
+    def _checkpoint(self, _op: str = "") -> None:
+        """Di setiap iterasi dan sebelum SETIAP tap/gestur/intent (TimedDriver.before_action): abort pengguna,
+        stop global dari jalur lain. Setelah alat mengklik "Buat Pesanan", stop global tidak menghentikan
+        penantian layar PIN (pesanan sudah dikirim)."""
         if self._abort_reason is not None:
             raise _Aborted(self._abort_reason)
+        if not self.order_clicked and self.stop_event is not None and self.stop_event.is_set():
+            raise _Aborted(getattr(self.stop_event, "reason", "") or "dihentikan oleh runner lain")
+
+    def _poll_checkpoint(self) -> None:
+        """Fase polling (klik Beli, konfirmasi ulang, reload, pilih ulang variasi): juga berhenti bila jalur lain
+        sudah memenangkan lock "Buat Pesanan"."""
+        self._checkpoint()
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise _Aborted(CANCEL_MESSAGE)
 
     # ------------------------------------------------------------------ util selector
 
@@ -994,6 +1008,8 @@ class AndroidRunner:
         self.d.find_all(Sel("textMatches", RP_ANY_MATCH))
         fa = [s.ms for s in self.d.stats.samples[mark:]]
         p95 = hot[min(len(hot) - 1, int(round(0.95 * (len(hot) - 1))))]
+        self.latency = {"median": hot[len(hot) // 2], "p95": p95, "max": hot[-1], "n": len(hot),
+                        "find_all": fa[0]}
         detail = (f"info/exists median {hot[len(hot) // 2]:.0f} ms, p95 {p95:.0f} ms, maks {hot[-1]:.0f} ms "
                   f"({len(hot)} query); find_all {fa[0]:.0f} ms")
         self.log.info(f"latensi query precheck: {detail}")
@@ -1207,7 +1223,7 @@ class AndroidRunner:
         last_reload = None
         outcome = Seen(Screen.PRODUCT_WAITING)
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             kind, info = self._wait_ready(gate, last_reload, clicks)
             if kind == "stop":
                 return TERMINAL[info.screen], info.evidence
@@ -1223,7 +1239,7 @@ class AndroidRunner:
                 t_wait = self._mono()
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 if self._mono() - t_wait > REVERIFY_AFTER_WAIT_S and self._dialog_blocks_click():
                     continue  # dialog crash/ANR muncul saat menunggu slot: gestur/intent tidak dikirim
                 if gate.expired():
@@ -1241,7 +1257,7 @@ class AndroidRunner:
             if kind == "variant":  # variasi lepas setelah reload: pilih ulang (aksi polling, lewat gate)
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 self._reselect_variant(gate)
                 self.limiter.touch(clock.now())  # seperti reload: slot berikutnya dihitung dari akhir aksi ini
                 continue
@@ -1249,7 +1265,7 @@ class AndroidRunner:
             if kind in ("sheet", "progress"):  # sheet masih terbuka: konfirmasi ulang = aksi polling
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 if not self._handle_sheet(retry=True, gate=gate):
                     continue  # ditahan (dialog sistem / jendela habis): tidak diklik, tidak dihitung
                 self.limiter.touch(clock.now())  # jarak >= 425 ms dihitung dari tap sebenarnya
@@ -1262,7 +1278,7 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 waited = self._mono() - t_wait > REVERIFY_AFTER_WAIT_S
-                self._checkpoint()
+                self._poll_checkpoint()
                 # toast lama bukan reaksi klik ini: dibersihkan SEBELUM klik (toast reaksi klik tetap terbaca) dan
                 # sebelum cek ulang tombol, supaya jarak cek ulang -> klik sesingkat mungkin
                 self.d.clear_toast()
@@ -1348,8 +1364,9 @@ class AndroidRunner:
             return RunStatus.DRYRUN_OK, "sampai checkout dengan ShopeePay & harga lolos; 'Buat Pesanan' TIDAK diklik"
 
         self.d.clear_toast()
+        self._checkpoint()  # stop global terakhir sebelum klik yang mengikat
         t_click = clock.now_ms()
-        self.order_clicked = True
+        self.order_clicked = True  # sejak sini stop global tidak menghentikan penantian layar PIN
         self.d.click(place)
         self.log.mark("click_place_order", t_ms=t_click)
         outcome = self._wait_screen({Screen.PIN_SCREEN}, max(0.1, deadline - self._mono()), "after_order")
@@ -1407,7 +1424,7 @@ class AndroidRunner:
         | ("reload", None) | ("variant", Node) | ("stop", Seen).
         """
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             if gate.expired():
                 return "expired", None
             reloadable = True

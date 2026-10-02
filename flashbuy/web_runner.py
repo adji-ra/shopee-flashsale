@@ -22,6 +22,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from flashbuy import pricing, selector_store
 from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, WebConfig, require_live_ready
+from flashbuy.control import CANCEL_MESSAGE
 from flashbuy.guards import ENABLED_JS, MIN_IFRAME_PX, TERMINAL, Classification, Guard, PageState
 from flashbuy.notifier import Notifier
 from flashbuy.runner_base import (
@@ -120,7 +121,8 @@ class WebRunner:
         self.headless = headless
         self.before_place_order = before_place_order
         self.limiter = limiter or RateLimiter()
-        self.stop_event = stop_event
+        self.stop_event = stop_event  # stop global (orchestrator: StopView)
+        self.cancel_event = None  # orchestrator: jalur lain memenangkan lock -> berhenti polling
         self.variant = cfg.variant
         self.open_at: float | None = None
         # batas waktu internal (bisa diskalakan di tes)
@@ -224,13 +226,29 @@ class WebRunner:
             await self._closed.wait()
 
     def _checkpoint(self) -> None:
-        """Dipanggil di setiap iterasi loop: abort, stop dari runner lain, captcha dari event."""
-        if self._abort_reason is None and self.stop_event is not None and self.stop_event.is_set():
-            self._abort_reason = "dihentikan oleh runner lain"
+        """Dipanggil di setiap iterasi loop dan sebelum SETIAP klik/navigasi: abort pengguna, captcha dari event
+        halaman ini, stop global dari jalur lain. Setelah alat mengklik "Buat Pesanan", stop global tidak
+        menghentikan penantian layar PIN (pesanan sudah dikirim)."""
         if self._abort_reason is not None:
             raise _Aborted(self._abort_reason)
         if self._event_hit is not None:
             raise _Stop(TERMINAL[self._event_hit.state], self._event_hit.evidence)
+        if not self.order_clicked and self.stop_event is not None and self.stop_event.is_set():
+            raise _Aborted(getattr(self.stop_event, "reason", "") or "dihentikan oleh runner lain")
+
+    def _poll_checkpoint(self) -> None:
+        """Fase polling (klik Beli, reload): juga berhenti bila jalur lain sudah memenangkan lock."""
+        self._checkpoint()
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise _Aborted(CANCEL_MESSAGE)
+
+    async def _click(self, loc: Locator, **kw) -> None:
+        self._checkpoint()
+        await loc.click(**kw)
+
+    async def _goto(self, url: str) -> None:
+        self._checkpoint()
+        await self.page.goto(url, wait_until="domcontentloaded")
 
     # ------------------------------------------------------------------ util
 
@@ -275,12 +293,25 @@ class WebRunner:
 
     async def precheck(self) -> PrecheckResult:
         res = PrecheckResult(self.name)
+        try:
+            await self._precheck(res)
+        except _Aborted as e:
+            res.status = RunStatus.ABORTED
+            res.items.append(PrecheckItem("precheck", False, f"dibatalkan: {e}"))
+        except _Stop as e:
+            res.status = e.status
+            res.items.append(PrecheckItem("precheck", False, f"{e.status}: {e.message}"))
+        if res.status in STOP_ALL_STATUSES and self.stop_event is not None:
+            self.stop_event.set()
+        return res
+
+    async def _precheck(self, res: PrecheckResult) -> None:
         page = self.page
-        await page.goto(self._url("address_page"), wait_until="domcontentloaded")
+        await self._goto(self._url("address_page"))
         if (await self._classify()).state == PageState.LOGIN_REQUIRED:
             res.items.append(PrecheckItem("login", False, "sesi tidak login (diarahkan ke halaman login)"))
             res.status = RunStatus.LOGIN_REQUIRED
-            return res
+            return
         res.items.append(PrecheckItem("login", True, "sesi aktif"))
 
         text = await self._body_text()
@@ -291,16 +322,16 @@ class WebRunner:
         else:
             res.items.append(PrecheckItem("alamat default", None, "tidak terbaca dari halaman alamat"))
 
-        await page.goto(self._url("wallet_page"), wait_until="domcontentloaded")
+        await self._goto(self._url("wallet_page"))
         text = await self._body_text()
         m = re.search(r"saldo[^\n]*\n?[^\n]*?(Rp\s?[\d.]+)", text, re.I)
         balance = pricing.parse_price(m.group(1)) if m else None
 
-        await page.goto(self.cfg.product_url, wait_until="domcontentloaded")
+        await self._goto(self.cfg.product_url)
         if (await self._classify()).state == PageState.LOGIN_REQUIRED:
             res.items.append(PrecheckItem("login", False, "halaman produk minta login"))
             res.status = RunStatus.LOGIN_REQUIRED
-            return res
+            return
         text = await self._body_text()
         price_text = await page.evaluate(PRICE_TEXT_JS, self.sel.css("product_price"))
         price = pricing.parse_price(price_text)
@@ -330,19 +361,26 @@ class WebRunner:
         buy = await self._resolve("buy_button")
         res.items.append(PrecheckItem("tombol Beli", True if buy else None,
                                       "ditemukan" if buy else "tidak ditemukan - jalankan calibrate"))
-        return res
 
     # ------------------------------------------------------------------ arm (T-60 s)
 
     async def arm(self, open_at: float) -> None:
         self.open_at = open_at
-        await self.page.goto(self.cfg.product_url, wait_until="domcontentloaded")
+        try:
+            await self._arm()
+        except (_Aborted, _Stop) as e:  # stop global saat arm: attempt langsung berhenti tanpa aksi
+            self.log.warn(f"arm dihentikan: {e}")
+
+    async def _arm(self) -> None:
+        await self._goto(self.cfg.product_url)
         self.log.mark("page_open")
         self._buy = await self._resolve("buy_button")
         c = await self._classify(with_buy=True)
         if c.state in (PageState.LOGIN_REQUIRED, PageState.CAPTCHA, PageState.VERIFICATION):
             self._arm_state = c
             self.log.warn(f"arm: {c.state} ({c.evidence})")
+            if TERMINAL[c.state] in STOP_ALL_STATUSES and self.stop_event is not None:
+                self.stop_event.set()  # langsung: jalur lain berhenti sekarang, bukan saat T-lead
             return
         try:
             self._product_title = await self.page.evaluate(PRODUCT_TITLE_JS)
@@ -376,7 +414,7 @@ class WebRunner:
             if not await opt.evaluate(ENABLED_JS):
                 self.log.warn(f"variasi '{self.variant}' belum bisa dipilih")
                 return False
-            await opt.click(timeout=3000)
+            await self._click(opt, timeout=3000)
         except PlaywrightError as e:
             self.log.warn(f"gagal memilih variasi: {_first_line(e)}")
             return False
@@ -391,6 +429,7 @@ class WebRunner:
         try:
             value = await qty.input_value(timeout=2000)
             if value.strip() != "1":
+                self._checkpoint()
                 await qty.fill("1")
                 self.log.mark("qty_set", f"{value} -> 1")
         except PlaywrightError:
@@ -424,9 +463,10 @@ class WebRunner:
     async def _attempt(self, clock: ServerClock, live: bool) -> tuple[RunStatus, str]:
         if self.open_at is None:
             raise RuntimeError("arm() belum dipanggil")
-        self._checkpoint()
+        # hasil arm dulu: arm sendiri yang men-set stop global saat captcha/verifikasi
         if self._arm_state is not None:
             return TERMINAL[self._arm_state.state], f"saat membuka halaman: {self._arm_state.evidence}"
+        self._checkpoint()
         gate = PollingGate(clock, self.open_at, self.limiter)
         loop = asyncio.get_running_loop()
         self.log.mark("poll_start")
@@ -435,7 +475,7 @@ class WebRunner:
         last_reload = None
         outcome: Classification | None = None
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             kind, info = await self._wait_ready(gate, last_reload)
             if kind == "stop":
                 return TERMINAL[info.state], info.evidence
@@ -444,7 +484,7 @@ class WebRunner:
             if kind == "reload":
                 if not await gate.acquire():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 await self.page.reload(wait_until="domcontentloaded")
                 last_reload = clock.now()
                 self.log.mark("reload")
@@ -456,10 +496,10 @@ class WebRunner:
             t_ready = clock.now_ms()
             if not await gate.acquire():
                 return self._window_closed(clicks)
-            self._checkpoint()
+            self._poll_checkpoint()
             stale = outcome is not None and outcome.state in (PageState.NOT_STARTED, PageState.VARIANT_REQUIRED)
             t_click = clock.now_ms()
-            await self._buy.click(force=True, timeout=2000)
+            await self._click(self._buy, force=True, timeout=2000)
             clicks += 1
             if clicks == 1:
                 self.log.mark("buy_ready", price.describe(self.limits), t_ms=t_ready)
@@ -492,9 +532,8 @@ class WebRunner:
             btn = await self._wait_resolve("cart_checkout", deadline)
             if btn is None:
                 return RunStatus.ERROR, "tombol Checkout di keranjang tidak ditemukan"
-            self._checkpoint()
             t_click = clock.now_ms()
-            await btn.click(timeout=5000)  # Playwright ikut menunggu navigasi commit
+            await self._click(btn, timeout=5000)  # Playwright ikut menunggu navigasi commit
             self.log.mark("click_checkout", t_ms=t_click)
             outcome = await self._wait_for({PageState.CHECKOUT}, deadline)
         if outcome.state != PageState.CHECKOUT:
@@ -518,8 +557,9 @@ class WebRunner:
         if not live:
             return RunStatus.DRYRUN_OK, "sampai checkout dengan ShopeePay & harga lolos; 'Buat Pesanan' TIDAK diklik"
 
+        self._checkpoint()  # stop global terakhir sebelum klik yang mengikat
         t_click = clock.now_ms()
-        self.order_clicked = True
+        self.order_clicked = True  # sejak sini stop global tidak menghentikan penantian layar PIN
         await place.click(timeout=5000)
         self.log.mark("click_place_order", t_ms=t_click)
         outcome = await self._wait_for({PageState.PIN_SCREEN}, deadline)
@@ -551,7 +591,7 @@ class WebRunner:
         Return ("ready", ProductPrice) | ("expired", None) | ("reload", None) | ("stop", Classification).
         """
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             if gate.expired():
                 return "expired", None
             if self._buy is None:
@@ -679,7 +719,7 @@ class WebRunner:
                 box = (await self.page.evaluate_handle(CART_BOX_JS, i)).as_element()
                 if box is None:
                     break
-                await box.click(timeout=3000)
+                await self._click(box, timeout=3000)
                 self.log.mark("cart_uncheck", rows[i].text.splitlines()[0][:50])
             await asyncio.sleep(0.2)
             rows, counts = await self._read_cart()
@@ -733,7 +773,7 @@ class WebRunner:
             change = await self._resolve("payment_change")
             if change is not None:
                 t_click = self.clock.now_ms()
-                await change.click(timeout=5000)
+                await self._click(change, timeout=5000)
                 self.log.mark("payment_change", t_ms=t_click)
                 opt = await self._wait_resolve("payment_shopeepay", deadline)
         if opt is None:
@@ -741,7 +781,7 @@ class WebRunner:
         if await self._is_selected(opt):
             return True, "ShopeePay sudah terpilih"
         t_click = self.clock.now_ms()
-        await opt.click(timeout=5000)
+        await self._click(opt, timeout=5000)
         self.log.mark("select_shopeepay", t_ms=t_click)
         end = min(deadline, loop.time() + SELECT_WAIT_S)
         while loop.time() < end:

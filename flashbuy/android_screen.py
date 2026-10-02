@@ -137,7 +137,7 @@ def checkout_snapshot(nodes: list[Node], total_rid: re.Pattern | None = None,
     penanda, maks _CARD_LINES baris, TANPA header toko - teks teratas yang lebih kiri dari teks di bawahnya, atau
     bila tak terbedakan teks di kiri kolom harga/"Variasi" - sehingga nama toko tidak ikut dicocokkan dengan
     expected_name) + harga satuan sebaris penanda + "xN".
-    Total & ongkir: node ber-resource-id (testID, mis. labelTotalPayment) DITAMBAH pasangan label baris ->
+    Total & ongkir: node ber-resource-id hasil kalibrasi (bila ada) DITAMBAH pasangan label baris ->
     nilai di layar; semua harus konsisten.
     """
     nodes = [n for n in nodes if n.label.strip()]

@@ -458,7 +458,7 @@ class FakeShopeeApp:
         out += [("", _n("Subtotal untuk Produk", (20, y + 40, 400, y + 70))),
                 ("", _n(rupiah(subtotal), (500, y + 40, 700, y + 70))),
                 ("", _n("Subtotal Pengiriman", (20, y + 80, 400, y + 110))),
-                ("", _n(ship, (500, y + 80, 700, y + 110), rid="labelShippingFinalPrice"))]
+                ("", _n(ship, (500, y + 80, 700, y + 110), rid="fake_shipping_value"))]
         if sc.service_fee:
             out += [("", _n("Biaya Layanan", (20, y + 120, 400, y + 150))),
                     ("", _n(rupiah(sc.service_fee), (500, y + 120, 700, y + 150)))]
@@ -466,7 +466,7 @@ class FakeShopeeApp:
                 ("", _n(rupiah(total), (500, y + 160, 700, y + 195)))]
         # bar bawah: label di atas nilai (pasangan "di bawah")
         out += [("", _n("Total Pembayaran", (300, 1515, 510, 1545))),
-                ("", _n(rupiah(total), (300, 1550, 510, 1595), rid="labelTotalPayment")),
+                ("", _n(rupiah(total), (300, 1550, 510, 1595), rid="fake_total_value")),
                 ("place_order", _n("Buat Pesanan", (520, 1500, 720, 1612), clickable=True))]
         return out
 
@@ -498,13 +498,13 @@ class FakeShopeeApp:
         out += [("", _n("", (20, 1530, 70, 1580), cls="android.widget.CheckBox", checked=False)),
                 ("", _n("Semua", (80, 1530, 200, 1580))),
                 ("cart_checkout", _n(f"Checkout ({n})", (480, 1500, 720, 1612), clickable=True,
-                                     rid="labelButtonCheckout"))]
+                                     rid="fake_cart_checkout"))]
         return out
 
     def _r_pin(self):
         title = [] if self.sc.pin_title is None else [("", _n(self.sc.pin_title, (100, 300, 620, 350)))]
         return title + [("", _n("", (100, 400, 640, 470), cls="android.widget.EditText",
-                                rid="com.shopee.id:id/payment_password_field"))]
+                                rid="com.shopee.id:id/fake_pin_field"))]
 
     def _r_captcha(self):
         return [("", _n("Geser untuk verifikasi", (100, 700, 620, 750))),

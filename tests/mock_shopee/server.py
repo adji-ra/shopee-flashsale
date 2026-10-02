@@ -38,6 +38,7 @@ class Scenario:
     payment_default: str = "shopeepay"  # shopeepay | cod | bank
     variants: list[str] = field(default_factory=list)  # tidak kosong = variasi wajib
     checkout_latency_ms: int = 0
+    buy_latency_ms: int = 0  # jawaban POST /api/buy ditunda X ms (server sibuk)
     address: str | None = "Jl. Contoh Raya No. 1, Kebayoran Baru, Jakarta Selatan"
     balance: int | None = 1_250_000
     product_name: str = "Ponsel Uji Coba 128GB"
@@ -326,6 +327,8 @@ def _make_handler(mock: MockShopee):
 
         def _buy(self, body: dict) -> None:
             s = mock.scenario
+            if s.buy_latency_ms:
+                time.sleep(s.buy_latency_ms / 1000.0)
             state = mock.sale_state()
             if state == "not_started" and not s.buy_active_before_open:
                 return self._json({"error": "not_started", "message": "Flash sale belum dimulai"})
