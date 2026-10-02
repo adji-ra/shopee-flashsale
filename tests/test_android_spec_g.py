@@ -26,7 +26,7 @@ import yaml
 from rich.console import Console
 
 from flashbuy import android_runner, android_selectors, cli, notifier, timesync
-from flashbuy.android_driver import AgentDead, FakeDriver, Node, Sel
+from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Node, Sel
 from flashbuy.runner_base import RunStatus
 from flashbuy.timesync import WIB, OffsetResult, SyncReport
 from tests import android_harness
@@ -40,7 +40,7 @@ HARNESS_WM = "Physical size: 720x1612"  # wm size bawaan FakeDriver (harness)
 # Operasi driver yang sah (tanpa input teks: PIN tidak mungkin diketik alat).
 ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
                "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent",
-               "last_toast", "clear_toast"}
+               "last_toast", "clear_toast", "configure", "click_miss", "click_sel"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (termasuk PIN, buka kunci).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
 SETTINGS_WRITE = re.compile(r"^(svc power stayon|settings put)\b")
@@ -638,6 +638,25 @@ def test_cli_precheck_command_never_changes_stay_on(cwd, device, term, stay):
     cli_safe(dev)
 
 
+class _RestoreFailsDriver(FakeDriver):
+    def shell(self, cmd: list[str]) -> str:
+        if " ".join(cmd) == "svc power stayon false":
+            self._rpc("shell", " ".join(cmd))
+            raise DriverError("adb: device offline")
+        return super().shell(cmd)
+
+
+def test_cli_run_stay_on_restore_failure_alarm_really_sounds(cwd, device, term, sync_calls, alarms):
+    """Alarm `stay_on_restore` muncul di close() SETELAH orchestrator selesai: tetap dibunyikan sungguhan
+    (bukan tertahan di notifier tunda fase run), sesudah satu alarm hasil akhir."""
+    open_at = time.time() + 1.0
+    device(open_at, stay_on="0", driver_cls=_RestoreFailsDriver)
+    rc = cli.main(["run", "--config", str(write_cfg(cwd, open_at)), "--only", "android", "--allow-local"])
+    assert rc == 0, term.getvalue()
+    assert [e for e, _ in alarms] == ["DRYRUN_OK", "stay_on_restore"]
+    assert "kembalikan manual" in alarms[1][1]
+
+
 def test_cli_run_sets_stay_on_usb_and_restores_after_run(cwd, device, term, sync_calls, alarms):
     open_at = time.time() + 1.0
     dev = device(open_at, stay_on="0")
@@ -653,7 +672,8 @@ def test_cli_run_sets_stay_on_usb_and_restores_after_run(cwd, device, term, sync
     log = next(cwd.glob("logs/*-android/android.log")).read_text(encoding="utf-8")
     assert "precheck layar tetap menyala: OK - svc power stayon usb selama run (semula 0)" in log
     assert "layar tetap menyala dikembalikan: svc power stayon false" in log
-    assert len(dev.app.kind("buy")) == 1 and alarms == []
+    # satu alarm hasil akhir dari orchestrator (pola pendek), tidak ada alarm stay_on
+    assert len(dev.app.kind("buy")) == 1 and [e for e, _ in alarms] == ["DRYRUN_OK"]
     t_ms = int(open_at * 1000)
     assert t_ms - 1000 <= dev.app.kind("buy")[0]["t_server_ms"] <= t_ms + 8000
     cli_safe(dev, taps=True)

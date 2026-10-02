@@ -1,7 +1,15 @@
 """Driver Android tipis di atas uiautomator2, plus FakeDriver untuk tes.
 
-Hot path memakai query selector di device (1 RPC per query: exists / info / click koordinat),
+Hot path memakai query selector di device (1 RPC per query: exists / info / klik),
 BUKAN dump_hierarchy. `dump()` hanya untuk kalibrasi, diagnosa UNKNOWN, dan status akhir.
+
+Dua cara mengetuk (android.tap_mode):
+  selector (default)  click_sel: elemen DICARI dan DIKETUK di device dalam satu RPC (jsonrpc `click(selector)`),
+                      tanpa tunggu implisit (waitForSelectorTimeout 0). Elemen tidak ada -> tidak ada ketukan.
+  coord               click(Node): tap tengah bounds hasil bacaan sebelumnya (2 RPC: baca, lalu tap). Bila layar
+                      berganti di antara keduanya, tap mendarat di elemen baru di posisi yang sama.
+`Node.via` mencatat selector (+ instance untuk find_all) yang menemukan node, supaya node yang sama bisa
+diketuk lewat selector.
 
 Semantik selector mengikuti UiSelector uiautomator:
   text / description          sama persis (case-sensitive)
@@ -22,7 +30,7 @@ import re
 import statistics
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -36,6 +44,12 @@ class DriverError(RuntimeError):
 
 class AgentDead(DriverError):
     """Agent uiautomator2 / transport adb tidak menjawab (mis. dibunuh HiOS); bisa dipulihkan dengan restart."""
+
+
+class SelectorStale(DriverError):
+    """Klik selector gagal karena elemen dibangun ulang / hilang di antara pencarian dan klik di server
+    (StaleObjectException / NullPointerException), SEBELUM gesture dikirim. Pemanggil mengklasifikasi ulang;
+    untuk "Buat Pesanan" tetap diperlakukan sebagai mungkin terketuk (aman)."""
 
 
 # Nama exception u2/adbutils/socket yang berarti agent atau transport mati (bukan "elemen tidak ada").
@@ -71,6 +85,9 @@ class Node:
     selected: bool = False
     checked: bool = False
     bounds: tuple[int, int, int, int] = (0, 0, 0, 0)  # left, top, right, bottom
+    # (selector, instance) yang menemukan node ini: info -> (sel, None) = cocok pertama di semua jendela;
+    # find_all -> (sel, i) = cocok ke-i di jendela aktif (urutan instance UiSelector). Untuk klik selector.
+    via: tuple[Sel, int | None] | None = field(default=None, compare=False, repr=False)
 
     @property
     def label(self) -> str:
@@ -128,6 +145,14 @@ class AndroidDriver(Protocol):
     def find_all(self, sel: Sel) -> list[Node]: ...  # semua elemen yang cocok (1 RPC)
 
     def click(self, target: Sel | Node) -> bool: ...  # Node -> tap tengah bounds (1 RPC)
+
+    # Cari + ketuk di device dalam SATU RPC, tanpa tunggu implisit. instance None = cocok pertama (semua jendela,
+    # seperti info); instance i = cocok ke-i di jendela aktif (seperti find_all). False = elemen tidak ada, TIDAK
+    # ada ketukan. Error lain (agent/transport) dilempar: ketukan mungkin sudah terjadi.
+    def click_sel(self, sel: Sel, instance: int | None = None) -> bool: ...
+
+    # Siapkan klik selector: waitForSelectorTimeout agent = 0 (tanpa ketuk). Return keterangan untuk log/precheck.
+    def configure_selector_click(self) -> str: ...
 
     def get_text(self, sel: Sel) -> str | None: ...
 
@@ -258,6 +283,7 @@ class U2Driver:
         self.rpc_timeout_s = rpc_timeout_s
         self.package = package  # query dibatasi ke aplikasi ini (notifikasi/jendela sistem tidak ikut cocok)
         self._size: tuple[int, int] | None = None
+        self._no_wait = False  # waitForSelectorTimeout agent sudah 0 (hilang bila agent di-restart)
 
     def _call(self, what: str, fn: Callable[[], Any]) -> Any:
         try:
@@ -275,8 +301,11 @@ class U2Driver:
         """Panggil jsonrpc agent dengan timeout per panggilan (bukan 300 s bawaan u2)."""
         return getattr(self.d.jsonrpc, method)(*params, http_timeout=self.rpc_timeout_s)
 
-    def _selector(self, sel: Sel, any_package: bool = False, exclude: tuple[str, ...] = ()) -> Any:
-        kw = sel.kwargs()
+    def _selector(self, sel: Sel, any_package: bool = False, exclude: tuple[str, ...] = (),
+                  instance: int | None = None) -> Any:
+        kw: dict[str, Any] = dict(sel.kwargs())
+        if instance is not None:
+            kw["instance"] = instance
         if self.package and not any_package:
             kw["packageName"] = self.package
         elif exclude:  # regex Java: package node BUKAN salah satu ini
@@ -302,7 +331,7 @@ class U2Driver:
                         return None
                     raise
             # objInfo bisa jatuh ke jalur B (contains/startsWith tidak peka huruf): cek ulang di klien
-            return node if node_matches(node, sel) else None
+            return replace(node, via=(sel, None)) if node_matches(node, sel) else None
 
         return self._call(f"info {sel}", get)
 
@@ -317,8 +346,9 @@ class U2Driver:
                 if type(e).__name__ == "UiObjectNotFoundError":
                     return []
                 raise
-            # elemen yang hilang di tengah iterasi server menjadi null di array
-            return [n for n in (Node.from_u2(i) for i in infos if i) if node_matches(n, sel)]
+            # elemen yang hilang di tengah iterasi server menjadi null di array; indeks array = instance UiSelector
+            nodes = [replace(Node.from_u2(info), via=(sel, i)) for i, info in enumerate(infos) if info]
+            return [n for n in nodes if node_matches(n, sel)]
 
         return self._call(f"find_all {sel}", get)
 
@@ -329,6 +359,38 @@ class U2Driver:
         x, y = node.center
         self._call(f"click {x},{y}", lambda: self._rpc("click", x, y))
         return True
+
+    def configure_selector_click(self) -> str:
+        """waitForSelectorTimeout = 0: klik selector yang tidak menemukan elemen langsung gagal, tidak menunggu
+        (default UiAutomator 10 s) lalu mengetuk elemen yang muncul belakangan. Field lain dipertahankan."""
+        def setup() -> str:
+            cfg = dict(self._rpc("getConfigurator") or {})
+            cfg["waitForSelectorTimeout"] = 0
+            got = self._rpc("setConfigurator", cfg) or {}
+            if int(got.get("waitForSelectorTimeout", -1)) != 0:
+                raise DriverError(f"waitForSelectorTimeout tetap {got.get('waitForSelectorTimeout')!r}")
+            return "waitForSelectorTimeout=0"
+
+        detail = self._call("setConfigurator", setup)
+        self._no_wait = True
+        return detail
+
+    def click_sel(self, sel: Sel, instance: int | None = None) -> bool:
+        if not self._no_wait:  # agent baru (restart): tunggu implisit harus dimatikan dulu
+            self.configure_selector_click()
+
+        def click() -> bool:
+            try:
+                self._rpc("click", self._selector(sel, instance=instance))
+            except Exception as e:  # noqa: BLE001
+                if type(e).__name__ == "UiObjectNotFoundError":
+                    return False  # tidak ditemukan di device: tidak ada ketukan
+                if "StaleObject" in str(e) or "NullPointerException" in str(e):
+                    raise SelectorStale(f"click_sel {sel}: elemen berubah saat diklik ({type(e).__name__})") from e
+                raise
+            return True  # server menjawab (true/false): ketukan dianggap TERJADI (aman untuk "Buat Pesanan")
+
+        return self._call(f"click_sel {sel}" + ("" if instance is None else f"[{instance}]"), click)
 
     def get_text(self, sel: Sel) -> str | None:
         node = self.info(sel)
@@ -397,6 +459,8 @@ class U2Driver:
             return False
 
     def restart_agent(self) -> None:
+        self._no_wait = False  # agent baru = Configurator bawaan (tunggu implisit 10 s)
+
         def restart() -> None:
             try:  # server yang bukan milik sesi ini tidak dimatikan stop_uiautomator: minta berhenti via HTTP
                 from uiautomator2 import core
@@ -461,6 +525,13 @@ class TimedDriver:
         self._mono = monotonic
         self._server_ms = server_ms
         self._lock = threading.Lock()  # satu query pada satu waktu (keepalive vs runner)
+        # dipanggil sebelum SETIAP aksi ke layar (tap, gestur, back, intent); boleh melempar untuk membatalkan
+        # (orchestrator: stop global / batal dicek sebelum tiap tap)
+        self.before_action: Callable[[str], None] | None = None
+
+    def _act(self, op: str) -> None:
+        if self.before_action is not None:
+            self.before_action(op)
 
     def _timed(self, op: str, target: object, fn: Callable[[], Any]) -> Any:
         with self._lock:
@@ -484,8 +555,17 @@ class TimedDriver:
         return self._timed("find_all", sel, lambda: self.inner.find_all(sel))
 
     def click(self, target: Sel | Node) -> bool:
+        self._act("click")
         label = target if isinstance(target, Sel) else f"node {target.label[:30]!r}"
         return self._timed("click", label, lambda: self.inner.click(target))
+
+    def click_sel(self, sel: Sel, instance: int | None = None) -> bool:
+        self._act("click")  # stop global / batal dicek sebelum ketukan, sama seperti tap koordinat
+        label = sel if instance is None else f"{sel}[{instance}]"
+        return self._timed("click_sel", label, lambda: self.inner.click_sel(sel, instance))
+
+    def configure_selector_click(self) -> str:
+        return self._timed("configure", "", self.inner.configure_selector_click)
 
     def get_text(self, sel: Sel) -> str | None:
         return self._timed("get_text", sel, lambda: self.inner.get_text(sel))
@@ -494,12 +574,15 @@ class TimedDriver:
         return self._timed("current_app", "", self.inner.current_app)
 
     def start_url(self, url: str, package: str, wait: bool = True) -> None:
+        self._act("start_url")
         return self._timed("start_url", url, lambda: self.inner.start_url(url, package, wait))
 
     def swipe_refresh(self) -> None:
+        self._act("swipe_refresh")
         return self._timed("swipe_refresh", "", self.inner.swipe_refresh)
 
     def press_back(self) -> None:
+        self._act("press_back")
         return self._timed("press_back", "", self.inner.press_back)
 
     def webview_present(self) -> bool:
@@ -610,6 +693,8 @@ class FakeDriver:
         self.calls: list[tuple[str, str]] = []
         self.restarts = 0
         self.fail_next: list[Exception] = []  # dilempar pada query berikutnya (simulasi agent mati)
+        self.no_wait = False  # configure_selector_click sudah dipanggil
+        self.sel_clicks: list[tuple[str, str]] = []  # (selector, label diketuk | "" = tidak ditemukan)
 
     def _rpc(self, op: str, target: object = "", latency: float | None = None) -> None:
         self.calls.append((op, str(target)))
@@ -627,7 +712,7 @@ class FakeDriver:
     def info(self, sel: Sel) -> Node | None:
         self._rpc("info", sel)
         found = self._match(sel)
-        return found[0] if found else None
+        return replace(found[0], via=(sel, None)) if found else None
 
     def info_any(self, sel: Sel, exclude: tuple[str, ...] = ()) -> Node | None:
         """Tanpa batas package: node aplikasi + jendela sistem/aplikasi lain di atasnya (app.system_nodes, package
@@ -640,7 +725,7 @@ class FakeDriver:
 
     def find_all(self, sel: Sel) -> list[Node]:
         active = getattr(self.app, "active_nodes", self.app.nodes)
-        found = [n for n in active() if node_matches(n, sel)]
+        found = [replace(n, via=(sel, i)) for i, n in enumerate(n for n in active() if node_matches(n, sel))]
         self._rpc("find_all", sel, latency=self.latency_s + self.per_match_s * len(found))
         return found
 
@@ -649,6 +734,33 @@ class FakeDriver:
         if node is None:
             return False
         self._rpc("click", node.label)
+        self.app.on_tap(*node.center)
+        return True
+
+    def configure_selector_click(self) -> str:
+        self._rpc("configure", "waitForSelectorTimeout=0")
+        self.no_wait = True
+        return "waitForSelectorTimeout=0"
+
+    def click_sel(self, sel: Sel, instance: int | None = None) -> bool:
+        """Seperti server u2: elemen dicari dan diketuk ATOMIK terhadap layar (keduanya di akhir satu RPC),
+        tanpa tunggu implisit. Satu entri per RPC: ("click", label) bila mengetuk, ("click_miss", selector) bila
+        tidak ditemukan, ("click_sel", selector) bila RPC gagal (agent/transport)."""
+        if not self.no_wait:  # seperti U2Driver: tunggu implisit dimatikan dulu sebelum klik selector pertama
+            self.configure_selector_click()
+        self._rpc("click_sel", sel if instance is None else f"{sel}[{instance}]")  # latensi + kegagalan suntikan
+        if instance is None:
+            found = self._match(sel)
+        else:
+            found = [n for n in getattr(self.app, "active_nodes", self.app.nodes)() if node_matches(n, sel)]
+            found = found[instance:instance + 1]
+        if not found:
+            self.calls[-1] = ("click_miss", str(sel))
+            self.sel_clicks.append((str(sel), ""))
+            return False
+        node = found[0]
+        self.calls[-1] = ("click", node.label)
+        self.sel_clicks.append((str(sel), node.label))
         self.app.on_tap(*node.center)
         return True
 
@@ -724,6 +836,7 @@ class FakeDriver:
         self._rpc("restart_agent", latency=2.0)
         self.restarts += 1
         self.alive = True
+        self.no_wait = False  # agent baru: Configurator bawaan (tunggu implisit)
 
     def window_size(self) -> tuple[int, int]:
         m = re.search(r"(\d+)x(\d+)", self.wm_size)

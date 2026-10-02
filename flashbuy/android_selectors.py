@@ -33,10 +33,9 @@ PLATFORM = "android"
 KIND_RANK = {"resourceId": 0, "resourceIdMatches": 0, "text": 1, "textContains": 2, "textStartsWith": 2,
              "textMatches": 2, "description": 3, "descriptionContains": 4, "descriptionMatches": 4, "className": 5}
 
-# testID React Native di aplikasi Shopee ID muncul sebagai resource-id mentah (tanpa "com.shopee.id:id/").
-# Hanya testID yang terverifikasi di app ID yang jadi default (labelTotalPayment, labelShippingFinalPrice,
-# labelButtonCheckout); testID dari app TH (buttonProductBuyNow, buttonPlaceOrder, buttonCartPanelSubmit)
-# dibiarkan untuk kalibrasi. Teks dicocokkan PERSIS: substring "Beli" tidak aman.
+# Default HANYA teks yang terlihat di layar (Bahasa Indonesia). resource-id/testID hanya dari kalibrasi di
+# device nyata (`calibrate --platform android`), tidak pernah dari riset isi aplikasi. Teks dicocokkan PERSIS:
+# substring "Beli" tidak aman.
 ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
     # Harga utama di halaman produk. Kosong = heuristik (nominal Rp terlihat dengan tinggi teks terbesar).
     "product_price": [],
@@ -64,7 +63,6 @@ ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
         {"textStartsWith": "Keranjang Saya"},
     ],
     "cart_checkout": [
-        {"resourceIdMatches": "(.*:id/)?labelButtonCheckout"},
         {"textMatches": "Checkout(\\s*\\(\\d+\\))?"},
         {"textStartsWith": "Checkout"},
         {"description": "Checkout"},
@@ -88,18 +86,13 @@ ANDROID_DEFAULT_STEPS: dict[str, list[dict]] = {
         {"text": "Buat Pesanan"},
         {"description": "Buat Pesanan"},
     ],
-    # Nilai "Total Pembayaran" & ongkir di checkout (dibaca langsung bila ada; selain itu dipasangkan
-    # dari label di layar).
-    "checkout_total": [
-        {"resourceIdMatches": "(.*:id/)?labelTotalPayment"},
-    ],
-    "checkout_shipping": [
-        {"resourceIdMatches": "(.*:id/)?labelShippingFinalPrice"},
-    ],
-    # Layar PIN ShopeePay (id native terverifikasi di app TH; teks Indonesia belum terverifikasi).
-    "pin_screen": [
-        {"resourceIdMatches": ".*:id/(payment_password_field|keyboard_number_view)"},
-    ],
+    # Nilai "Total Pembayaran" & ongkir di checkout: kosong = dipasangkan dari label baris di layar; resource-id
+    # nilainya bisa ditambahkan lewat kalibrasi / selectors.json.
+    "checkout_total": [],
+    "checkout_shipping": [],
+    # Layar PIN ShopeePay tanpa teks: resource-id hanya dari kalibrasi/selectors.json. Default: penanda teks
+    # "pin" (Masukkan PIN, PIN ShopeePay) di teks & content-desc.
+    "pin_screen": [],
 }
 
 # Regex penanda status layar (dicocokkan ke SELURUH teks satu elemen: textMatches/descriptionMatches).
@@ -143,6 +136,7 @@ ANDROID_DEFAULT_URLS: dict[str, str] = {
     # URL https yang dibuka lewat intent VIEW ke package Shopee (bila app tidak menanganinya -> tidak terbaca).
     "address_page": "https://shopee.co.id/user/account/address",
     "wallet_page": "https://shopee.co.id/user/shopeepay",
+    "cart_page": "https://shopee.co.id/cart",  # rehearsal: isi keranjang dibaca di akhir (tidak dihapus alat)
 }
 
 
@@ -181,6 +175,34 @@ def scoped(pattern: str) -> str:
         return f"(?:{pattern})"
     flags = "".join(sorted(set(re.sub(r"[()?]", "", m.group(0)))))
     return f"(?{flags}:{pattern[m.end():]})"
+
+
+# Teks "Buat Pesanan" pengujian selector langkah maju: selain langkah place_order, selector yang dipakai untuk
+# membaca/mengetuk TIDAK BOLEH cocok dengan teks ini (tombol Beli & "Buat Pesanan" sama-sama di kanan bawah).
+PLACE_ORDER_PROBE_TEXTS = ("Buat Pesanan", "BUAT PESANAN", "Buat pesanan", "buat pesanan", "Buat Pesanan (1)")
+
+
+def place_order_overlap(sel: Sel, place_cands: list[Sel]) -> str:
+    """"" bila `sel` tidak mungkin cocok dengan tombol "Buat Pesanan"; selain itu alasannya.
+
+    Diuji terhadap teks baku di atas + teks/content-desc/resource-id kandidat place_order (default & kalibrasi).
+    className polos ditolak: cocok dengan tombol apa pun, termasuk "Buat Pesanan"."""
+    from flashbuy.android_driver import Node, node_matches
+
+    if sel.by == "className":
+        return "tidak spesifik (className polos bisa cocok dengan 'Buat Pesanan')"
+    texts = set(PLACE_ORDER_PROBE_TEXTS)
+    rids: set[str] = set()
+    for c in place_cands:
+        if c.by in ("text", "description", "textContains", "descriptionContains", "textStartsWith"):
+            texts.add(c.value)
+        elif c.by == "resourceId":
+            rids.add(c.value)
+    probes = [*(Node(text=t) for t in texts), *(Node(desc=t) for t in texts), *(Node(rid=r) for r in rids)]
+    hit = next((p for p in probes if node_matches(p, sel)), None)
+    if hit is None:
+        return ""
+    return f"cocok dengan 'Buat Pesanan' ({hit.text or hit.desc or hit.rid!r})"
 
 
 def union(patterns: list[str]) -> str:

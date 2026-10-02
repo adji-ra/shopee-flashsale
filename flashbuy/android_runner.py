@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
-from flashbuy import pricing
+from flashbuy import android_selectors, pricing
 from flashbuy.android_driver import (
     AgentDead,
     AndroidDriver,
@@ -39,6 +39,7 @@ from flashbuy.android_driver import (
     DriverError,
     Node,
     Sel,
+    SelectorStale,
     TimedDriver,
     U2Driver,
     node_matches,
@@ -61,9 +62,20 @@ from flashbuy.android_screen import (
 )
 from flashbuy.android_selectors import AndroidSelectors, text_regex, union
 from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, require_live_ready
+from flashbuy.control import CANCEL_MESSAGE
 from flashbuy.notifier import Notifier
+from flashbuy.rehearsal import (
+    STOP_STATUSES,
+    PlaceOrderForbidden,
+    RehearsalReport,
+    RehearsalStep,
+    cart_line,
+    forbidden_gate,
+    guard_text,
+)
 from flashbuy.runner_base import (
     ALARM_STATUSES,
+    MAYBE_ORDERED_MSG,
     STOP_ALL_STATUSES,
     PollingGate,
     PrecheckItem,
@@ -78,6 +90,12 @@ from flashbuy.runner_base import (
 from flashbuy.timesync import ServerClock
 
 NO_RESPONSE_S = 1.5  # halaman produk TIDAK berubah sekian lama setelah klik -> boleh klik ulang (lewat gate)
+CHECKBOX_SEL = Sel("className", "android.widget.CheckBox")  # centang item keranjang (diketuk per instance)
+# langkah maju yang diketuk (selain "Buat Pesanan"): selectornya tidak boleh bisa cocok dengan "Buat Pesanan"
+TAP_STEPS = ("buy_button", "variant_option", "sheet_confirm", "cart_checkout", "payment_change", "payment_shopeepay",
+             "payment_confirm")
+FORWARD_RETRIES = 3  # ketukan langkah maju yang elemennya hilang saat diketuk: klasifikasi ulang & coba lagi
+PRE_SALE_BANNER = re.compile(r"(?i)dimulai\s+dalam")  # banner hitung mundur flash sale (bukan Toast "belum dimulai")
 STALE_TOAST_S = 0.4  # toast/banner lama yang masih tampil diabaikan selama ini
 FIRST_RELOAD_S = 0.5  # belum siap (tombol/harga) di T+0,5 s -> reload pertama
 RELOAD_EVERY_S = 2.0  # reload berikutnya tiap 2 s (tetap lewat RateLimiter & jendela)
@@ -220,9 +238,14 @@ class AndroidRunner:
         self.notifier = notifier
         self.before_place_order = before_place_order
         self.limiter = limiter or RateLimiter()
-        self.stop_event = stop_event  # asyncio.Event / threading.Event
+        self.stop_event = stop_event  # stop global: threading.Event / orchestrator StopView
+        self.cancel_event = None  # orchestrator: jalur lain memenangkan lock -> berhenti polling
+        self.latency: dict[str, float] = {}  # latensi query precheck (median/p95/maks ms) untuk doctor
         self.variant = cfg.variant
         self.package = cfg.android.package
+        self.tap_mode = cfg.android.tap_mode  # selector (cari+ketuk di device, 1 RPC) | coord (tap koordinat)
+        self.rehearsal = False  # mode rehearsal: "Buat Pesanan" tidak pernah diketuk (fungsi ketuknya melempar)
+        self._live = False  # attempt live: satu-satunya keadaan ketuk "Buat Pesanan" diizinkan
         self._raw_driver = driver
         self.d: TimedDriver | None = None
         self.open_at: float | None = None
@@ -313,6 +336,7 @@ class AndroidRunner:
         if raw is None:
             raw = await asyncio.to_thread(lambda: U2Driver(self.cfg.android.serial, package=self.package))
         self.d = TimedDriver(raw, self._mono, lambda: self._clock.now_ms())
+        self.d.before_action = self._checkpoint  # stop global/abort dicek sebelum SETIAP aksi ke layar
         try:
             self._screen_h = (await asyncio.to_thread(self.d.window_size))[1]
         except DriverError as e:
@@ -330,11 +354,21 @@ class AndroidRunner:
         self._stop_keepalive()
         await asyncio.to_thread(self._restore_stay_awake)
 
-    def _checkpoint(self) -> None:
-        if self._abort_reason is None and self.stop_event is not None and self.stop_event.is_set():
-            self._abort_reason = "dihentikan oleh runner lain"
+    def _checkpoint(self, _op: str = "") -> None:
+        """Di setiap iterasi dan sebelum SETIAP tap/gestur/intent (TimedDriver.before_action): abort pengguna,
+        stop global dari jalur lain. Setelah alat mengklik "Buat Pesanan", stop global tidak menghentikan
+        penantian layar PIN (pesanan sudah dikirim)."""
         if self._abort_reason is not None:
             raise _Aborted(self._abort_reason)
+        if not self.order_clicked and self.stop_event is not None and self.stop_event.is_set():
+            raise _Aborted(getattr(self.stop_event, "reason", "") or "dihentikan oleh runner lain")
+
+    def _poll_checkpoint(self) -> None:
+        """Fase polling (klik Beli, konfirmasi ulang, reload, pilih ulang variasi): juga berhenti bila jalur lain
+        sudah memenangkan lock "Buat Pesanan"."""
+        self._checkpoint()
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise _Aborted(CANCEL_MESSAGE)
 
     # ------------------------------------------------------------------ util selector
 
@@ -535,11 +569,15 @@ class AndroidRunner:
             return self._observe(msg_seen, t_obs)
         if context in ("after_buy", "after_order") and (toast := self._toast_screen(context)) is not None:
             return self._observe(toast, t_obs)
+        # rehearsal (pra-sale): banner hitung mundur "Flash Sale dimulai dalam .." selalu tampil, bukan reaksi
+        # klik Beli. Pesan "belum dimulai" sungguhan (Toast: _toast_screen di atas; overlay teks) tetap terbaca.
+        pre_sale = (self.rehearsal and msg_seen is not None and msg_seen.screen == Screen.NOT_STARTED
+                    and msg_seen.node is not None and PRE_SALE_BANNER.search(msg_seen.node.label) is not None)
         if anchor is not None:  # SHEET
-            if msg_seen is not None and context == "after_buy":
+            if msg_seen is not None and context == "after_buy" and not pre_sale:
                 return self._observe(msg_seen, t_obs)
             return self._observe(anchor, t_obs)
-        if context == "after_buy" and msg_seen is not None:  # "belum dimulai" di halaman produk
+        if context == "after_buy" and msg_seen is not None and not pre_sale:  # "belum dimulai" di halaman produk
             return self._observe(msg_seen, t_obs)
         if buy is not None:
             return self._observe(self._product(buy), t_obs)
@@ -781,7 +819,7 @@ class AndroidRunner:
         else:
             self.log.warn(f"agent uiautomator2 {why}; menghidupkan ulang")
             try:
-                self.d.restart_agent()
+                self._restart_agent()
                 ok, why2 = self._agent_healthy()
             except DriverError as e:
                 ok, why2 = False, str(e)
@@ -858,6 +896,7 @@ class AndroidRunner:
         add(PrecheckItem("harga produk", True if price.verdict != "unreadable" else None,
                          price.describe(self.limits) + " (sebelum flash sale bisa harga normal)"))
         add(self._latency_probe())
+        add(self._tap_mode_item())
 
         # alamat & saldo (dibaca dari UI). Tidak terbaca / kurang -> alarm saja, run tidak dihentikan.
         # Captcha/verifikasi di halaman ini = STOP (tidak ditimpa intent berikutnya).
@@ -994,6 +1033,9 @@ class AndroidRunner:
         self.d.find_all(Sel("textMatches", RP_ANY_MATCH))
         fa = [s.ms for s in self.d.stats.samples[mark:]]
         p95 = hot[min(len(hot) - 1, int(round(0.95 * (len(hot) - 1))))]
+        self.latency = {"median": hot[len(hot) // 2], "p95": p95, "max": hot[-1], "n": len(hot),
+                        "find_all": fa[0]}
+        self._tap_estimates(start)
         detail = (f"info/exists median {hot[len(hot) // 2]:.0f} ms, p95 {p95:.0f} ms, maks {hot[-1]:.0f} ms "
                   f"({len(hot)} query); find_all {fa[0]:.0f} ms")
         self.log.info(f"latensi query precheck: {detail}")
@@ -1001,6 +1043,44 @@ class AndroidRunner:
             return PrecheckItem("latensi query", None, f"{detail} > target {QUERY_WARN_MS:.0f}/{FIND_ALL_WARN_MS:.0f}"
                                                        " ms - pakai kabel/port USB lain, tutup aplikasi lain")
         return PrecheckItem("latensi query", True, detail)
+
+    def _tap_estimates(self, start: int) -> None:
+        """Estimasi latensi satu ketukan kedua mode dari query dengan selector Beli yang sama (TANPA ketukan):
+        selector ~ exists(selector) (cari + ketuk di device = satu RPC berisi pencarian yang sama);
+        coord ~ info(selector) + satu RPC kosong (baca node, lalu RPC tap koordinat)."""
+        cands = self._cands("buy_button")[:1]
+        if not cands:
+            return
+        mark = len(self.d.stats.samples)
+        for _ in range(3):
+            self.d.exists(cands[0])
+        ex = sorted(s.ms for s in self.d.stats.samples[mark:])
+        probe = sorted(s.ms for s in self.d.stats.samples[start:mark] if s.op == "exists")
+        info = sorted(s.ms for s in self.d.stats.samples[start:mark] if s.op == "info")
+        if not (ex and probe and info):
+            return
+        self.latency["tap_selector"] = ex[len(ex) // 2]
+        self.latency["tap_coord"] = info[len(info) // 2] + probe[len(probe) // 2]
+
+    def _tap_mode_item(self) -> PrecheckItem:
+        """Mode ketuk: selector Beli (dan langkah maju lain) tidak boleh bisa cocok dengan "Buat Pesanan" (kedua
+        mode); mode selector: tunggu implisit agent dimatikan (setConfigurator, TANPA ketukan)."""
+        lat = self.latency
+        est = (f"; estimasi ketuk: selector ~{lat['tap_selector']:.0f} ms (1 RPC), coord ~{lat['tap_coord']:.0f} ms "
+               "(baca + tap)") if "tap_selector" in lat else ""
+        problems = self.tap_selector_problems()
+        if problems:
+            return PrecheckItem("mode ketuk", False, "selector bisa cocok dengan 'Buat Pesanan': "
+                                + "; ".join(problems) + " - kalibrasi ulang")
+        if self.tap_mode == "coord":
+            return PrecheckItem("mode ketuk", True, f"coord: tap koordinat hasil bacaan (layar yang berganti di antara "
+                                                    f"baca & tap = celah 1 RPC){est}")
+        try:
+            detail = self.d.configure_selector_click()
+        except DriverError as e:
+            return PrecheckItem("mode ketuk", False, f"selector: agent menolak setConfigurator ({e}); "
+                                                     "pakai android.tap_mode: coord")
+        return PrecheckItem("mode ketuk", True, f"selector: cari+ketuk di HP dalam 1 RPC ({detail}){est}")
 
     def _read_page(self, name: str, url_key: str, judge) -> PrecheckItem:
         item = self._read_page_raw(name, url_key, judge)
@@ -1056,6 +1136,11 @@ class AndroidRunner:
         if self._arm_state is None and self._arm_failure is None:
             self._keepalive = asyncio.ensure_future(self._keepalive_loop())
 
+    @property
+    def arm_blocked(self) -> bool:
+        """arm (T-60 s) berakhir di layar stop / gagal: attempt() langsung mengembalikan hasilnya tanpa aksi."""
+        return self._arm_state is not None or self._arm_failure is not None
+
     def _arm_guarded(self) -> None:
         try:
             self._arm_sync()
@@ -1096,7 +1181,7 @@ class AndroidRunner:
         alive = self.d.agent_alive()
         if alive is False:
             self.log.warn(f"{when}: agent uiautomator2 mati (HiOS?), menghidupkan ulang")
-            self.d.restart_agent()
+            self._restart_agent()
             self.log.info(f"{when}: agent hidup lagi ({self.d.agent_alive()})")
 
     async def _keepalive_loop(self) -> None:
@@ -1143,7 +1228,9 @@ class AndroidRunner:
                               f"{self.variant!r} dipilih saat polling (lewat gate)")
                 return
             opt = self._find("variant_option", sticky=False) or opt
-        self.d.click(opt)
+        if not self._tap("variant_option", opt):
+            self.log.info(f"chip variasi {self.variant!r} hilang saat diketuk; dipilih di bottom sheet")
+            return
         self.log.mark("variant_selected", self.variant)
         self._variant_ok = True
         if self._has("sheet_marker") is not None:  # opsi membuka bottom sheet -> tutup, pilih ulang setelah Beli
@@ -1176,6 +1263,7 @@ class AndroidRunner:
         return await self._in_thread(self._attempt_wrapped, live)
 
     def _attempt_wrapped(self, live: bool) -> RunResult:
+        self._live = live and not self.rehearsal
         self._tracking = True
         self._unknown_since = self._loading_since = None
         try:
@@ -1207,7 +1295,7 @@ class AndroidRunner:
         last_reload = None
         outcome = Seen(Screen.PRODUCT_WAITING)
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             kind, info = self._wait_ready(gate, last_reload, clicks)
             if kind == "stop":
                 return TERMINAL[info.screen], info.evidence
@@ -1223,7 +1311,7 @@ class AndroidRunner:
                 t_wait = self._mono()
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 if self._mono() - t_wait > REVERIFY_AFTER_WAIT_S and self._dialog_blocks_click():
                     continue  # dialog crash/ANR muncul saat menunggu slot: gestur/intent tidak dikirim
                 if gate.expired():
@@ -1241,7 +1329,7 @@ class AndroidRunner:
             if kind == "variant":  # variasi lepas setelah reload: pilih ulang (aksi polling, lewat gate)
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 self._reselect_variant(gate)
                 self.limiter.touch(clock.now())  # seperti reload: slot berikutnya dihitung dari akhir aksi ini
                 continue
@@ -1249,7 +1337,7 @@ class AndroidRunner:
             if kind in ("sheet", "progress"):  # sheet masih terbuka: konfirmasi ulang = aksi polling
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
-                self._checkpoint()
+                self._poll_checkpoint()
                 if not self._handle_sheet(retry=True, gate=gate):
                     continue  # ditahan (dialog sistem / jendela habis): tidak diklik, tidak dihitung
                 self.limiter.touch(clock.now())  # jarak >= 425 ms dihitung dari tap sebenarnya
@@ -1262,22 +1350,24 @@ class AndroidRunner:
                 if not gate.acquire_sync():
                     return self._window_closed(clicks)
                 waited = self._mono() - t_wait > REVERIFY_AFTER_WAIT_S
-                self._checkpoint()
+                self._poll_checkpoint()
                 # toast lama bukan reaksi klik ini: dibersihkan SEBELUM klik (toast reaksi klik tetap terbaca) dan
                 # sebelum cek ulang tombol, supaya jarak cek ulang -> klik sesingkat mungkin
                 self.d.clear_toast()
-                if waited:
-                    # sempat menunggu slot: layar bisa sudah berubah (mis. checkout) -> cek ulang tombolnya
-                    fresh = self._find("buy_button")
-                    if fresh is None or fresh.bounds != btn.bounds:
-                        self.log.mark("buy_recheck", "tombol Beli berubah/hilang saat menunggu slot; tidak diklik")
-                        continue
                 if self._dialog_blocks_click():
                     continue  # dialog crash/ANR di atas tombol: tap akan mengenai dialog ("Tutup aplikasi")
                 if gate.expired():
                     return self._window_closed(clicks)
+                # mode coord, klik ulang (klik sebelumnya bisa diterima server terlambat) atau sempat menunggu slot:
+                # layar bisa sudah berganti ke checkout sejak tombol dibaca; tap koordinat basi bisa mendarat di
+                # "Buat Pesanan". Mode selector tidak perlu: elemen dicari & diketuk di device dalam satu RPC.
+                if self.tap_mode == "coord" and (clicks or waited) and \
+                        not self._retap_ok(btn, lambda: self._find("buy_button"), "buy_recheck"):
+                    continue
                 t_click = clock.now_ms()
-                self.d.click(btn)
+                if not self._tap("buy_button", btn):
+                    self.log.mark("buy_missed", "tombol Beli tidak ada lagi saat diketuk; tidak diketuk")
+                    continue  # klasifikasi ulang layar (bisa sudah checkout / sheet)
                 # slot berikutnya dihitung dari tap sebenarnya (RPC sebelum tap bisa lambat): jarak tap >= 425 ms
                 self.limiter.touch(clock.now())
                 clicks += 1
@@ -1295,6 +1385,7 @@ class AndroidRunner:
             if st == Screen.PIN_SCREEN:
                 # PIN tanpa klik "Buat Pesanan" dari alat: pesanan mungkin sudah terbuat (mis. tap tak sengaja)
                 self.order_clicked = True
+                self._signal_stop()  # jalur lain berhenti SEKARANG (gate menolak), bukan baru di _finish
                 return RunStatus.UNKNOWN_STATE, f"layar PIN muncul setelah klik Beli ({outcome.evidence})"
             if st in (Screen.NOT_STARTED, Screen.ERROR_TOAST):
                 self.log.mark("not_started", f"#{clicks} ({outcome.evidence})")
@@ -1314,12 +1405,18 @@ class AndroidRunner:
             btn = self._wait_find("cart_checkout", deadline)
             if btn is None:
                 return RunStatus.ERROR, "tombol Checkout di keranjang tidak ditemukan"
-            while self._dialog_blocks_click():  # tunggu dialog hilang (jaring UNKNOWN 1,5 s)
+            while True:
+                while self._dialog_blocks_click():  # tunggu dialog hilang (jaring UNKNOWN 1,5 s)
+                    self._checkpoint()
+                    btn = self._find("cart_checkout") or btn
                 self._checkpoint()
-                btn = self._find("cart_checkout") or btn
-            self._checkpoint()
-            t_click = clock.now_ms()
-            self.d.click(btn)
+                t_click = clock.now_ms()
+                if self._tap("cart_checkout", btn):
+                    break
+                self._halt(self._classify("any"))  # tombol hilang saat diketuk: klasifikasi ulang, cari lagi
+                btn = self._wait_find("cart_checkout", deadline)
+                if btn is None:
+                    return RunStatus.ERROR, "tombol Checkout di keranjang hilang"
             self.log.mark("click_checkout", t_ms=t_click)
             outcome = self._wait_screen({Screen.CHECKOUT}, max(0.1, deadline - self._mono()))
         if outcome.screen != Screen.CHECKOUT:
@@ -1348,9 +1445,13 @@ class AndroidRunner:
             return RunStatus.DRYRUN_OK, "sampai checkout dengan ShopeePay & harga lolos; 'Buat Pesanan' TIDAK diklik"
 
         self.d.clear_toast()
+        self._checkpoint()  # stop global terakhir sebelum klik yang mengikat
         t_click = clock.now_ms()
-        self.order_clicked = True
-        self.d.click(place)
+        self.order_clicked = True  # sejak sini stop global tidak menghentikan penantian layar PIN
+        if not self._tap("place_order", place):
+            # klik selector: "Buat Pesanan" tidak ditemukan di device = PASTI tidak diketuk (lock tetap dipegang)
+            self.order_clicked = False
+            return RunStatus.ERROR, "tombol 'Buat Pesanan' hilang tepat saat diketuk; tidak diketuk"
         self.log.mark("click_place_order", t_ms=t_click)
         outcome = self._wait_screen({Screen.PIN_SCREEN}, max(0.1, deadline - self._mono()), "after_order")
         if outcome.screen != Screen.PIN_SCREEN:
@@ -1407,7 +1508,7 @@ class AndroidRunner:
         | ("reload", None) | ("variant", Node) | ("stop", Seen).
         """
         while True:
-            self._checkpoint()
+            self._poll_checkpoint()
             if gate.expired():
                 return "expired", None
             reloadable = True
@@ -1431,6 +1532,7 @@ class AndroidRunner:
                         return ("sheet", None) if seen.screen == Screen.VARIANT_SHEET else ("progress", seen)
                     if seen.screen == Screen.PIN_SCREEN:
                         self.order_clicked = True
+                        self._signal_stop()  # pesanan mungkin ada: jalur lain berhenti SEKARANG, bukan di _finish
                         raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
                     # layar tak dikenal / aplikasi lain / loading: jangan reload/klik, biarkan jaring UNKNOWN.
                     # Halaman pesan tanpa tombol Beli ("Gagal memuat", "belum dimulai") = belum siap -> reload.
@@ -1534,14 +1636,78 @@ class AndroidRunner:
         self._guard_at = float("-inf")
         return True
 
-    def _forward_click(self, node: Node, refind: Callable[[], Node | None] | None = None) -> None:
-        """Tap langkah maju (sheet, keranjang, metode bayar): dialog crash/ANR di atasnya -> tunggu sampai hilang
-        (jaring UNKNOWN 1,5 s), lalu tap posisi terbaru. Tap tidak pernah mengenai dialog ("Tutup aplikasi")."""
-        while self._dialog_blocks_click():
-            self._checkpoint()
-            if refind is not None:
-                node = refind() or node
-        self.d.click(node)
+    def _forward_click(self, step: str, node: Node, refind: Callable[[], Node | None] | None = None) -> bool:
+        """Tap langkah maju (keranjang, metode bayar): dialog crash/ANR di atasnya -> tunggu sampai hilang
+        (jaring UNKNOWN 1,5 s), lalu tap posisi terbaru. Tap tidak pernah mengenai dialog ("Tutup aplikasi").
+        Mode selector: elemen tidak ada saat diketuk -> klasifikasi ulang, cari lagi (maks FORWARD_RETRIES);
+        False = tetap tidak ada (tidak diketuk)."""
+        for _ in range(FORWARD_RETRIES):
+            while self._dialog_blocks_click():
+                self._checkpoint()
+                if refind is not None:
+                    node = refind() or node
+            if self._tap(step, node):
+                return True
+            self._halt(self._classify("any"))
+            node = refind() if refind is not None else None
+            if node is None:
+                return False
+        return False
+
+    def _tap(self, step: str, node: Node) -> bool:
+        """SATU-SATUNYA jalan ketukan maju (Beli, chip variasi, konfirmasi sheet, centang keranjang, Checkout,
+        metode bayar, "Buat Pesanan"). Stop global/batal dicek driver sebelum ketukan (before_action), di kedua
+        mode; cek dialog crash/ANR ada di pemanggil.
+        - selector: elemen dicari & diketuk di device dalam SATU RPC lewat selector langkah ini (tanpa tunggu
+          implisit). Elemen tidak ada -> TIDAK diketuk, return False: pemanggil mengklasifikasi ulang layar.
+        - coord: tap tengah bounds hasil bacaan (layar bisa berganti di antara bacaan & tap)."""
+        if step == "place_order" and (self.rehearsal or not self._live):  # sebelum RPC apa pun
+            mode = "rehearsal" if self.rehearsal else "dry-run"
+            raise PlaceOrderForbidden(f"ketuk 'Buat Pesanan' dilarang di mode {mode}")
+        if self.tap_mode == "coord":
+            self.d.click(node)
+            return True
+        sel, instance = self._tap_selector(step, node)
+        try:
+            return self.d.click_sel(sel, instance)
+        except SelectorStale as e:
+            if step == "place_order":
+                raise  # tetap dianggap mungkin terketuk -> pesan wajib "Pesanan MUNGKIN sudah terbuat"
+            self.log.warn(f"{e}; tidak diketuk, layar diklasifikasi ulang")
+            return False
+
+    def _tap_selector(self, step: str, node: Node) -> tuple[Sel, int | None]:
+        """Selector untuk mengetuk `node` lewat klik selector: selector langkah ini yang menemukannya (via), atau
+        selector langkah ini (cocok pertama) bila node berasal dari bacaan gabungan. Tidak pernah selector yang
+        bisa cocok dengan "Buat Pesanan" (selain langkah place_order) atau className polos (selain centang
+        keranjang)."""
+        if step == "cart_toggle":
+            allowed = {CHECKBOX_SEL}
+        else:
+            allowed = set(self._cands(step))
+            if (u := self._union((step,))) is not None:
+                allowed.add(u)
+        if node.via is not None and node.via[0] in allowed:
+            sel, instance = node.via
+        else:
+            hit = self._sticky.get(step)
+            sel, instance = (hit if hit in allowed else (self._union((step,)) or self._cands(step)[0])), None
+        if step not in ("place_order", "cart_toggle") and (problem := android_selectors.place_order_overlap(
+                sel, self._cands("place_order"))):
+            raise _Stop(RunStatus.ERROR, f"selector {step} {sel} {problem}; tidak diketuk (kalibrasi ulang)")
+        return sel, instance
+
+    def tap_selector_problems(self) -> list[str]:
+        """Selector langkah maju yang bisa cocok dengan "Buat Pesanan" (atau tidak spesifik). Tombol Beli WAJIB
+        bersih: "Beli Sekarang" dan "Buat Pesanan" sama-sama di pojok kanan bawah."""
+        place = self._cands("place_order")
+        out = []
+        for step in TAP_STEPS:
+            sels = [*self._cands(step), *([u] if (u := self._union((step,))) is not None else [])]
+            for sel in sels:
+                if problem := android_selectors.place_order_overlap(sel, place):
+                    out.append(f"{step}: {sel} {problem}")
+        return out
 
     def _recognized(self) -> None:
         """Bacaan langkah maju mengenali layarnya: jaring UNKNOWN/loading mulai dari nol (dialog yang sudah hilang
@@ -1581,7 +1747,9 @@ class AndroidRunner:
             return
         if gate is not None and gate.expired():
             return  # aksi polling: tidak setelah T+8 s
-        self.d.click(opt)
+        if not self._tap("variant_option", opt):
+            self._recheck_variant = True  # chip hilang saat diketuk: dibaca & dicoba lagi
+            return
         self.log.mark("variant_selected", f"{self.variant} (ulang setelah reload)")
         if self._has("sheet_marker") is not None:
             self._variant_on_page = False
@@ -1614,7 +1782,14 @@ class AndroidRunner:
             raise err
         self._agent_restarts += 1
         self.log.warn(f"restart agent #{self._agent_restarts}")
+        self._restart_agent()
+
+    def _restart_agent(self) -> None:
+        """Restart agent + (mode selector) matikan lagi tunggu implisit sekarang, bukan di dalam ketukan pertama
+        sesudahnya (agent baru = Configurator bawaan)."""
         self.d.restart_agent()
+        if self.tap_mode == "selector":
+            self.d.configure_selector_click()
 
     def _after_buy(self, stale: bool, confirm_done: bool = False) -> Seen:
         """Tunggu reaksi klik Beli/konfirmasi. 'Tidak bereaksi' hanya bila halaman produk TIDAK berubah
@@ -1697,7 +1872,8 @@ class AndroidRunner:
                     raise _Stop(RunStatus.SOLD_OUT, f"variasi {self.variant!r} tidak bisa dipilih (habis?)")
                 if self._dialog_blocks_click() or (gate is not None and gate.expired()):
                     return False  # dialog crash/ANR di atas chip / jendela polling habis: tidak di-tap
-                self.d.click(opt)
+                if not self._tap("variant_option", opt):
+                    return False  # chip hilang saat diketuk: klasifikasi ulang, dicoba lagi
                 waited = True
                 self.log.mark("variant_selected", self.variant)
                 end = self._mono() + VARIANT_VERIFY_S
@@ -1724,10 +1900,28 @@ class AndroidRunner:
         if gate is not None and gate.expired():
             return False  # konfirmasi ulang = aksi polling: tidak setelah T+8 s
         self.d.clear_toast()
+        if retry and self.tap_mode == "coord" and not self._retap_ok(confirm, lambda: self._pick(
+                "sheet_confirm", self._sheet_nodes("sheet_confirm")) or self._find("sheet_confirm"), "confirm_recheck"):
+            return False
         t_click = self.clock.now_ms()
-        self.d.click(confirm)
+        if not self._tap("sheet_confirm", confirm):
+            self.log.mark("confirm_missed", "konfirmasi sheet tidak ada lagi saat diketuk; tidak diketuk")
+            return False
         self.log.mark("click_sheet_confirm", "ulang (lewat gate)" if retry else "", t_ms=t_click)
         return True
+
+    def _retap_ok(self, node: Node, read: Callable[[], Node | None], mark: str) -> bool:
+        """Tap ulang memakai koordinat elemen yang dibaca sebelumnya. Klik sebelumnya bisa diterima server
+        terlambat, sehingga checkout muncul di antara bacaan dan tap; tombol "Buat Pesanan" bisa berada di
+        koordinat yang sama. Dibaca ulang TEPAT sebelum tap (RPC terakhir sebelum tap): tidak boleh ada
+        "Buat Pesanan" di layar dan elemennya harus sama di posisi yang sama. Selain itu tidak di-tap; iterasi
+        berikutnya mengklasifikasi ulang layar."""
+        if self._has("place_order") is None:
+            fresh = read()
+            if fresh is not None and fresh.bounds == node.bounds:
+                return True
+        self.log.mark(mark, "berubah/hilang atau 'Buat Pesanan' tampil sejak dibaca; tidak di-tap")
+        return False
 
     # ------------------------------------------------------------------ lapis 2: keranjang
 
@@ -1761,7 +1955,9 @@ class AndroidRunner:
             for i in verdict.to_uncheck:
                 self._checkpoint()
                 row, box = rows[i]
-                self._forward_click(box)
+                if not self._forward_click("cart_toggle", box):
+                    raise _Stop(RunStatus.PRICE_GUARD, f"keranjang: centang {row.text.splitlines()[0][:40]!r} "
+                                                       "tidak bisa diketuk (hilang)")
                 self.log.mark("cart_uncheck", row.text.splitlines()[0][:50])
             changed = True
             end = self._mono() + CART_SETTLE_S
@@ -1784,7 +1980,7 @@ class AndroidRunner:
         nodes = self._snapshot()
         self._halt(self._classify_nodes(nodes, "any"))
         self._still_there("cart_marker", nodes)
-        boxes = self.d.find_all(Sel("className", "android.widget.CheckBox"))
+        boxes = self.d.find_all(CHECKBOX_SEL)
         return cart_rows(boxes, nodes), checkout_count(nodes)
 
     # ------------------------------------------------------------------ checkout
@@ -1809,7 +2005,8 @@ class AndroidRunner:
         if row is None:
             return False, f"baris 'Metode Pembayaran' tidak ditemukan (metode tampil: {value!r})", False
         t_click = self.clock.now_ms()
-        self._forward_click(row, lambda: self._find("payment_change"))
+        if not self._forward_click("payment_change", row, lambda: self._find("payment_change")):
+            return False, "baris 'Metode Pembayaran' hilang saat diketuk", False
         self.log.mark("payment_change", f"sebelumnya {value!r}", t_ms=t_click)
         end = min(deadline, self._mono() + SELECT_WAIT_S)
         opt = None
@@ -1822,12 +2019,13 @@ class AndroidRunner:
         if opt is None:
             return False, "opsi ShopeePay tidak ditemukan di daftar metode pembayaran", True
         t_click = self.clock.now_ms()
-        self._forward_click(opt, lambda: (n if (n := self._find("payment_shopeepay")) is not None and
-                                          is_shopeepay(n.label) else None))
+        if not self._forward_click("payment_shopeepay", opt, lambda: (
+                n if (n := self._find("payment_shopeepay")) is not None and is_shopeepay(n.label) else None)):
+            return False, "opsi ShopeePay hilang saat diketuk", True
         self.log.mark("select_shopeepay", t_ms=t_click)
         confirm = self._find("payment_confirm")
-        if confirm is not None:
-            self._forward_click(confirm, lambda: self._find("payment_confirm"))
+        if confirm is not None and self._forward_click("payment_confirm", confirm,
+                                                       lambda: self._find("payment_confirm")):
             self.log.mark("payment_confirm")
         while self._mono() < end:
             self._checkpoint()
@@ -1846,7 +2044,7 @@ class AndroidRunner:
                            PENDING_MATCH, VARIANT_LINE_MATCH, *loose))
         return self.d.find_all(sel)
 
-    def _checkout_guard(self, changed: bool = False) -> pricing.CheckoutVerdict:
+    def _checkout_guard(self, changed: bool = False, enforce: bool = True) -> pricing.CheckoutVerdict:
         """Lapis 3: tunggu ongkir & total terbaca dan stabil, lalu cek isi pesanan (fail-closed).
 
         Stabil = nilai sama bertahan >= 100 ms; setelah ganti metode bayar / uncheck keranjang >= 1 s
@@ -1884,6 +2082,8 @@ class AndroidRunner:
             verdict = self._recheck_identity(snap, total_rid, shipping_rid) or verdict
         self.log.info(f"checkout terbaca: {verdict.summary()}")
         if not verdict.ok:
+            if not enforce:  # rehearsal: dievaluasi & dilaporkan, tidak menghentikan
+                return verdict
             raise _Stop(RunStatus.PRICE_GUARD, f"{'; '.join(verdict.reasons)} | {verdict.summary()}")
         self.log.mark("price_guard_ok", verdict.summary())
         return verdict
@@ -1902,6 +2102,222 @@ class AndroidRunner:
                                                                   page_text=full.page_text), self.limits)
         self.log.info(f"nama/variasi dibaca ulang dari semua teks layar: {verdict.summary()}")
         return verdict if verdict.ok else None
+
+    # ------------------------------------------------------------------ rehearsal
+
+    async def rehearse(self, clock: ServerClock) -> RehearsalReport:
+        """Rehearsal sekali jalan di produk target asli (lihat flashbuy.rehearsal): mode ketuk -> buka produk ->
+        variasi -> klik Beli (lapis 1 hanya dievaluasi; sheet variasi dikonfirmasi) -> keranjang bila tampil
+        (lapis 2 dievaluasi) -> checkout -> ShopeePay -> baca checkout (lapis 3 dievaluasi) -> cari tombol
+        "Buat Pesanan" TANPA ketuk -> STOP. Ketuk "Buat Pesanan" dilarang di _tap; before_place_order diganti
+        fungsi yang melempar."""
+        self.rehearsal, self._live = True, False
+        self.before_place_order = forbidden_gate
+        self.clock = clock
+        return await self._in_thread(self._rehearse_wrapped)
+
+    def _rehearse_wrapped(self) -> RehearsalReport:
+        rep = RehearsalReport(self.name)
+        self._tracking = True
+        self._unknown_since = self._loading_since = None
+        try:
+            self._rehearse(rep)
+        except _Stop as e:
+            rep.stop(str(e.status), e.message)
+        except _Aborted as e:
+            rep.stop("ABORTED", str(e))
+        except DriverError as e:
+            rep.stop("ERROR", f"driver: {e}")
+        finally:
+            self._tracking = False
+        if self.order_clicked and not rep.message.startswith(MAYBE_ORDERED_MSG):  # PIN tanpa ketuk "Buat Pesanan"
+            rep.stop("UNKNOWN_STATE", f"{MAYBE_ORDERED_MSG} ({rep.message})")
+        if rep.status in STOP_STATUSES:  # captcha/verifikasi/login/UNKNOWN_STATE/PIN: stop + alarm, tanpa retry
+            if rep.status != "LOGIN_REQUIRED":
+                self._signal_stop()
+            self._alarm(rep.status, f"rehearsal android: {rep.message}")
+        elif rep.status in ("OK", "GAGAL") and rep.clicked_buy:  # keranjang hanya berubah bila Beli diklik
+            rep.cart_items = self._rehearse_cart()
+        self.log.mark("result", f"rehearsal {rep.status}: {rep.message or 'semua langkah OK'}")
+        self.log.info(cart_line(rep.cart_items))
+        rep.write(self.log.run_dir)
+        return rep
+
+    def _rh(self, rep: RehearsalReport, name: str, t0: float, ok: bool, *, selector: str = "",
+            values: dict | None = None, detail: str = "") -> None:
+        """Catat satu langkah rehearsal: latensi (sebelum screenshot), screenshot, log."""
+        ms = (self._mono() - t0) * 1000
+        shot = ""
+        path = self.log.screenshot_path(f"rehearsal-{len(rep.steps) + 1}-{name}")
+        try:
+            if self.d.screenshot(path):
+                shot = str(path)
+        except DriverError as e:
+            self.log.warn(f"screenshot gagal: {e}")
+        rep.add(RehearsalStep(name, ok, selector, round(ms, 1), values or {}, shot, detail))
+        text = f"rehearsal {name}: {'OK' if ok else 'GAGAL'}" + (f" [{selector}]" if selector else "")
+        (self.log.info if ok else self.log.warn)(text + (f" - {detail}" if detail else ""))
+
+    def _hit(self, step: str) -> str:
+        sel = self._sticky.get(step)
+        return str(sel) if sel is not None else ""
+
+    def _rehearse(self, rep: RehearsalReport) -> None:
+        # 0. mode ketuk (tanpa ketukan): selector langkah maju tidak boleh cocok dengan "Buat Pesanan"
+        t0 = self._mono()
+        item = self._tap_mode_item()
+        self._rh(rep, "mode ketuk", t0, item.ok is not False, values={"tap_mode": self.tap_mode}, detail=item.detail)
+        if item.ok is False:
+            return
+        # 1. buka produk
+        t0 = self._mono()
+        self._checkpoint()
+        self.d.start_url(self.cfg.product_url, self.package)
+        seen = self._wait_screen({*PRODUCT, Screen.NOT_STARTED, Screen.VARIANT_SHEET}, self.open_timeout_s, "product")
+        if seen.screen in (Screen.LOGIN_REQUIRED, Screen.CAPTCHA, Screen.VERIFICATION):
+            raise _Stop(TERMINAL[seen.screen], f"saat membuka produk: {seen.evidence}")
+        app = self.d.current_app()
+        ok = seen.screen in (*PRODUCT, Screen.NOT_STARTED) and app.package == self.package
+        self._rh(rep, "buka produk", t0, ok,
+                 values={"layar": str(seen.screen), "aplikasi": f"{app.package}/{app.activity}"},
+                 detail="" if ok else f"{seen.screen} {seen.evidence}".strip())
+        if not ok:
+            return
+        # 2. tombol Beli
+        t0 = self._mono()
+        btn = self._find("buy_button")
+        if btn is None:
+            self._rh(rep, "tombol Beli", t0, False, detail="tidak ditemukan - jalankan calibrate --platform android")
+            return
+        self._rh(rep, "tombol Beli", t0, True, selector=self._hit("buy_button"),
+                 values={"teks": btn.label, "aktif": btn.enabled})
+        # 3. harga produk: lapis 1 dievaluasi, TIDAK ditegakkan (harga normal saat rehearsal)
+        t0 = self._mono()
+        price = pricing.check_product_price(self._read_price(), self.limits)
+        rep.guards["lapis 1 harga produk"] = guard_text(price.verdict == "ok", price.describe(self.limits))
+        price_sel = ", ".join(str(c) for c in self._cands("product_price")) or "heuristik (nominal Rp terbesar)"
+        self._rh(rep, "baca harga produk", t0, price.verdict != "unreadable", selector=price_sel,
+                 values={"harga": price.value, "teks": price.text})
+        # 4. variasi di halaman produk (bila tampil); selain itu dipilih di bottom sheet setelah Beli
+        if self.variant:
+            t0 = self._mono()
+            self._preselect_variant()
+            where = "halaman produk" if self._variant_ok else "bottom sheet (setelah klik Beli)"
+            self._rh(rep, "pilih variasi", t0, True, selector=self._hit("variant_option"),
+                     values={"variasi": self.variant, "dipilih di": where})
+        # 5. klik Beli sekali (lewat RateLimiter jalur ini)
+        t0 = self._mono()
+        if not btn.enabled:
+            self._rh(rep, "klik Beli", t0, False, detail=f"tombol {btn.label!r} tidak aktif")
+            return
+        self.clock.wait_until(self.limiter.reserve(self.clock.now()))
+        while self._dialog_blocks_click():  # dialog crash/ANR: tunggu (jaring UNKNOWN 1,5 s), jangan ketuk
+            self._checkpoint()
+        self.d.clear_toast()
+        btn = self._find("buy_button") or btn
+        if not self._tap("buy_button", btn):
+            self._rh(rep, "klik Beli", t0, False, detail="tombol Beli hilang saat diketuk")
+            return
+        outcome = self._after_buy(False)
+        st = outcome.screen
+        if st == Screen.PIN_SCREEN:  # tanpa ketuk "Buat Pesanan": pesanan mungkin ada -> stop semua, alarm
+            self.order_clicked = True
+            self._signal_stop()
+            raise _Stop(RunStatus.UNKNOWN_STATE, f"{MAYBE_ORDERED_MSG} (layar PIN muncul setelah klik Beli)")
+        if st in TERMINAL:
+            raise _Stop(TERMINAL[st], outcome.evidence)
+        ok = st in (Screen.CART, Screen.CHECKOUT)
+        values = {"hasil": str(st)}
+        if self.variant:
+            values["variasi terpilih"] = bool(self._variant_ok)
+        self._rh(rep, "klik Beli", t0, ok, selector=self._hit("buy_button"), values=values,
+                 detail="" if ok else f"{st} {outcome.evidence}".strip())
+        if not ok:
+            return
+        deadline = self._mono() + self.flow_timeout_s
+        changed = False
+        # 6. keranjang (bila aplikasi membuka keranjang): lapis 2 dievaluasi, lalu ketuk Checkout
+        if st == Screen.CART:
+            t0 = self._mono()
+            rows, counts = self._read_cart()
+            values = {"item": [r.text.splitlines()[0][:60] for r, _ in rows],
+                      "tercentang": sum(r.checked for r, _ in rows), "tombol Checkout": counts}
+            try:
+                changed = self._cart_guard()
+                rep.guards["lapis 2 keranjang"] = guard_text(True, "1 item tercentang, kuantitas 1")
+            except _Stop as e:
+                if e.status != RunStatus.PRICE_GUARD:
+                    raise
+                rep.guards["lapis 2 keranjang"] = guard_text(False, e.message)
+            self._rh(rep, "baca keranjang", t0, bool(rows), values=values,
+                     detail="" if rows else "baris keranjang tidak terbaca")
+            t0 = self._mono()
+            btn = self._wait_find("cart_checkout", deadline)
+            tapped = False
+            if btn is not None:
+                while self._dialog_blocks_click():
+                    self._checkpoint()
+                tapped = self._tap("cart_checkout", btn)
+            if not tapped:
+                self._rh(rep, "klik Checkout", t0, False, detail="tombol Checkout tidak ditemukan / hilang")
+                return
+            outcome = self._wait_screen({Screen.CHECKOUT}, max(0.1, deadline - self._mono()))
+            if outcome.screen in TERMINAL:
+                raise _Stop(TERMINAL[outcome.screen], outcome.evidence)
+            ok = outcome.screen == Screen.CHECKOUT
+            self._rh(rep, "klik Checkout", t0, ok, selector=self._hit("cart_checkout"),
+                     detail="" if ok else f"{outcome.screen} {outcome.evidence}".strip())
+            if not ok:
+                return
+        # 7. checkout + ShopeePay
+        t0 = self._mono()
+        self._rh(rep, "halaman checkout", t0, True)
+        t0 = self._mono()
+        ok, msg, switched = self._ensure_shopeepay(deadline)
+        self._rh(rep, "ShopeePay", t0, ok, selector=self._hit("payment_shopeepay") or self._hit("payment_change"),
+                 detail=msg)
+        # 8. baca checkout: lapis 3 dievaluasi, tidak ditegakkan
+        t0 = self._mono()
+        try:
+            verdict = self._checkout_guard(changed or switched, enforce=False)
+        except _Stop as e:
+            if e.status != RunStatus.PRICE_GUARD:
+                raise
+            rep.guards["lapis 3 checkout"] = guard_text(False, e.message)
+            self._rh(rep, "baca checkout", t0, False, detail=e.message)
+        else:
+            v = verdict.values
+            rep.guards["lapis 3 checkout"] = guard_text(
+                verdict.ok, ("; ".join(verdict.reasons) + " | " if verdict.reasons else "") + verdict.summary())
+            missing = [r for r in verdict.reasons if "terbaca" in r]
+            self._rh(rep, "baca checkout", t0, not missing, values={
+                "nama cocok": v.get("name_ok"), "variasi cocok": v.get("variant_ok"), "qty": v.get("qty"),
+                "harga": v.get("item_price"), "ongkir": v.get("shipping"), "total": v.get("total")},
+                detail="; ".join(missing))
+        # 9. tombol "Buat Pesanan": hanya DICARI, tidak pernah diketuk
+        t0 = self._mono()
+        place = self._find("place_order")
+        self._rh(rep, "tombol Buat Pesanan (tidak diketuk)", t0, place is not None, selector=self._hit("place_order"),
+                 detail="ditemukan; rehearsal berhenti di sini" if place is not None else
+                 "tidak ditemukan - jalankan calibrate --platform android")
+
+    def _rehearse_cart(self) -> list[str] | None:
+        """Isi keranjang di akhir rehearsal (dilaporkan untuk dihapus manual; alat tidak menghapusnya)."""
+        url = self.sel.urls.get("cart_page")
+        if not url:
+            return None
+        try:
+            self._checkpoint()
+            self.d.start_url(url, self.package)
+            seen = self._wait_screen({Screen.CART}, 5.0)
+            if seen.screen != Screen.CART:
+                self.log.warn(f"halaman keranjang tidak terbuka ({seen.screen} {seen.evidence})")
+                return None
+            rows, _ = self._read_cart()
+        except (DriverError, _Stop, _Aborted) as e:
+            self.log.warn(f"isi keranjang tidak terbaca: {e}")
+            return None
+        return [r.text.splitlines()[0][:60] + (f" (qty {r.qty})" if r.qty not in (None, 1) else "") for r, _ in rows]
 
     # ------------------------------------------------------------------ akhir
 

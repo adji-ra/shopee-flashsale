@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -49,6 +50,42 @@ class AndroidOutcome:
         return [e["event"] for e in self.notifier.events]
 
 
+class RealClock:
+    """Jam nyata untuk FakeDriver/FakeShopeeApp saat berjalan bersama runner web (mock Shopee, Playwright).
+    `sleep` dipotong `cap` detik supaya latensi tetap FakeDriver yang besar tidak memperlambat tes."""
+
+    def __init__(self, cap: float = 0.02):
+        self.cap = cap
+
+    def time(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.perf_counter()
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(min(seconds, self.cap))
+
+
+# "Hasil kalibrasi" untuk aplikasi palsu: resource-id fake_* milik tests/fake_android.py. Default selector alat
+# hanya teks; resource-id hanya dari kalibrasi di device (tidak dari riset isi aplikasi Shopee).
+FAKE_CALIBRATED_STEPS: dict[str, list[dict]] = {
+    "cart_checkout": [{"resourceIdMatches": "(.*:id/)?fake_cart_checkout"}],
+    "checkout_total": [{"resourceIdMatches": "(.*:id/)?fake_total_value"}],
+    "checkout_shipping": [{"resourceIdMatches": "(.*:id/)?fake_shipping_value"}],
+    "pin_screen": [{"resourceIdMatches": ".*:id/(fake_pin_field|fake_pin_keypad)"}],
+}
+
+
+def calibrated_selectors():
+    """Default + resource-id aplikasi palsu di depan (seperti setelah `calibrate`); tanpa meta kalibrasi."""
+    sel = android_selectors.defaults()
+    for step, cands in FAKE_CALIBRATED_STEPS.items():
+        sel.steps[step] = [*cands, *sel.steps.get(step, [])]
+    return sel
+
+
 def make_android(tmp_path, *, open_in_s: float = 12.0, cfg: dict | None = None, live: bool = False,
                  selectors=None, latency_s: float = 0.02, driver_kw: dict | None = None,
                  runner_attrs: dict | None = None, before=None, **scenario):
@@ -67,7 +104,7 @@ def make_android(tmp_path, *, open_in_s: float = 12.0, cfg: dict | None = None, 
     target = android_cfg(open_at, **cfg)
     log = RunLog(tmp_path / "logs", sclock, "android", quiet_console())
     notifier = Notifier(beep=lambda f, d: None, post=lambda u, p: None, repeat=1)
-    runner = AndroidRunner(target, selectors or android_selectors.defaults(), log=log, notifier=notifier,
+    runner = AndroidRunner(target, selectors or calibrated_selectors(), log=log, notifier=notifier,
                            driver=driver, before_place_order=before or always_allow)
     for k, v in (runner_attrs or {}).items():
         setattr(runner, k, v)
@@ -77,7 +114,8 @@ def make_android(tmp_path, *, open_in_s: float = 12.0, cfg: dict | None = None, 
 # Semua operasi FakeDriver yang sah. Tidak ada operasi input teks: alat tidak pernah mengetik (PIN diketik manual).
 DRIVER_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "last_toast",
-              "clear_toast"}
+              # configure = waitForSelectorTimeout 0; click_miss = klik selector yang tidak menemukan elemen
+              "clear_toast", "configure", "click_miss", "click_sel"}
 
 
 def check_invariants(out: AndroidOutcome, live: bool) -> None:

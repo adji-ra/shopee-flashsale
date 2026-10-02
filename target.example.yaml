@@ -7,15 +7,17 @@ payment: "ShopeePay"
 max_item_price: 1500000       # harga flash maksimum per unit (Rupiah)
 max_total: 1550000            # total pembayaran maks, termasuk ongkir & biaya layanan
 expected_name: "Ponsel"       # potongan nama produk (tidak peka huruf besar/kecil); WAJIB untuk --live
-lead_ms: 150                  # opsional, bisa di-override --lead-ms
 web:
   enabled: true
   profile_dir: "C:/flashbuy/chrome-profile"   # profil terpisah, login manual sekali
   channel: "chrome"           # Chrome terpasang; null = Chromium bawaan Playwright
   block_media: false          # true = blokir gambar/video/font agar lebih cepat
+  lead_ms: 150                # polling web mulai T-150 ms (0..1000); --lead-ms mengganti semua jalur
 android:
   enabled: true
   serial: ""                  # kosong = device pertama
   package: "com.shopee.id"
   reload: "swipe"             # reload produk saat polling: "swipe" (tarik ke bawah) | "intent" (buka ulang URL)
+  lead_ms: 300                # polling Android mulai T-300 ms; saran nilai dari `flashbuy doctor`
+  tap_mode: "selector"        # "selector" (cari+ketuk di HP dalam 1 RPC, default) | "coord" (tap koordinat)
 notify_webhook: ""            # opsional

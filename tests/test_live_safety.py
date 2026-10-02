@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -120,13 +121,68 @@ def test_browser_handover(mock, admin, tmp_path, run, scenario, live, kept):
         assert admin.log("order") == []
 
 
-def test_live_browser_kept_open_even_on_exception(mock, admin, tmp_path, run, monkeypatch):
+@pytest.mark.parametrize("where", ["arm", "ringkasan"])
+def test_live_browser_kept_open_even_on_exception(mock, admin, tmp_path, run, monkeypatch, where):
+    """Exception di fase runner (arm) -> hasil ERROR jalur itu; exception di luar runner (ringkasan konsol) ->
+    menjalar. Keduanya: browser live tetap diserahkan ke pengguna (tidak ditutup alat)."""
     from flashbuy.web_runner import WebRunner
 
     async def broken_arm(self, open_at):
         raise RuntimeError("arm rusak")
 
-    monkeypatch.setattr(WebRunner, "arm", broken_arm)
+    def broken_summary(outcome, open_at):
+        raise RuntimeError("konsol rusak")
+
+    if where == "arm":
+        monkeypatch.setattr(WebRunner, "arm", broken_arm)
+    else:
+        monkeypatch.setattr(cli, "print_summary", broken_summary)
     result, seen = run(_cli_run(mock, admin, tmp_path, scenario="normal", live=True))
-    assert isinstance(result, RuntimeError)
+    if where == "arm":
+        assert result.status == RunStatus.ERROR and result.message == "arm: RuntimeError: arm rusak"
+        assert admin.log("buy") == [] and admin.log("order") == []
+    else:
+        assert isinstance(result, RuntimeError) and str(result) == "konsol rusak"
     assert seen.get("open"), "live: browser tetap diserahkan ke pengguna walau terjadi error"
+
+
+# ------------------------------------------------------------------ Ctrl+C saat browser diserahkan
+
+
+async def _cli_run_ctrl_c(mock, admin, tmp_path, *, live: bool, presses: int, scenario: str = "normal"):
+    """Ctrl+C (asyncio.run membatalkan task utama) `presses` kali saat menunggu pengguna menutup browser."""
+    admin.scenario(name=scenario, open_in_ms=3500)
+    st = admin.state()["scenario"]
+    cfg = make_cfg(mock, tmp_path, st["open_at"], expected_name=LIVE_NAME)
+    opened: list[bool] = []
+
+    async def wait_user(runner):
+        opened.append(runner.context is not None and len(runner.context.pages) > 0)
+        if len(opened) <= presses:
+            asyncio.current_task().cancel()
+            await asyncio.sleep(5)
+        await runner.context.close()  # pengguna menutup jendela
+
+    report = SimpleNamespace(offset_s=st["clock_offset_ms"] / 1000)
+    try:
+        result = await cli.run_web(cfg, selector_store.defaults(), live=live, lead_ms=150, report=report,
+                                   run_dir=tmp_path / "logs", headless=HEADLESS, samples=1, wait_user=wait_user)
+    except asyncio.CancelledError as e:
+        result = e
+    return result, opened
+
+
+def test_live_first_ctrl_c_during_handover_does_not_close_browser(mock, admin, tmp_path, run):
+    result, opened = run(_cli_run_ctrl_c(mock, admin, tmp_path, live=True, presses=1))
+    assert opened == [True, True], "setelah Ctrl+C pertama browser masih terbuka & tetap ditunggu"
+    assert result.status == RunStatus.ORDER_PLACED_AWAIT_PIN
+
+
+def test_live_second_ctrl_c_forces_exit(mock, admin, tmp_path, run):
+    result, opened = run(_cli_run_ctrl_c(mock, admin, tmp_path, live=True, presses=2))
+    assert opened == [True, True] and isinstance(result, asyncio.CancelledError)
+
+
+def test_dry_run_ctrl_c_during_handover_exits_at_once(mock, admin, tmp_path, run):
+    result, opened = run(_cli_run_ctrl_c(mock, admin, tmp_path, live=False, presses=1, scenario="captcha_redirect"))
+    assert opened == [True] and isinstance(result, asyncio.CancelledError)

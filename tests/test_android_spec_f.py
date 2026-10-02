@@ -38,8 +38,9 @@ ANR_TEXT = "dialog sistem 'Shopee tidak merespons' (crash/ANR)"
 
 # Operasi driver yang mengubah layar aplikasi; selain ini hanya membaca/diagnosa.
 ACTION_OPS = {"click", "start_url", "swipe_refresh", "press_back", "restart_agent"}
+# configure = waitForSelectorTimeout 0; click_miss = klik selector tanpa ketukan; click_sel = RPC klik gagal
 READ_OPS = {"exists", "info", "info_any", "find_all", "current_app", "webview", "screenshot", "dump", "agent_alive",
-            "last_toast", "clear_toast"}
+            "last_toast", "clear_toast", "configure", "click_miss", "click_sel"}
 # Semua operasi yang sah (tidak ada set_text/send_keys: PIN tidak mungkin diketik alat).
 ALLOWED_OPS = ACTION_OPS | READ_OPS | {"shell"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol.

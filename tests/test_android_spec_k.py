@@ -43,13 +43,14 @@ RESEL = "(ulang setelah reload)"  # detail langkah variant_selected saat dipilih
 
 # Operasi driver yang mengubah layar aplikasi; selain ini hanya membaca/diagnosa.
 ACTION_OPS = {"click", "start_url", "swipe_refresh", "press_back", "restart_agent"}
+# configure = waitForSelectorTimeout 0; click_miss = klik selector tanpa ketukan; click_sel = RPC klik gagal
 READ_OPS = {"exists", "info", "info_any", "find_all", "current_app", "webview", "screenshot", "dump", "agent_alive",
-            "last_toast", "clear_toast"}
+            "last_toast", "clear_toast", "configure", "click_miss", "click_sel"}
 ALLOWED_OPS = ACTION_OPS | READ_OPS | {"shell"}
 # API driver yang sah (Protocol = U2Driver = FakeDriver = TimedDriver). Tidak ada set_text/send_keys/...
 DRIVER_API = {"exists", "info", "info_any", "find_all", "click", "get_text", "current_app", "start_url",
               "swipe_refresh", "press_back", "webview_present", "screenshot", "last_toast", "clear_toast", "dump",
-              "shell", "agent_alive", "restart_agent", "window_size"}
+              "shell", "agent_alive", "restart_agent", "window_size", "click_sel", "configure_selector_click"}
 TEXT_INPUT_API = {"set_text", "send_keys", "input_text", "clear_text", "type_text", "send_text", "set_value",
                   "press_key", "keyevent", "set_input_ime", "set_fastinput_ime", "send_action", "set_clipboard"}
 # Nama RPC/metode uiautomator2 untuk mengetik/menekan tombol (camelCase server agent).
@@ -57,8 +58,9 @@ U2_TYPING = {"setText", "clearTextField", "injectInputEvent", "pressKeyCode", "s
              "setClipboard"}
 TYPING_RX = re.compile(r"\b(" + "|".join(sorted(TEXT_INPUT_API | U2_TYPING)) + r")\b")
 # Pemanggilan uiautomator2 yang dipakai U2Driver: jsonrpc agent + utilitas device. Tanpa setText/injectInputEvent.
+# getConfigurator/setConfigurator: hanya waitForSelectorTimeout = 0 untuk klik selector (bukan input)
 U2_RPC = {"exist", "objInfo", "objInfoOfAllInstances", "click", "swipe", "pressKey", "getLastToast", "clearLastToast",
-          "deviceInfo"}
+          "deviceInfo", "getConfigurator", "setConfigurator"}
 U2_DEVICE_ATTRS = {"jsonrpc", "app_current", "window_size", "screenshot", "dump_hierarchy", "shell", "_check_alive",
                    "_dev", "_device_server_port", "stop_uiautomator", "start_uiautomator"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol.

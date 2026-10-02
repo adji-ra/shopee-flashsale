@@ -46,6 +46,14 @@ def fake_clock() -> FakeClock:
     return FakeClock()
 
 
+@pytest.fixture(autouse=True)
+def _flashbuy_home(tmp_path_factory, monkeypatch):
+    """Lock antar-proses (~/.flashbuy/run.lock) per tes, tidak pernah di home pengguna."""
+    home = tmp_path_factory.mktemp("flashbuy-home")
+    monkeypatch.setenv("FLASHBUY_HOME", str(home))
+    return home
+
+
 # ------------------------------------------------------------------ mock Shopee + web runner
 
 import io  # noqa: E402

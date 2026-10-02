@@ -24,11 +24,11 @@ def test_timesync_all_fail(monkeypatch):
     assert cli.main(["timesync"]) == 1
 
 
-def test_run_without_platform_is_orchestrator_stage4(tmp_path, capsys):
-    # tanpa --only web|android: orchestrator (dua jalur paralel) baru di tahap 4; ditolak sebelum config dibaca.
-    # Jalur Android sendiri diuji di tests/test_android_cli.py.
-    assert cli.main(["run", "--config", "x.yaml"]) == 2
-    assert "menyusul di tahap 4" in capsys.readouterr().out
+def test_run_without_only_runs_all_enabled_lanes_config_checked_first(tmp_path, capsys):
+    # tanpa --only: orchestrator menjalankan semua jalur enabled; config tetap divalidasi lebih dulu (exit 2).
+    # Jalur gabungan diuji di tests/test_orchestrator.py, jalur Android sendiri di tests/test_android_cli.py.
+    assert cli.main(["run", "--config", str(tmp_path / "x.yaml")]) == 2
+    assert "file config tidak ditemukan" in capsys.readouterr().out
 
 
 def test_missing_config_exit_2(tmp_path):
@@ -99,3 +99,42 @@ def test_login_web_opens_login_page_and_waits_for_close(mock, admin, tmp_path, r
     run(cli.login_web(cfg, selector_store.defaults(), headless=True, on_open=on_open))
     assert "/buyer/login" in seen["url"]
     assert (tmp_path / "profile").exists()
+
+
+def test_cli_doctor_web_read_only(mock, admin, tmp_path, monkeypatch, capsys):
+    """doctor jalur web: precheck membuka alamat/saldo/produk saja; tidak ada beli/keranjang/checkout/pesanan."""
+    from types import SimpleNamespace
+
+    from flashbuy import doctor
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(timesync, "sync", lambda **kw: _report())
+    monkeypatch.setattr(doctor.shutil, "disk_usage", lambda p: SimpleNamespace(free=50 * 2**30))
+    cfg = _write_cfg(tmp_path, mock, mock.now() + 3600)
+    cfg.write_text(cfg.read_text() + 'expected_name: "Uji Coba"\n')
+    rc = cli.main(["doctor", "--config", str(cfg), "--allow-local", "--headless",
+                   "--selectors", str(tmp_path / "none.json")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    for row in ("config: start_time", "timesync", "precheck web", "umur selector web", "ruang disk log"):
+        assert row in out, row
+    assert "belum dikalibrasi" in out and "Hasil doctor: WARN" in out
+    assert "versi Shopee" not in out and "latensi query Android" not in out, "jalur Android disabled"
+    kinds = {e["kind"] for e in admin.log()}
+    assert not kinds & {"buy", "cart", "checkout", "order", "pin"}, kinds
+    assert {"address", "wallet"} <= kinds
+
+
+def test_cli_rehearse_web_against_mock(mock, admin, tmp_path, monkeypatch, capsys):
+    """rehearse --only web: produk harga normal (sebelum flash sale) sampai checkout, exit 0, laporan + JSON,
+    tanpa request "Buat Pesanan"."""
+    monkeypatch.chdir(tmp_path)
+    admin.scenario(name="normal_price_before_open", open_in_ms=3_600_000)
+    cfg = _write_cfg(tmp_path, mock, mock.now() - 86_400)  # start_time boleh lewat
+    rc = cli.main(["rehearse", "--config", str(cfg), "--only", "web", "--allow-local", "--headless",
+                   "--selectors", str(tmp_path / "none.json")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Rehearsal web: OK" in out and "keranjang berisi: Ponsel Uji Coba 128GB" in out
+    assert len(list((tmp_path / "logs").glob("*-rehearse/web-rehearsal.json"))) == 1
+    assert admin.log("order") == [] and admin.log("pin") == []

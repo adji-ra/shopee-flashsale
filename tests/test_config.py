@@ -19,7 +19,7 @@ BASE = {
 def test_example_config_loads():
     cfg = load_config(ROOT / "target.example.yaml")
     assert cfg.payment == "ShopeePay"
-    assert cfg.lead_ms == 150
+    assert cfg.web.lead_ms == 150 and cfg.android.lead_ms == 300
     assert cfg.variant == "128GB Hitam"
     assert cfg.max_item_price == 1_500_000 and cfg.max_total == 1_550_000
     assert cfg.expected_name == "Ponsel"
@@ -39,8 +39,9 @@ def test_defaults():
     ({"product_url": "https://tokopedia.com/x"}, "product_url"),
     ({"product_url": "http://shopee.co.id/x"}, "product_url"),
     ({"payment": "COD"}, "payment"),
-    ({"lead_ms": -1}, "lead_ms"),
-    ({"lead_ms": 5000}, "lead_ms"),
+    ({"lead_ms": 150}, "per platform"),  # kunci lama tingkat atas: pesan migrasi ke web.lead_ms / android.lead_ms
+    ({"web": {"lead_ms": -1}}, "lead_ms"),
+    ({"android": {"lead_ms": 5000}}, "lead_ms"),
     ({"pin": "123456"}, "pin"),
     ({"quantity": 2}, "quantity"),
     ({"notify_webhook": "ftp://x"}, "notify_webhook"),

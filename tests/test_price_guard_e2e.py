@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from flashbuy.runner_base import RunStatus
+from flashbuy.runner_base import MAYBE_ORDERED_MSG, RunStatus
 from tests.conftest import assert_polling_rules, run_web
 
 BOTH = pytest.mark.parametrize("live", [False, True], ids=["dry", "live"])
@@ -67,6 +69,13 @@ def test_variant_reselected_after_reload(mock, admin, tmp_path, run):
     i_reload = names.index("reload")
     assert names.index("variant_selected") < i_reload  # dipilih saat arm
     assert "variant_selected" in names[i_reload:names.index("click_buy")]  # dipilih ULANG setelah reload
+    # pilih ulang variasi = aksi polling (lewat RateLimiter): >= 425 ms setelah reload, klik Beli >= 425 ms lagi
+    steps = [s for s in out.result.steps if s.name in ("reload", "variant_selected", "click_buy")]
+    after = steps[[s.name for s in steps].index("reload"):]
+    assert [s.name for s in after[:3]] == ["reload", "variant_selected", "click_buy"], after
+    assert after[1].t_server_ms - after[0].t_server_ms >= 420, after
+    slots = out.runner.limiter.history  # reload, pilih variasi, klik Beli: masing-masing satu slot
+    assert len(slots) >= 3 and all(b - a >= 0.425 - 1e-6 for a, b in zip(slots, slots[1:], strict=False)), slots
     assert [b["body"]["variant"] for b in out.kind("buy")] == ["128GB Hitam"]
     assert_polling_rules(out)
     _no_order(out)
@@ -195,6 +204,20 @@ def test_unknown_page_becomes_unknown_state(mock, admin, tmp_path, run, live):
     _alarmed(out, RunStatus.UNKNOWN_STATE)
     log = (tmp_path / "logs" / "web.log").read_text()
     assert "/promo/kejutan" in log and "judul='Promo | Mock Shop'" in log
+
+
+@BOTH
+def test_pin_after_buy_is_maybe_ordered_and_stops_other_lanes_now(mock, admin, tmp_path, run, live):
+    """Layar PIN langsung setelah klik Beli (tanpa klik "Buat Pesanan" dari alat): pesanan MUNGKIN terbuat ->
+    UNKNOWN_STATE + pesan wajib, stop global saat itu juga (jalur lain tidak lewat gate), alarm."""
+    stop = threading.Event()
+    out = run(run_web(mock, admin, tmp_path, scenario="pin_after_buy", live=live,
+                      runner_attrs={"stop_event": stop}))
+    assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
+    assert out.result.message == MAYBE_ORDERED_MSG and "layar PIN muncul setelah klik Beli" in out.result.detail
+    assert stop.is_set() and out.runner.order_clicked
+    _no_order(out)
+    _alarmed(out, RunStatus.UNKNOWN_STATE)
 
 
 def test_unknown_limit_is_scalable(mock, admin, tmp_path, run):

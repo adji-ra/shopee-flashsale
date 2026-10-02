@@ -88,7 +88,7 @@ from flashbuy.android_selectors import (
     union,
 )
 from flashbuy.pricing import Limits
-from tests.android_harness import make_android
+from tests.android_harness import FAKE_CALIBRATED_STEPS, calibrated_selectors, make_android
 from tests.conftest import FakeClock
 from tests.fake_android import AppScenario, FakeShopeeApp
 
@@ -96,8 +96,8 @@ L = Limits(max_item_price=100_000, max_total=120_000, expected_name="Uji Coba")
 # regex baris label yang dipakai android_screen (label harus di AWAL teks; grup terakhir = nilai inline)
 TOTAL_RE = _TOTAL_ROW
 SHIPPING_RE = _SHIPPING_ROW
-TOTAL_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_total"][0]["resourceIdMatches"])
-SHIPPING_RID = re.compile(ANDROID_DEFAULT_STEPS["checkout_shipping"][0]["resourceIdMatches"])
+TOTAL_RID = re.compile(FAKE_CALIBRATED_STEPS["checkout_total"][0]["resourceIdMatches"])  # resource-id "kalibrasi"
+SHIPPING_RID = re.compile(FAKE_CALIBRATED_STEPS["checkout_shipping"][0]["resourceIdMatches"])
 TARGET = "Ponsel Uji Coba 128GB"
 OTHER = "Kabel Data USB-C"
 BOX = "android.widget.CheckBox"
@@ -420,7 +420,7 @@ def test_checkout_snapshot_testid_and_label_values_must_agree(fake_clock):
     assert pricing.check_checkout(snap, L).ok
 
     # testID berbeda dengan label (mis. total belum diperbarui) -> tidak terbaca (fail-closed), bukan pilih salah satu
-    tampered = [replace(n, text="Rp119.000") if n.rid == "labelTotalPayment" else n for n in nodes]
+    tampered = [replace(n, text="Rp119.000") if n.rid == "fake_total_value" else n for n in nodes]
     snap = checkout_snapshot(tampered, TOTAL_RID, SHIPPING_RID)
     assert snap.totals == ["Rp119.000", "Rp109.000", "Rp119.000"]  # testID, label rincian, label bar bawah
     assert pricing.read_total(snap)[1] is None
@@ -433,8 +433,8 @@ def test_checkout_snapshot_testid_and_label_values_must_agree(fake_clock):
 
 def test_checkout_snapshot_testid_only_values():
     nodes = [_n(TARGET, (140, 300, 700, 340)), _n("Rp99.000", (140, 395, 300, 430)), _n("x1", (640, 398, 700, 428)),
-             _n("Rp10.000", (500, 900, 700, 930), rid="com.shopee.id:id/labelShippingFinalPrice"),
-             _n("Rp109.000", (300, 1550, 510, 1595), rid="labelTotalPayment")]
+             _n("Rp10.000", (500, 900, 700, 930), rid="com.shopee.id:id/fake_shipping_value"),
+             _n("Rp109.000", (300, 1550, 510, 1595), rid="fake_total_value")]
     snap = checkout_snapshot(nodes, TOTAL_RID, SHIPPING_RID)
     assert (snap.totals, snap.shippings) == (["Rp109.000"], ["Rp10.000"])
     assert pricing.check_checkout(snap, L).ok
@@ -911,29 +911,36 @@ def test_default_step_lists_of_redesign():
     assert s["buy_button"] == [{"text": "Beli Sekarang"}, {"description": "Beli Sekarang"}]
     assert s["variant_option"] == [{"text": "{variant}"}, {"description": "{variant}"}]
     assert s["sheet_confirm"] == [{"text": "Beli Sekarang"}, {"text": "Konfirmasi"}]
-    assert s["cart_checkout"][0] == {"resourceIdMatches": "(.*:id/)?labelButtonCheckout"}
+    assert s["cart_checkout"][0] == {"textMatches": "Checkout(\\s*\\(\\d+\\))?"}
     assert s["product_price"] == []  # kosong = teks Rp pendek pertama (RP_SHORT_MATCH)
     for step in ("checkout_total", "checkout_shipping", "pin_screen"):
-        assert s[step] and all(set(c) == {"resourceIdMatches"} for c in s[step]), step
+        assert s[step] == [], step  # kosong = pasangan label / penanda teks; resource-id hanya dari kalibrasi
     # tombol yang men-tap (aksi) tidak pernah memakai kandidat substring
     for step in ("buy_button", "sheet_confirm", "place_order", "variant_option"):
         assert all(not k.endswith("Contains") for c in s[step] for k in c), step
 
 
+def test_defaults_contain_no_resource_ids():
+    """Aturan tahap 4: selector resource-id hanya dari kalibrasi di device nyata; default alat = teks terlihat."""
+    for step, cands in ANDROID_DEFAULT_STEPS.items():
+        assert not [c for c in cands if any(k.startswith("resourceId") for k in c)], step
+
+
 @pytest.mark.parametrize("step, rid, ok", [
-    ("checkout_total", "labelTotalPayment", True),  # testID React Native mentah
-    ("checkout_total", "com.shopee.id:id/labelTotalPayment", True),
-    ("checkout_total", "labelTotalPaymentDiscount", False),
-    ("checkout_shipping", "labelShippingFinalPrice", True),
-    ("checkout_shipping", "labelShippingPrice", False),
-    ("cart_checkout", "labelButtonCheckout", True),
-    ("cart_checkout", "com.shopee.id:id/labelButtonCheckout", True),
-    ("pin_screen", "com.shopee.id:id/payment_password_field", True),
-    ("pin_screen", "com.shopee.id:id/keyboard_number_view", True),
-    ("pin_screen", "com.shopee.id:id/payment_password_hint", False),
+    ("checkout_total", "fake_total_value", True),  # resource-id mentah tanpa awalan package
+    ("checkout_total", "com.shopee.id:id/fake_total_value", True),
+    ("checkout_total", "fake_total_value_discount", False),
+    ("checkout_shipping", "fake_shipping_value", True),
+    ("checkout_shipping", "fake_shipping_price", False),
+    ("cart_checkout", "fake_cart_checkout", True),
+    ("cart_checkout", "com.shopee.id:id/fake_cart_checkout", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_field", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_keypad", True),
+    ("pin_screen", "com.shopee.id:id/fake_pin_hint", False),
 ])
-def test_default_resource_id_steps_match_intended_ids(step, rid, ok):
-    cands = [c for c in android_selectors.defaults().candidates(step) if c.by.startswith("resourceId")]
+def test_calibrated_resource_id_steps_match_intended_ids(step, rid, ok):
+    """resource-id hasil kalibrasi (FAKE_CALIBRATED_STEPS) cocok ke seluruh id, dengan/tanpa awalan package."""
+    cands = [c for c in calibrated_selectors().candidates(step) if c.by.startswith("resourceId")]
     assert cands, step
     assert any(node_matches(_n(rid=rid), c) for c in cands) is ok
 
@@ -1010,7 +1017,7 @@ def test_load_rejects_invalid_android_section(tmp_path, section, match):
 @pytest.mark.parametrize("cand", [
     {"textMatches": "Checkout(("},
     {"descriptionMatches": "[Checkout"},
-    {"resourceIdMatches": "(.*:id/labelButtonCheckout"},
+    {"resourceIdMatches": "(.*:id/fake_cart_checkout"},
     {"textMatches": "(?i).*{variant}(.*"},  # divalidasi setelah {variant} diisi
     {"textMatches": "Checkout(?i)"},  # flag global di tengah ditolak
 ])
@@ -1028,7 +1035,7 @@ def test_load_accepts_valid_selector_regex_and_variant_template(tmp_path):
     assert sel.candidates("variant_option", "1+1") == [
         Sel("text", "1+1"), Sel("textMatches", "(?i)(?s)1\\+1"), Sel("description", "1+1")]  # urut jenis
     assert sel.candidates("cart_checkout")[:2] == [Sel("resourceIdMatches", ".*:id/btn_checkout"),
-                                                   Sel("resourceIdMatches", "(.*:id/)?labelButtonCheckout")]
+                                                   Sel("textMatches", "Checkout(\\s*\\(\\d+\\))?")]
 
 
 def test_save_new_file_without_backup(tmp_path):
@@ -1379,11 +1386,11 @@ def test_sel_kinds_and_rendering():
     (Sel("resourceId", "buy"), _n(rid="com.shopee.id:id/buy"), False),
     (Sel("className", "android.widget.CheckBox"), _n(cls=BOX), True),
     (Sel("className", "CheckBox"), _n(cls=BOX), False),
-    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="labelTotalPayment"), True),
-    (Sel("resourceIdMatches", "(.*:id/)?labelTotalPayment"), _n(rid="com.shopee.id:id/labelTotalPayment"), True),
-    (Sel("resourceIdMatches", "labelTotal"), _n(rid="labelTotalPayment"), False),  # seluruh resource-id
-    (Sel("resourceIdMatches", ".*"), _n("labelTotalPayment"), True),  # rid kosong pun cocok ".*"
-    (Sel("resourceIdMatches", "labelTotalPayment"), _n("labelTotalPayment"), False),  # bukan teks
+    (Sel("resourceIdMatches", "(.*:id/)?fake_total_value"), _n(rid="fake_total_value"), True),
+    (Sel("resourceIdMatches", "(.*:id/)?fake_total_value"), _n(rid="com.shopee.id:id/fake_total_value"), True),
+    (Sel("resourceIdMatches", "fake_total"), _n(rid="fake_total_value"), False),  # seluruh resource-id
+    (Sel("resourceIdMatches", ".*"), _n("fake_total_value"), True),  # rid kosong pun cocok ".*"
+    (Sel("resourceIdMatches", "fake_total_value"), _n("fake_total_value"), False),  # bukan teks
     # regex Java: \s, \w, \b hanya ASCII -> NBSP bukan spasi (karena itu android_screen menulis SP eksplisit)
     (Sel("textMatches", r"Rp\s99\.000"), _n("Rp 99.000"), True),
     (Sel("textMatches", r"Rp\s99\.000"), _n("Rp\u00a099.000"), False),
@@ -1535,9 +1542,30 @@ class FakeU2Device:
         found = self._match(selector)
         return [x for info in found for x in (None, info)] if self.null_entries else found
 
-    def _rpc_click(self, x, y) -> bool:
+    def _rpc_click(self, *args) -> bool:
+        if len(args) == 1:  # klik selector di server: cari + ketuk dalam satu RPC (instance = cocok ke-i)
+            (selector,) = args
+            found = self._match(selector)
+            i = selector.get("instance") or 0
+            if i >= len(found):
+                raise UiObjectNotFoundError(-32002, "androidx.test.uiautomator.UiObjectNotFoundException", selector)
+            self.actions.append(("click_sel", found[i].get("text"), dict(selector)))
+            return True
+        x, y = args
         self.actions.append(("click", x, y))
         return True
+
+    configurator = {"actionAcknowledgmentTimeout": 3000, "keyInjectionDelay": 0, "scrollAcknowledgmentTimeout": 200,
+                    "waitForIdleTimeout": 0, "waitForSelectorTimeout": 10000}
+    honor_configurator = True
+
+    def _rpc_getConfigurator(self) -> dict:
+        return dict(self.configurator)
+
+    def _rpc_setConfigurator(self, cfg: dict) -> dict:
+        if self.honor_configurator:
+            self.configurator = dict(cfg)
+        return dict(self.configurator)
 
     def _rpc_deviceInfo(self) -> dict:
         if isinstance(self.device_info, Exception):
@@ -2318,3 +2346,76 @@ def test_progress_bar_does_not_hide_login_or_sold_out_button(tmp_path, screen, e
     for context in ("product", "after_buy", "any"):
         assert runner._classify(context).screen == expected, context
     log.close()
+
+
+# ------------------------------------------------------------------ U2Driver: klik selector (tap_mode selector)
+
+
+def test_u2_click_sel_turns_off_implicit_wait_once_and_keeps_other_settings():
+    drv, dev = _u2(package="com.shopee.id")
+    assert drv.click_sel(Sel("text", "Beli Sekarang")) is True
+    assert drv.click_sel(Sel("text", "Beli Sekarang")) is True
+    methods = [m for m, _, _ in dev.rpcs]
+    assert methods == ["getConfigurator", "setConfigurator", "click", "click"], "konfigurasi sekali, lalu 1 RPC/ketuk"
+    assert dev.configurator["waitForSelectorTimeout"] == 0
+    assert dev.configurator["actionAcknowledgmentTimeout"] == 3000, "field lain dipertahankan"
+    (_, label, selector), _ = dev.actions
+    assert label == "Beli Sekarang" and selector["text"] == "Beli Sekarang"
+    assert selector["packageName"] == "com.shopee.id" and "instance" not in selector
+    assert all(a[0] == "click_sel" for a in dev.actions), "tidak ada tap koordinat"
+
+
+def test_u2_click_sel_missing_element_is_false_without_any_tap():
+    drv, dev = _u2(package="com.shopee.id")
+    assert drv.click_sel(Sel("text", "Buat Pesanan")) is False
+    assert dev.actions == []
+
+
+def test_u2_click_sel_instance_targets_nth_match():
+    a = _u2_info("Beli Sekarang", None, "", "android.widget.Button", (360, 1500, 720, 1612))
+    b = _u2_info("Beli Sekarang", None, "", "android.widget.Button", (0, 1500, 720, 1612))
+    drv, dev = _u2(elements=[a, b])
+    assert drv.click_sel(Sel("text", "Beli Sekarang"), 1) is True
+    assert dev.actions[0][2]["instance"] == 1
+    assert drv.click_sel(Sel("text", "Beli Sekarang"), 2) is False  # instance di luar jumlah: tidak diketuk
+
+
+def test_u2_click_sel_reconfigures_after_agent_restart():
+    drv, dev = _u2()
+    drv.click_sel(Sel("text", "Beli Sekarang"))
+    drv.restart_agent()
+    dev.configurator = dict(FakeU2Device.configurator)  # agent baru: Configurator bawaan (tunggu 10 s)
+    drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert [m for m, _, _ in dev.rpcs].count("setConfigurator") == 2
+    assert dev.configurator["waitForSelectorTimeout"] == 0
+
+
+def test_u2_configurator_rejected_is_driver_error_and_no_click():
+    drv, dev = _u2()
+    dev.honor_configurator = False
+    with pytest.raises(DriverError, match="waitForSelectorTimeout tetap 10000"):
+        drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert dev.actions == [] and "click" not in [m for m, _, _ in dev.rpcs]
+
+
+def test_u2_find_all_and_info_record_via_for_selector_click():
+    a = _u2_info("Konfirmasi", None, "", "android.widget.Button", (0, 1500, 720, 1612))
+    drv, dev = _u2(elements=[BUY_INFO, a, BUY_INFO])
+    sel = Sel("text", "Beli Sekarang")
+    assert drv.info(sel).via == (sel, None)
+    assert [n.via for n in drv.find_all(sel)] == [(sel, 0), (sel, 1)]
+
+
+
+@pytest.mark.parametrize("err", [STALE, "Unknown RPC error: -32001 java.lang.NullPointerException: Attempt to invoke"])
+def test_u2_click_sel_server_stale_or_npe_is_selector_stale(err):
+    """Elemen dibangun ulang / hilang di antara pencarian & klik di server (sebelum gesture): SelectorStale, bukan
+    DriverError umum; pemanggil mengklasifikasi ulang (untuk "Buat Pesanan": tetap mungkin terketuk)."""
+    from flashbuy.android_driver import SelectorStale
+
+    drv, dev = _u2()
+    drv.click_sel(Sel("text", "Beli Sekarang"))  # konfigurasi dulu
+    dev.fail_once["click"] = [RPCUnknownError(err, None, "trace")]
+    with pytest.raises(SelectorStale):
+        drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert [a[0] for a in dev.actions] == ["click_sel"], "hanya ketukan pertama yang terjadi"

@@ -14,6 +14,9 @@ from datetime import UTC, datetime
 log = logging.getLogger(__name__)
 
 WEBHOOK_TIMEOUT_S = 2.0
+# Pola alarm: "urgent" = pesanan (mungkin) terbuat -> panjang, dua nada bergantian; "short" = hasil lain;
+# "normal" = alarm runner tunggal (perilaku lama).
+PATTERNS = ("normal", "short", "urgent")
 
 
 def _default_beep(freq: int, duration_ms: int) -> None:
@@ -45,10 +48,12 @@ class Notifier:
         self.events: list[dict] = []  # riwayat, berguna untuk tes & ringkasan
         self._threads: list[threading.Thread] = []
 
-    def alarm(self, event: str, message: str, **extra) -> None:
+    def alarm(self, event: str, message: str, *, pattern: str = "normal", **extra) -> None:
         """Beep berulang + webhook, keduanya di thread latar (non-blocking)."""
-        payload = self._payload("alarm", event, message, extra)
-        self._spawn(self._beep_loop)
+        if pattern not in PATTERNS:
+            raise ValueError(f"pola alarm tidak dikenal: {pattern}")
+        payload = self._payload("alarm", event, message, {"pattern": pattern, **extra})
+        self._spawn(lambda: self._beep_loop(pattern))
         self._send(payload)
 
     def notify(self, event: str, message: str, **extra) -> None:
@@ -61,14 +66,23 @@ class Notifier:
         self.events.append(payload)
         return payload
 
-    def _beep_loop(self) -> None:
-        for _ in range(self.repeat):
+    def beeps(self, pattern: str = "normal") -> list[tuple[int, int, float]]:
+        """(frekuensi Hz, durasi ms, jeda s) setiap beep pola ini."""
+        if pattern == "short":
+            return [(self.freq, self.duration_ms, self.gap_s)] * min(3, self.repeat)
+        if pattern == "urgent":  # 3x lebih panjang, nada tinggi-rendah bergantian, jeda rapat
+            tones = (self.freq + 400, max(400, self.freq - 400))
+            return [(tones[i % 2], self.duration_ms + 100, self.gap_s / 2) for i in range(self.repeat * 3)]
+        return [(self.freq, self.duration_ms, self.gap_s)] * self.repeat
+
+    def _beep_loop(self, pattern: str = "normal") -> None:
+        for freq, duration_ms, gap_s in self.beeps(pattern):
             try:
-                self._beep(self.freq, self.duration_ms)
+                self._beep(freq, duration_ms)
             except Exception as e:  # noqa: BLE001 - alarm tidak boleh menjatuhkan run
                 log.warning("beep gagal: %s", e)
                 return
-            time.sleep(self.gap_s)
+            time.sleep(gap_s)
 
     def _send(self, payload: dict) -> None:
         if not self.webhook_url:
@@ -93,3 +107,17 @@ class Notifier:
         deadline = time.monotonic() + timeout
         for t in self._threads:
             t.join(max(0.0, deadline - time.monotonic()))
+
+
+class DeferredNotifier(Notifier):
+    """Notifier runner di bawah orchestrator: alarm dicatat (tanpa beep/webhook); orchestrator yang membunyikan
+    SATU alarm hasil akhir (dan paling banyak satu alarm precheck)."""
+
+    def __init__(self):
+        super().__init__("", beep=lambda f, d: None, post=lambda u, p: None, repeat=0)
+
+    def alarm(self, event: str, message: str, *, pattern: str = "normal", **extra) -> None:
+        self._payload("alarm", event, message, {"pattern": pattern, **extra})
+
+    def notify(self, event: str, message: str, **extra) -> None:
+        self._payload("info", event, message, extra)

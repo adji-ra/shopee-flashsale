@@ -32,7 +32,8 @@ PRECHECK_BEFORE_S = 600  # pre-check T-10 menit
 RESYNC_BEFORE_S = 120  # timesync ulang T-2 menit
 OPEN_PAGE_BEFORE_S = 60  # buka halaman produk T-60 s
 RESYNC_WARN_MS = 50  # offset baru beda > 50 ms -> peringatan
-DEFAULT_LEAD_MS = 150
+DEFAULT_LEAD_MS = 150  # web: mulai cek tombol 150 ms sebelum T
+DEFAULT_ANDROID_LEAD_MS = 300  # android: satu iterasi polling (3 query u2) lebih lambat dari web
 
 SHOPEE_HOSTS = ("shopee.co.id",)
 LOCAL_HOSTS = ("127.0.0.1", "localhost")  # hanya untuk tes (mock), lewat validation context
@@ -51,6 +52,7 @@ class WebConfig(_Strict):
     profile_dir: Path = Path("chrome-profile")
     channel: str | None = "chrome"  # "chrome" | "msedge" | null (Chromium bawaan Playwright)
     block_media: bool = False  # blokir gambar/video/font untuk mempercepat
+    lead_ms: int = Field(DEFAULT_LEAD_MS, ge=0, le=1000)  # polling mulai T - lead_ms
 
 
 class AndroidConfig(_Strict):
@@ -59,6 +61,10 @@ class AndroidConfig(_Strict):
     package: str = "com.shopee.id"
     # cara reload halaman produk saat polling: tarik-untuk-muat-ulang, atau buka ulang lewat intent VIEW
     reload: Literal["swipe", "intent"] = "swipe"
+    lead_ms: int = Field(DEFAULT_ANDROID_LEAD_MS, ge=0, le=1000)  # polling mulai T - lead_ms
+    # cara mengetuk: selector = elemen dicari & diketuk di device dalam satu RPC (tidak bisa mengenai elemen lain
+    # yang kebetulan menempati posisi lama); coord = tap koordinat hasil bacaan sebelumnya (perilaku lama)
+    tap_mode: Literal["selector", "coord"] = "selector"
 
 
 class TargetConfig(_Strict):
@@ -70,10 +76,17 @@ class TargetConfig(_Strict):
     max_item_price: int = Field(gt=0)  # harga satuan maksimum (harga flash)
     max_total: int = Field(gt=0)  # total pembayaran maks, termasuk ongkir & biaya layanan
     expected_name: str | None = None  # substring nama produk (case-insensitive)
-    lead_ms: int = Field(DEFAULT_LEAD_MS, ge=0, le=1000)
     web: WebConfig = WebConfig()
     android: AndroidConfig = AndroidConfig()
     notify_webhook: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _moved_keys(cls, data):
+        if isinstance(data, dict) and "lead_ms" in data:
+            raise ValueError("`lead_ms` sekarang per platform: pindahkan ke `web.lead_ms` (default 150) dan/atau "
+                             "`android.lead_ms` (default 300)")
+        return data
 
     @field_validator("product_url")
     @classmethod

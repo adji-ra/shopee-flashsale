@@ -38,6 +38,7 @@ class Scenario:
     payment_default: str = "shopeepay"  # shopeepay | cod | bank
     variants: list[str] = field(default_factory=list)  # tidak kosong = variasi wajib
     checkout_latency_ms: int = 0
+    buy_latency_ms: int = 0  # jawaban POST /api/buy ditunda X ms (server sibuk)
     address: str | None = "Jl. Contoh Raya No. 1, Kebayoran Baru, Jakarta Selatan"
     balance: int | None = 1_250_000
     product_name: str = "Ponsel Uji Coba 128GB"
@@ -56,6 +57,7 @@ class Scenario:
     captcha_redirect_after_buy: bool = False  # redirect penuh ke /verify/captcha
     captcha_iframe_after_buy: bool = False  # overlay iframe captcha (bukan dialog)
     unknown_page_after_buy: bool = False  # redirect ke halaman asing
+    pin_after_buy: bool = False  # klik Beli langsung berujung layar PIN (pesanan mungkin sudah terbuat)
     # --- keranjang & checkout
     cart_other_items: list[dict] = field(default_factory=list)  # {"name","price","checked"}
     cart_uncheck_fails: bool = False
@@ -83,6 +85,7 @@ PRESETS: dict[str, dict] = {
     "captcha_redirect": {"captcha_redirect_after_buy": True},
     "captcha_iframe": {"captcha_iframe_after_buy": True},
     "unknown_page": {"unknown_page_after_buy": True},
+    "pin_after_buy": {"pin_after_buy": True},
 }
 
 
@@ -326,6 +329,8 @@ def _make_handler(mock: MockShopee):
 
         def _buy(self, body: dict) -> None:
             s = mock.scenario
+            if s.buy_latency_ms:
+                time.sleep(s.buy_latency_ms / 1000.0)
             state = mock.sale_state()
             if state == "not_started" and not s.buy_active_before_open:
                 return self._json({"error": "not_started", "message": "Flash sale belum dimulai"})
@@ -344,6 +349,8 @@ def _make_handler(mock: MockShopee):
                 return self._json({"captcha_iframe": True})
             if s.unknown_page_after_buy:
                 return self._json({"redirect": "/promo/kejutan"})
+            if s.pin_after_buy:
+                return self._json({"redirect": "/pin"})
             flash = state == "open" and s.flash_available
             unit = mock.flash_price(body.get("variant")) if flash else s.original_price
             sid = secrets.token_hex(6)
@@ -362,7 +369,9 @@ def _make_handler(mock: MockShopee):
             return rows
 
         def _cart(self, sid: str) -> None:
-            sess = mock.sessions.get(sid)
+            # tanpa sid (buka /cart langsung) = keranjang tersimpan: sesi Beli terakhir
+            sess = mock.sessions.get(sid) if sid else (list(mock.sessions.values())[-1] if mock.sessions else None)
+            sid = sid or (list(mock.sessions)[-1] if mock.sessions else "")
             if not sess:
                 return self._html(pages.simple("Keranjang", "Keranjang belanja kosong."))
             self._html(pages.cart(sid, self._cart_rows(sess), mock.scenario.cart_uncheck_fails))
