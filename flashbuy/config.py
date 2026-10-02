@@ -62,6 +62,9 @@ class AndroidConfig(_Strict):
     # cara reload halaman produk saat polling: tarik-untuk-muat-ulang, atau buka ulang lewat intent VIEW
     reload: Literal["swipe", "intent"] = "swipe"
     lead_ms: int = Field(DEFAULT_ANDROID_LEAD_MS, ge=0, le=1000)  # polling mulai T - lead_ms
+    # cara mengetuk: selector = elemen dicari & diketuk di device dalam satu RPC (tidak bisa mengenai elemen lain
+    # yang kebetulan menempati posisi lama); coord = tap koordinat hasil bacaan sebelumnya (perilaku lama)
+    tap_mode: Literal["selector", "coord"] = "selector"
 
 
 class TargetConfig(_Strict):

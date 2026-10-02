@@ -40,7 +40,7 @@ HARNESS_WM = "Physical size: 720x1612"  # wm size bawaan FakeDriver (harness)
 # Operasi driver yang sah (tanpa input teks: PIN tidak mungkin diketik alat).
 ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
                "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent",
-               "last_toast", "clear_toast"}
+               "last_toast", "clear_toast", "configure", "click_miss", "click_sel"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (termasuk PIN, buka kunci).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
 SETTINGS_WRITE = re.compile(r"^(svc power stayon|settings put)\b")

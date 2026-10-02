@@ -114,7 +114,8 @@ def make_android(tmp_path, *, open_in_s: float = 12.0, cfg: dict | None = None, 
 # Semua operasi FakeDriver yang sah. Tidak ada operasi input teks: alat tidak pernah mengetik (PIN diketik manual).
 DRIVER_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "last_toast",
-              "clear_toast"}
+              # configure = waitForSelectorTimeout 0; click_miss = klik selector yang tidak menemukan elemen
+              "clear_toast", "configure", "click_miss", "click_sel"}
 
 
 def check_invariants(out: AndroidOutcome, live: bool) -> None:

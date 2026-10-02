@@ -14,8 +14,6 @@ import threading
 import time
 from collections.abc import Callable
 
-from flashbuy.runner_base import RateLimiter
-
 
 class RunControl:
     def __init__(self, now_ms: Callable[[], int] | None = None):
@@ -30,9 +28,6 @@ class RunControl:
         self.stop_reason = ""
         self.stop_ms: int | None = None
         self.gate_calls: list[tuple[str, bool, int]] = []  # (jalur, hasil, waktu ms) untuk ringkasan & tes
-        # satu akun = satu batas: maks 1 aksi polling (klik Beli, reload, pilih ulang variasi) per 400 ms
-        # untuk SEMUA jalur bersama, bukan per jalur
-        self.limiter = RateLimiter()
 
     def set_clock(self, now_ms: Callable[[], int]) -> None:
         self._now_ms = now_ms

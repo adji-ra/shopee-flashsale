@@ -130,7 +130,7 @@ def wire(lane: Lane, control: RunControl) -> None:
     r.stop_event = control.stop_view(lane.name)
     r.cancel_event = control.cancel_event(lane.name)
     r.before_place_order = control.place_order_gate(lane.name)
-    r.limiter = control.limiter  # rate limit polling dibagi semua jalur (satu akun)
+    # rate limit polling TIDAK dibagi: setiap jalur memakai RateLimiter-nya sendiri (1 aksi / 400 ms per jalur)
     r.notifier = DeferredNotifier()
 
 

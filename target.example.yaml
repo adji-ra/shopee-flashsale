@@ -19,4 +19,5 @@ android:
   package: "com.shopee.id"
   reload: "swipe"             # reload produk saat polling: "swipe" (tarik ke bawah) | "intent" (buka ulang URL)
   lead_ms: 300                # polling Android mulai T-300 ms; saran nilai dari `flashbuy doctor`
+  tap_mode: "selector"        # "selector" (cari+ketuk di HP dalam 1 RPC, default) | "coord" (tap koordinat)
 notify_webhook: ""            # opsional

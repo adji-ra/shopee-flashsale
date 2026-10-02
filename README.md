@@ -16,10 +16,11 @@ pesanan paling banyak **satu**, siapa pun jalur yang lebih cepat.
 | 2.1 | `pricing` (pengaman harga 3 lapis), deteksi captcha non-dialog, `UNKNOWN_STATE`, reload T+0,5 s | ✅ |
 | 3 | `android_runner` (dry-run & live) di atas device palsu, kalibrasi/precheck/run Android, koreksi live web | ✅ (perlu kalibrasi di HP asli) |
 | 4 | `orchestrator` (paralel, lock pemenang, stop global, satu alarm), `doctor`, `setup.ps1`, lock antar-proses | ✅ |
+| 4.1 | mode ketuk Android `selector` (cari+ketuk di HP, 1 RPC), rate limit per jalur, `rehearse` | ✅ (perlu dicoba di HP asli) |
 
 ## Batasan keras (tertanam di kode, bukan opsi)
 
-- Android: **hanya interaksi UI lewat uiautomator2** (query elemen, tap koordinat elemen, swipe, back,
+- Android: **hanya interaksi UI lewat uiautomator2** (query elemen, klik selector / tap koordinat elemen, swipe, back,
   intent VIEW `am start`). Tidak ada modifikasi/patch/dekompilasi APK Shopee (jadx/apktool), Frida/hook,
   root, bypass captcha, atau API privat. Perintah shell adb yang dipakai hanya membaca status device
   (`getprop`, `wm`, `dumpsys`, `settings get`, `pm path`, `ps`, `cmd package resolve-activity`), membuka
@@ -40,7 +41,8 @@ pesanan paling banyak **satu**, siapa pun jalur yang lebih cepat.
   stop, alarm) dengan pesan **"Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"**.
 - PIN ShopeePay tidak disimpan dan tidak diketik alat. Config menolak kunci tak dikenal (mis. `pin:`).
 - Rate limit **polling & retry** (klik ulang Beli, reload, pilih ulang variasi): maks 1 aksi / 400 ms (dipakai
-  425 ms untuk menyerap jitter) **untuk semua jalur bersama**, hanya di jendela **T-1 s s.d. T+8 s**.
+  425 ms untuk menyerap jitter) **per jalur** (web dan Android masing-masing punya `RateLimiter`), hanya di jendela
+  **T-1 s s.d. T+8 s** (juga per jalur).
 - Langkah maju (Checkout, pilih ShopeePay, Buat Pesanan) masing-masing dijalankan sekali, tanpa
   throttle, dengan batas total 30 s setelah klik Beli berhasil.
 - Kuantitas 1: diset di halaman produk, dicek di keranjang dan checkout.
@@ -81,8 +83,9 @@ H-1 (sehari sebelumnya):
 | 1 | setup laptop (sekali) | `.\setup.ps1` |
 | 2 | login manual web (termasuk OTP) dan aplikasi | `python -m flashbuy login --platform web --config target.yaml` / `--platform android` |
 | 3 | kalibrasi di produk biasa yang murah | `python -m flashbuy calibrate --platform web --config target.yaml --url <URL>` / `--platform android` |
-| 4 | dry-run kedua jalur (berhenti sebelum "Buat Pesanan") | `python -m flashbuy run --config target.yaml` |
-| 5 | cek akhir + uji alarm | `python -m flashbuy doctor --config target.yaml --beep` |
+| 4 | **rehearse di produk target** (harga masih normal; sampai checkout, tanpa "Buat Pesanan"); hapus sisa keranjang manual | `python -m flashbuy rehearse --config target.yaml` |
+| 5 | dry-run kedua jalur (berhenti sebelum "Buat Pesanan") | `python -m flashbuy run --config target.yaml` |
+| 6 | cek akhir + uji alarm | `python -m flashbuy doctor --config target.yaml --beep` |
 
 Hari H:
 
@@ -92,8 +95,42 @@ Hari H:
 | 2 | run live, paling lambat T-70 s (idealnya sebelum T-10 mnt agar precheck terjadwal ikut jalan) | `python -m flashbuy run --config target.yaml --live` |
 | 3 | alarm mendesak → periksa total di layar PIN, masukkan PIN **manual** | — |
 
-`run` dan `precheck` tanpa `--only` menjalankan **semua jalur yang `enabled`** di config; `--only web` /
-`--only android` tetap ada untuk satu jalur saja.
+`run`, `precheck`, dan `rehearse` tanpa `--only` menjalankan **semua jalur yang `enabled`** di config;
+`--only web` / `--only android` tetap ada untuk satu jalur saja.
+
+## Rehearsal (`flashbuy rehearse`)
+
+Menguji jalur dari produk target **asli** sampai halaman checkout, beberapa hari sebelum event, saat harga masih
+normal:
+
+```powershell
+python -m flashbuy rehearse --config target.yaml [--only web|android]
+```
+
+- Langsung jalan (tidak menunggu T; `start_time` boleh sudah lewat), memakai file lock yang sama. `--live` di CLI
+  atau kunci `live`/`mode` di config → ditolak (exit 2).
+- Alur sekali jalan per platform (berurutan): buka URL produk → pilih variasi → klik Beli sekali (lewat rate
+  limit; lapis 1 harga **tidak** ditegakkan, harga tetap dibaca) → keranjang (web; Android bila aplikasi membuka
+  keranjang) → checkout: pilih ShopeePay bila belum, baca harga/qty/nama/ongkir/total → cari tombol "Buat Pesanan"
+  **tanpa** klik → STOP.
+- Lapis 2 & 3 tetap **dievaluasi dan dilaporkan** ("akan lolos" / "akan gagal: …"); dengan harga normal lapis harga
+  memang "akan gagal" — itu wajar dan tidak memengaruhi exit code.
+- Pengaman berlapis: fungsi klik/ketuk "Buat Pesanan" kedua runner melempar error di mode rehearsal (juga di
+  dry-run); `before_place_order()` diganti fungsi yang melempar, jadi tidak pernah dipanggil.
+- CAPTCHA, VERIFICATION, UNKNOWN_STATE, layar PIN tak terduga → stop + alarm (platform berikutnya tidak
+  dijalankan), sama seperti run biasa. Browser/layar dibiarkan untuk diselesaikan manual.
+- Laporan per platform: tabel di terminal + `logs/<run_id>/<platform>-rehearsal.json`. Tiap langkah: nama,
+  OK/GAGAL, kandidat selector yang cocok, latensi, nilai yang terbaca, path screenshot. Di akhir:
+  **"keranjang berisi: …"** — hapus manual; alat tidak menghapusnya.
+
+| Exit (`rehearse`) | Arti |
+|---|---|
+| 0 | semua langkah OK di semua platform |
+| 1 | ada langkah GAGAL (nama langkahnya di tabel & JSON) / error |
+| 2 | config/argumen salah, termasuk `--live` atau kunci live di config |
+| 4 | CAPTCHA / VERIFICATION / LOGIN_REQUIRED |
+| 5 | UNKNOWN_STATE (mis. layar PIN muncul setelah Beli: pesanan MUNGKIN terbuat — cek manual) |
+| 6 | proses flashbuy lain memegang lock |
 
 ## Konfigurasi
 
@@ -452,8 +489,17 @@ Keamanan klik:
 - Klik ulang Beli, konfirmasi ulang di bottom sheet, dan reload = aksi polling (≥ 425 ms, jendela
   T-1..T+8 s, dicek lagi tepat sebelum tap). Jarak dihitung dari saat tap/gestur/intent **selesai**, jadi
   RPC lambat sebelum tap tidak memperpendeknya. Konfirmasi ulang yang ditahan dialog tidak dihitung klik.
-- Bila sempat menunggu slot, tombol Beli dibaca ulang tepat sebelum diklik (layar bisa sudah
-  berganti ke checkout; koordinat lama tidak pernah dipakai).
+- **Mode ketuk** `android.tap_mode`:
+  - `selector` (default): SEMUA ketukan maju (Beli, chip variasi, konfirmasi sheet, centang keranjang, Checkout,
+    metode bayar, "Buat Pesanan") memakai klik selector yang dijalankan di HP (jsonrpc `click(selector)`): elemen
+    dicari dan diketuk dalam **satu RPC**, tanpa tunggu implisit (`waitForSelectorTimeout` agent di-nol-kan saat
+    precheck, tanpa ketukan). Elemen tidak ada → **tidak** mengetuk, layar diklasifikasi ulang. Selector tombol
+    Beli (dan langkah maju lain) wajib tidak mungkin cocok dengan "Buat Pesanan" (diuji terhadap teks & resource-id
+    "Buat Pesanan"; className polos ditolak) — gagal → precheck GAGAL, run tidak dimulai.
+  - `coord`: tap koordinat hasil bacaan (perilaku lama). Bila sempat menunggu slot / tap ulang, tombol dibaca
+    ulang tepat sebelum diklik; sisa celah satu RPC baca (lihat Risiko).
+  - Cek stop global/batal dan dialog ANR sebelum ketukan berlaku di kedua mode. `doctor` melaporkan estimasi
+    latensi satu ketukan kedua mode dari query `exists`/`info` dengan selector Beli yang sama (tanpa ketukan).
 - Toast lama dibersihkan (`clearLastToast`) **sebelum** klik Beli/konfirmasi/"Buat Pesanan", jadi toast
   reaksi klik itu sendiri tetap terbaca.
 - Bottom sheet yang sudah terbuka sebelum klik Beli pertama ditutup dengan back (sekali; tidak tertutup →
@@ -502,9 +548,8 @@ python -m flashbuy run --config target.yaml --live     # pesanan sungguhan (maks
 - Precheck kedua jalur paralel (T-10 mnt). Satu gagal → lanjut dengan jalur yang lolos + alarm "jalan dengan
   satu platform". Keduanya gagal → batal (exit 3). Captcha/verifikasi saat precheck → stop semua.
 - Arm (T-60 s) paralel; tiap jalur mulai polling di `T - <jalur>.lead_ms`.
-- **Rate limit polling dibagi semua jalur** (satu akun): maks 1 aksi polling (klik Beli, reload, pilih ulang
-  variasi) per 400 ms (dipakai 425 ms) untuk web + Android **bersama**. Akibatnya klik Beli pertama jalur kedua
-  ≥ 425 ms setelah jalur pertama.
+- **Rate limit polling per jalur**: setiap jalur punya `RateLimiter` sendiri (1 aksi / 425 ms) dan jendela
+  T-1 s..T+8 s sendiri; klik Beli pertama web tidak tertunda oleh klik Android.
 - **Lock pemenang** (`threading.Lock`, hook `before_place_order()` tepat sebelum klik "Buat Pesanan"):
   pemanggil pertama mendapat izin, berikutnya ditolak → `ABORTED` tanpa klik. Lock **tidak pernah dilepas**
   dalam run itu, walaupun pemenang gagal setelahnya. Begitu diambil, jalur lain menerima event batal dan
@@ -571,6 +616,7 @@ checkout (hanya membuka halaman alamat, saldo, produk, lalu membaca layar); alar
 | `versi Shopee vs kalibrasi` | sama | belum dikalibrasi / versi tak tercatat atau tak terbaca | versi berubah |
 | `umur selector web` / `android` | ≤ 3 hari | > 3 hari / belum dikalibrasi | — |
 | `latensi query Android` | p95 ≤ 100 ms dan `android.lead_ms` ≥ saran | p95 > 100 ms / lead < saran / tak terukur | p95 > 500 ms |
+| `mode ketuk Android` | `selector` + estimasi latensi kedua mode | `coord` (celah ketukan basi) / tak terukur | — |
 | `ruang disk log` | ≥ 1 GB | < 1 GB | < 200 MB |
 | `alarm (--beep)` | pola pendek lalu mendesak dibunyikan (+ webhook) | webhook gagal | — |
 
@@ -599,7 +645,7 @@ headless, kalibrasi dengan Alt+klik yang disimulasikan, jalur Android di atas de
 skenario keselamatan (captcha, PIN, habis, agent mati, toast, sheet, dialog ANR, aplikasi asing), serta
 orchestrator dengan **kedua jalur berjalan bersamaan** (mock web + Playwright dan FakeDriver di jam nyata):
 lock pemenang (tepat 1 "Buat Pesanan"), stop global (0 tap setelah stop), pemenang yang sudah mengklik tetap
-sampai PIN, PRICE_GUARD satu jalur, precheck satu/dua gagal, rate limit bersama, lock antar-proses (proses
+sampai PIN, PRICE_GUARD satu jalur, precheck satu/dua gagal, rate limit per jalur, lock antar-proses (proses
 kedua ditolak), dan setiap baris `doctor` (PASS/WARN/FAIL, termasuk versi Shopee berubah & selector lama).
 Jumlahnya besar karena parametrisasi: 586 fungsi tes, 217 di antaranya diparametrisasi (misalnya setiap
 skenario dijalankan dry-run dan live, serta untuk kedua mode refresh). Setiap run Android juga memeriksa
@@ -625,9 +671,13 @@ Lint: `ruff check flashbuy tests`.
   kecepatan klik di T, jadi bisa ada satu klik Beli sebelum terdeteksi; dicek lagi segera setelah klik dan
   tepat sebelum konfirmasi bottom sheet.
 - Checkout `--live` memotong saldo ShopeePay sungguhan setelah Anda memasukkan PIN.
-- Android: tap memakai koordinat elemen yang dibaca sebelumnya. Bila klik Beli diterima server terlambat
-  (tanpa reaksi 1,5 s) lalu checkout muncul tepat saat tap ulang, tap bisa mendarat di "Buat Pesanan" (posisinya
-  sama). Sebelum setiap tap ulang (Beli & konfirmasi sheet) alat membaca ulang layar sebagai RPC terakhir: tombol
-  harus sama di posisi yang sama dan "Buat Pesanan" tidak tampil. Sisa jendela = satu RPC baca (± 10–60 ms).
-  Bila tetap terjadi, layar PIN terdeteksi → `UNKNOWN_STATE` "Pesanan MUNGKIN sudah terbuat", jalur lain langsung
-  berhenti, alarm; PIN tidak pernah diketik alat, jadi pembayaran tidak terjadi tanpa Anda.
+- Android, **hanya `tap_mode: coord`**: tap memakai koordinat elemen yang dibaca sebelumnya. Bila klik Beli
+  diterima server terlambat (tanpa reaksi 1,5 s) lalu checkout muncul tepat saat tap ulang, tap bisa mendarat di
+  "Buat Pesanan" (posisinya sama). Sebelum setiap tap ulang (Beli & konfirmasi sheet) alat membaca ulang layar
+  sebagai RPC terakhir: tombol harus sama di posisi yang sama dan "Buat Pesanan" tidak tampil. Sisa jendela = satu
+  RPC baca (± 10–60 ms). Bila tetap terjadi, layar PIN terdeteksi → `UNKNOWN_STATE` "Pesanan MUNGKIN sudah
+  terbuat", jalur lain langsung berhenti, alarm; PIN tidak pernah diketik alat, jadi pembayaran tidak terjadi
+  tanpa Anda. Mode `selector` (default) tidak punya celah ini.
+- Android `tap_mode: selector` memakai jsonrpc `click(selector)` & `setConfigurator` agent uiautomator2; baru
+  diverifikasi di HP palsu. Jalankan `rehearse` di HP sungguhan dulu: langkah "klik Beli" membuktikan klik selector
+  bekerja. Bila agent menolak, precheck GAGAL dengan saran `tap_mode: coord`.

@@ -369,7 +369,9 @@ def _make_handler(mock: MockShopee):
             return rows
 
         def _cart(self, sid: str) -> None:
-            sess = mock.sessions.get(sid)
+            # tanpa sid (buka /cart langsung) = keranjang tersimpan: sesi Beli terakhir
+            sess = mock.sessions.get(sid) if sid else (list(mock.sessions.values())[-1] if mock.sessions else None)
+            sid = sid or (list(mock.sessions)[-1] if mock.sessions else "")
             if not sess:
                 return self._html(pages.simple("Keranjang", "Keranjang belanja kosong."))
             self._html(pages.cart(sid, self._cart_rows(sess), mock.scenario.cart_uncheck_fails))

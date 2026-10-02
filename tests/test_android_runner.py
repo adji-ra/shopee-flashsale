@@ -37,7 +37,8 @@ BUY_SEL = "text='Beli Sekarang'"  # str(Sel) kandidat pertama buy_button (defaul
 AGENT_OPS = {"last_toast", "clear_toast"}
 # Operasi driver yang sah dipakai runner (tidak ada input teks: PIN tidak mungkin diketik alat).
 ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
-               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
+               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "configure",
+               "click_miss", "click_sel"} | AGENT_OPS
 # Kueri satu objek (jalur A) - satu-satunya kueri yang boleh dipakai di hot path polling.
 SINGLE_OBJECT_OPS = {"info", "exists"}
 # Klik yang tepat didahului clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
@@ -314,7 +315,7 @@ def test_dry_run_writes_screenshot_dump_and_latency_csv(tmp_path):
         for row in lines[1:]:
             assert float(row.rsplit(",", 1)[1]) >= 0
     run_ops = {row.split(",")[1] for row in (logs / "android-queries-run.csv").read_text().splitlines()[1:]}
-    assert {"info", "find_all", "click"} <= run_ops
+    assert {"info", "find_all"} <= run_ops and run_ops & {"click", "click_sel"}  # tap koordinat / klik selector
     log_text = (logs / "android.log").read_text(encoding="utf-8")
     assert "latensi run" in log_text and "latensi query precheck" in log_text
     # hot path tanpa dump_hierarchy: dump hanya sekali, untuk status akhir
@@ -932,9 +933,11 @@ def _buy_button_glitch_after_reload(move: bool):
 
 @pytest.mark.parametrize("move", [False, True], ids=["vanished", "moved"])
 def test_buy_button_rechecked_after_waiting_for_slot(tmp_path, move):
-    """Runner menunggu slot > 50 ms (reload barusan) -> tombol dibaca ulang; hilang/bergeser -> tidak diklik di
-    koordinat lama (langkah buy_recheck)."""
-    out = run_android(tmp_path, live_update=False, during=_during_patch(_buy_button_glitch_after_reload(move)))
+    """Mode coord: runner menunggu slot > 50 ms (reload barusan) -> tombol dibaca ulang; hilang/bergeser -> tidak
+    diklik di koordinat lama (langkah buy_recheck). Mode selector tidak memakai koordinat (lihat
+    test_android_stale_tap)."""
+    out = run_android(tmp_path, live_update=False, during=_during_patch(_buy_button_glitch_after_reload(move)),
+                      cfg={"android": {"tap_mode": "coord"}})
     assert out.result.status == RunStatus.DRYRUN_OK, out.result.message
     names = out.step_names()
     assert "buy_recheck" in names

@@ -294,8 +294,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 checks.append(doctor.check_selector_age(p, calibrated))
             if "android" in platforms:
                 runner = runners.get("android")
-                checks.append(doctor.check_latency(getattr(runner, "latency", {}) if runner else {},
-                                                   cfg.android.lead_ms))
+                latency = getattr(runner, "latency", {}) if runner else {}
+                checks.append(doctor.check_latency(latency, cfg.android.lead_ms))
+                checks.append(doctor.check_tap_mode(cfg.android.tap_mode, latency))
         checks.append(doctor.check_disk(Path("logs")))
         if args.beep:
             checks.append(doctor.check_beep(Notifier(cfg.notify_webhook if cfg is not None else "")))
@@ -609,6 +610,127 @@ def cmd_run(args: argparse.Namespace) -> int:
         lock.release()
 
 
+# --------------------------------------------------------------------------- rehearsal
+
+
+def _rehearsal_live_rejected(args: argparse.Namespace) -> str:
+    """Rehearsal tidak pernah live: --live di CLI atau kunci live/mode di config -> alasan penolakan."""
+    if getattr(args, "live", False):
+        return "rehearse tidak boleh digabung dengan --live (rehearsal selalu berhenti sebelum 'Buat Pesanan')"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""  # dilaporkan oleh validasi config biasa
+    if isinstance(raw, dict) and (raw.get("live") is not None or str(raw.get("mode", "")).lower() == "live"):
+        return "rehearse ditolak: config memuat kunci live/mode (rehearsal tidak pernah live)"
+    return ""
+
+
+def print_rehearsal(rep) -> None:
+    from flashbuy.rehearsal import cart_line
+
+    color = "green" if rep.ok else "red"
+    table = Table(title=f"Rehearsal {rep.platform}: {rep.status}" + (f" - {rep.message}" if rep.message else ""))
+    for col in ("#", "Langkah", "Hasil", "Selector cocok", "Latensi", "Nilai terbaca", "Screenshot / catatan"):
+        table.add_column(col)
+    for i, s in enumerate(rep.steps, 1):
+        values = ", ".join(f"{k}={v}" for k, v in s.values.items() if v not in (None, "", []))
+        note = "; ".join(x for x in (Path(s.screenshot).name if s.screenshot else "", s.detail) if x)
+        table.add_row(str(i), s.name, Text("OK" if s.ok else "GAGAL", style="green" if s.ok else "bold red"),
+                      Text(s.selector), "" if s.latency_ms is None else f"{s.latency_ms:.0f} ms", Text(values),
+                      Text(note))
+    console.print(table)
+    for name, verdict in rep.guards.items():
+        style = "green" if verdict.startswith("akan lolos") else "yellow"
+        console.print(Text(f"  {name}: {verdict}", style=style))
+    if rep.guards:
+        console.print("  (pengaman harga hanya DIEVALUASI saat rehearsal; harga normal = 'akan gagal' itu wajar)")
+    console.print(Text(f"  {cart_line(rep.cart_items)}", style="bold"))
+    console.print(f"  Laporan JSON: {rep.json_path}")
+    console.print(f"  [{color}]Rehearsal {rep.platform}: {'semua langkah OK' if rep.ok else rep.status}[/]"
+                  + ("" if rep.ok or not rep.failed else f" (gagal: {', '.join(rep.failed)})"))
+
+
+async def rehearse_platforms(cfg: TargetConfig, platforms: list[str], sels: dict, driver, *, run_dir: Path,
+                             headless: bool, wait_user: Callable[[object], Awaitable[None]] | None = None) -> list:
+    """Rehearsal per platform berurutan. CAPTCHA/VERIFICATION/UNKNOWN_STATE di satu platform = stop semua:
+    platform berikutnya tidak dijalankan. Browser dibiarkan terbuka bila butuh tindakan manual."""
+    from flashbuy.android_runner import AndroidRunner
+    from flashbuy.notifier import Notifier
+    from flashbuy.rehearsal import RehearsalReport
+    from flashbuy.runner_base import RunLog, RunStatus
+    from flashbuy.web_runner import WebRunner
+
+    clock = timesync.ServerClock(0.0)  # tidak ada T: jam lokal cukup untuk log & rate limit
+    notifier = Notifier(cfg.notify_webhook)
+    reports: list[RehearsalReport] = []
+    try:
+        for p in platforms:
+            if reports and reports[-1].status in ("CAPTCHA", "VERIFICATION", "UNKNOWN_STATE"):
+                rep = RehearsalReport(p, status="ABORTED", message=f"dihentikan: {reports[-1].status} di "
+                                                                     f"{reports[-1].platform}")
+                reports.append(rep)
+                continue
+            log = RunLog(run_dir, clock, p, console)
+            if p == "web":
+                runner = WebRunner(cfg, sels["web"], log=log, notifier=notifier, headless=headless)
+            else:
+                runner = AndroidRunner(cfg, sels["android"], log=log, notifier=notifier, driver=driver)
+            try:
+                await runner.prepare()
+                rep = await runner.rehearse(clock)
+            except DriverError as e:
+                rep = RehearsalReport(p, status="ERROR", message=f"driver: {e}")
+                rep.write(run_dir)
+            reports.append(rep)
+            print_rehearsal(rep)
+            try:
+                needs_user = rep.status in ("CAPTCHA", "VERIFICATION", "LOGIN_REQUIRED", "UNKNOWN_STATE")
+                if p == "web" and needs_user and getattr(runner, "context", None) is not None:
+                    await _hand_over_browser(runner, False, RunStatus(rep.status), headless, wait_user)
+                elif p == "android" and needs_user:
+                    console.print("[bold]Layar di HP dibiarkan apa adanya; selesaikan manual.[/]")
+            finally:
+                await runner.close()
+                log.close()
+    finally:
+        notifier.join(1)
+    return reports
+
+
+def cmd_rehearse(args: argparse.Namespace) -> int:
+    from flashbuy.orchestrator import EXIT_BUSY
+    from flashbuy.rehearsal import combined_exit
+
+    reason = _rehearsal_live_rejected(args)
+    if reason:
+        console.print(f"[red]{reason}[/]")
+        return 2
+    cfg = _load(args)
+    platforms = _platforms(args, cfg)
+    if not platforms:
+        return 2
+    lock = _lock("rehearse")
+    if lock is None:
+        return EXIT_BUSY
+    try:
+        sels = {p: selector_store.load(args.selectors) if p == "web" else _android_selectors(args.selectors)
+                for p in platforms}
+        console.print(f"[bold]REHEARSAL[/] {'+'.join(platforms)} | produk {cfg.product_url} | langsung jalan (tanpa "
+                      "menunggu T) | berhenti sebelum 'Buat Pesanan'; harga TIDAK ditegakkan, hanya dievaluasi")
+        driver = _android_driver(cfg) if "android" in platforms else None
+        run_dir = Path("logs") / f"{time.strftime('%Y%m%d-%H%M%S')}-rehearse"
+        reports = asyncio.run(rehearse_platforms(cfg, platforms, sels, driver, run_dir=run_dir,
+                                                 headless=args.headless))
+        code = combined_exit(reports)
+        console.print(f"Log: {run_dir} | exit {code}")
+        return code
+    finally:
+        lock.release()
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -651,6 +773,13 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--samples", type=int, default=timesync.DEFAULT_SAMPLES, help="sampel timesync")
     common(doc)
     doc.set_defaults(func=cmd_doctor)
+
+    rh = sub.add_parser("rehearse", help="uji jalur di produk target asli sampai checkout, langsung jalan "
+                                         "(tidak pernah 'Buat Pesanan')")
+    rh.add_argument("--only", choices=("web", "android"), help="hanya satu jalur (default: semua yang enabled)")
+    rh.add_argument("--live", action="store_true", help=argparse.SUPPRESS)  # selalu ditolak (pesan jelas)
+    common(rh)
+    rh.set_defaults(func=cmd_rehearse)
 
     run = sub.add_parser("run", help="jalankan checkout semua jalur enabled (default DRY-RUN)")
     run.add_argument("--live", action="store_true", help="checkout sungguhan (klik Buat Pesanan)")

@@ -188,6 +188,8 @@ class FakeShopeeApp:
         self.toast = None
         if "/user/account/address" in url:
             self.screen = "address"
+        elif url.rstrip("/").endswith("/cart"):  # keranjang tersimpan (isi dari alur go_cart)
+            self.screen = "cart"
         elif "/user/shopeepay" in url:
             if self.sc.wallet_unsupported:
                 raise DriverError("am start gagal: Error: Activity not started, unable to resolve Intent")

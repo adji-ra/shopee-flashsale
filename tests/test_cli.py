@@ -123,3 +123,18 @@ def test_cli_doctor_web_read_only(mock, admin, tmp_path, monkeypatch, capsys):
     kinds = {e["kind"] for e in admin.log()}
     assert not kinds & {"buy", "cart", "checkout", "order", "pin"}, kinds
     assert {"address", "wallet"} <= kinds
+
+
+def test_cli_rehearse_web_against_mock(mock, admin, tmp_path, monkeypatch, capsys):
+    """rehearse --only web: produk harga normal (sebelum flash sale) sampai checkout, exit 0, laporan + JSON,
+    tanpa request "Buat Pesanan"."""
+    monkeypatch.chdir(tmp_path)
+    admin.scenario(name="normal_price_before_open", open_in_ms=3_600_000)
+    cfg = _write_cfg(tmp_path, mock, mock.now() - 86_400)  # start_time boleh lewat
+    rc = cli.main(["rehearse", "--config", str(cfg), "--only", "web", "--allow-local", "--headless",
+                   "--selectors", str(tmp_path / "none.json")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Rehearsal web: OK" in out and "keranjang berisi: Ponsel Uji Coba 128GB" in out
+    assert len(list((tmp_path / "logs").glob("*-rehearse/web-rehearsal.json"))) == 1
+    assert admin.log("order") == [] and admin.log("pin") == []

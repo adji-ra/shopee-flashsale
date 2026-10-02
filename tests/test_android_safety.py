@@ -38,8 +38,9 @@ MANDATORY = "Pesanan MUNGKIN sudah terbuat — cek status pesanan manual"
 # Operasi driver yang mengubah layar aplikasi; selain ini hanya membaca/diagnosa.
 ACTION_OPS = {"click", "start_url", "swipe_refresh", "press_back", "restart_agent"}
 # last_toast/clear_toast: status Toast di agent uiautomator2 (tidak menyentuh aplikasi/Shopee).
+# configure = waitForSelectorTimeout 0; click_miss = klik selector tanpa ketukan; click_sel = RPC klik gagal
 READ_OPS = {"exists", "info", "info_any", "find_all", "current_app", "webview", "screenshot", "dump", "agent_alive",
-            "last_toast", "clear_toast"}
+            "last_toast", "clear_toast", "configure", "click_miss", "click_sel"}
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (PIN tidak boleh diketik alat).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
 
@@ -1247,7 +1248,7 @@ def test_challenge_after_order_keeps_status_with_mandatory_message(tmp_path, mon
 def test_driver_error_on_place_order_click_is_maybe_ordered(tmp_path, monkeypatch):
     """Klik 'Buat Pesanan' gagal di tengah RPC: bisa saja sudah sampai ke HP -> tetap pesan wajib."""
     attrs = _stop()
-    out = _run(tmp_path, monkeypatch, setup=_inject("place_order", kill=False, ops=("click",)), live=True,
+    out = _run(tmp_path, monkeypatch, setup=_inject("place_order", kill=False, ops=("click", "click_sel")), live=True,
                runner_attrs=attrs)
     assert out.result.status == RunStatus.UNKNOWN_STATE, out.result.message
     assert out.result.message == MANDATORY
@@ -1256,5 +1257,6 @@ def test_driver_error_on_place_order_click_is_maybe_ordered(tmp_path, monkeypatc
     assert attrs["stop_event"].is_set()
     _alarmed(out, RunStatus.UNKNOWN_STATE, MANDATORY)
     assert out.step_names().count("place_order_gate") == 1
-    assert len([op for op, t in out.driver.calls if op == "click" and t == "Buat Pesanan"]) == 1, "tanpa klik ulang"
+    clicks = [t for op, t in out.driver.calls if op in ("click", "click_sel") and "Buat Pesanan" in t]
+    assert len(clicks) == 1, f"tanpa klik ulang: {clicks}"
     assert "press_back" not in _ops(out)

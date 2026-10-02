@@ -302,16 +302,22 @@ def test_price_guard_on_one_lane_other_lane_continues_and_succeeds(mock, admin, 
     assert out.outcome.status == str(RunStatus.ORDER_PLACED_AWAIT_PIN) and out.outcome.exit_code == EXIT_OK
 
 
-def test_polling_rate_limit_is_shared_by_both_lanes(mock, admin, tmp_path):
-    """Satu akun: maks 1 aksi polling per 400 ms untuk SEMUA jalur bersama (klik Beli kedua jalur tidak
-    bersamaan di T, tapi berjarak >= 425 ms)."""
+def test_rate_limit_is_per_lane_web_first_click_not_delayed_by_android(mock, admin, tmp_path):
+    """Setiap jalur punya RateLimiter sendiri (1 aksi / 425 ms per jalur): dengan lead Android 300 ms & web
+    150 ms, klik Beli pertama web di T tidak tertunda oleh klik Android (log mock + event FakeDriver)."""
     # kedua jalur lambat setelah klik Beli: keduanya sempat klik sebelum lock diambil
     out = run_both(mock, admin, tmp_path, web={"checkout_latency_ms": 2500}, android={"loading_after_buy_ms": 1500})
-    assert out.web.limiter is out.control.limiter is out.android.limiter
-    slots = out.control.limiter.history
-    assert len(slots) >= 2 and all(b - a >= 0.425 - 1e-6 for a, b in zip(slots, slots[1:], strict=False)), slots
+    assert (out.lane("web").lead_ms, out.lane("android").lead_ms) == (150, 300)
+    assert out.web.limiter is not out.android.limiter
+    t_ms = int(out.open_at * 1000)
     web_buy, app_buy = out.web_kind("buy")[0]["t_server_ms"], out.app.kind("buy")[0]["t_server_ms"]
-    assert abs(web_buy - app_buy) >= 350, (web_buy, app_buy)  # slot 425 ms dikurangi latensi kirim tiap jalur
+    web_steps = [(st.name, st.t_server_ms - t_ms) for st in out.result("web").steps]
+    assert t_ms <= web_buy < t_ms + 300, (web_buy - t_ms, web_steps)  # bukan >= 425 ms setelah klik Android
+    assert t_ms <= app_buy < t_ms + 300, app_buy - t_ms
+    assert abs(web_buy - app_buy) < 425, (web_buy - t_ms, app_buy - t_ms)
+    for limiter in (out.web.limiter, out.android.limiter):  # di dalam satu jalur tetap >= 425 ms
+        slots = limiter.history
+        assert all(b - a >= 0.425 - 1e-6 for a, b in zip(slots, slots[1:], strict=False)), slots
 
 
 # ------------------------------------------------------------------ precheck

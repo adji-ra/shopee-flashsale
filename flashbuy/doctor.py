@@ -200,6 +200,21 @@ def check_latency(latency: dict, configured_lead: int) -> Check:
     return Check(name, PASS, detail)
 
 
+def check_tap_mode(tap_mode: str, latency: dict) -> Check:
+    """Mode ketuk Android + estimasi latensi satu ketukan kedua mode, dari query exists/info dengan selector Beli
+    yang sama saat precheck (doctor tidak pernah mengetuk)."""
+    name = "mode ketuk Android"
+    if "tap_selector" in latency:
+        est = (f"estimasi ketuk: selector ~{latency['tap_selector']:.0f} ms (1 RPC: cari+ketuk di HP), coord "
+               f"~{latency['tap_coord']:.0f} ms (baca + tap koordinat)")
+    else:
+        est = "estimasi ketuk tidak terukur (precheck Android tidak sampai uji latensi)"
+    if tap_mode == "coord":
+        return Check(name, WARN, f"tap_mode=coord; {est}; celah: bila layar berganti di antara baca & ketuk, tap "
+                                 "mendarat di elemen baru (mis. 'Buat Pesanan') - disarankan selector")
+    return Check(name, PASS if "tap_selector" in latency else WARN, f"tap_mode=selector; {est}")
+
+
 def check_disk(path: Path) -> Check:
     probe = path if path.exists() else Path.cwd()
     free_mb = shutil.disk_usage(probe).free / 2**20

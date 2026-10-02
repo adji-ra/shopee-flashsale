@@ -53,13 +53,14 @@ PROPS = {"ro.product.brand": "TECNO", "ro.product.manufacturer": "TECNO", "ro.pr
 # Perintah shell yang menutup/mematikan aplikasi atau mengetik/menekan tombol (termasuk PIN).
 FORBIDDEN_SHELL = re.compile(r"force-stop|\bam\s+(kill|stop)|\bpm\s+clear|\binput\b|\bkill\b", re.I)
 PRECHECK_ROWS = ["device", "agent uiautomator2", "layar", "layar tetap menyala", "aplikasi Shopee",
-                 "versi vs kalibrasi", "login", "tombol Beli", "harga produk", "latensi query", "alamat default",
-                 "saldo ShopeePay"]
+                 "versi vs kalibrasi", "login", "tombol Beli", "harga produk", "latensi query", "mode ketuk",
+                 "alamat default", "saldo ShopeePay"]
 # last_toast/clear_toast: status Toast di agent uiautomator2 saja (tidak menyentuh aplikasi/Shopee).
 AGENT_OPS = {"last_toast", "clear_toast"}
 # Operasi driver yang sah dipakai CLI/runner. Tidak ada input teks (PIN tidak mungkin diketik alat).
 ALLOWED_OPS = {"exists", "info", "info_any", "find_all", "click", "current_app", "start_url", "swipe_refresh",
-               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent"} | AGENT_OPS
+               "press_back", "webview", "screenshot", "dump", "shell", "agent_alive", "restart_agent", "configure",
+               "click_miss", "click_sel"} | AGENT_OPS
 # Klik yang harus langsung diikuti clear_toast: Beli & konfirmasi sheet (keduanya "Beli Sekarang"), Buat Pesanan.
 TOAST_CLEARED_CLICKS = {"Beli Sekarang", "Buat Pesanan"}
 VARIANTS = ["128GB Hitam", "256GB Biru"]
@@ -304,6 +305,10 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
     assert re.fullmatch(r"info/exists median \d+ ms, p95 \d+ ms, maks \d+ ms \(13 query\); find_all \d+ ms",
                         rows["latensi query"][1]), rows["latensi query"]
     assert "Rp500.000" in rows["saldo ShopeePay"][1]
+    # mode ketuk default selector: tunggu implisit dimatikan (tanpa ketukan) + estimasi latensi kedua mode
+    assert re.fullmatch(r"selector: cari\+ketuk di HP dalam 1 RPC \(waitForSelectorTimeout=0\); estimasi ketuk: "
+                        r"selector ~\d+ ms \(1 RPC\), coord ~\d+ ms \(baca \+ tap\)", rows["mode ketuk"][1]), \
+        rows["mode ketuk"]
     assert prechecks[0].status is None and prechecks[0].warnings == []
     assert dev.configs and dev.configs[0].android.serial == SERIAL
 
@@ -316,7 +321,7 @@ def test_precheck_android_ok_table_device_props_and_latency_csv(tmp_path, device
                  "device ro.tranos.version = hios13.6.0", f"device wm size = {WM_SIZE}",
                  "device wm density = Physical density: 320", "HiOS/Transsion terdeteksi",
                  "latensi query precheck: info/exists median",
-                 "latensi precheck exists: n=13",  # 10 probe + 3 ping agent
+                 "latensi precheck exists: n=16",  # 10 probe + 3 ping agent + 3 estimasi ketuk (selector Beli)
                  "latensi precheck find_all: n="):
         assert line in log, line
     with (log_dir / "android-queries-precheck.csv").open(encoding="utf-8") as f:
@@ -1381,7 +1386,7 @@ def test_run_android_live_maybe_ordered_safety_holds_even_if_console_rendering_f
 
 DOCTOR_ROWS = ["config: expected_name", "config: max_item_price", "config: max_total", "config: start_time",
                "timesync", "precheck android", "versi Shopee vs kalibrasi", "umur selector android",
-               "latensi query Android", "ruang disk log"]
+               "latensi query Android", "mode ketuk Android", "ruang disk log"]
 # event aplikasi palsu yang berarti beli / keranjang / checkout / mengubah pilihan: doctor tidak boleh memicunya
 DOCTOR_FORBIDDEN_EVENTS = {"buy", "buy_disabled", "confirm", "checkout", "order", "variant", "payment",
                            "cart_toggle", "tap"}
@@ -1422,7 +1427,7 @@ def run_doctor(tmp_path, device, term, *, app_version: str = "3.40.21", days_ago
 def assert_doctor_read_only(dev: Device) -> None:
     kinds = {e["kind"] for e in dev.app.events}
     assert not kinds & DOCTOR_FORBIDDEN_EVENTS, f"doctor memicu {kinds & DOCTOR_FORBIDDEN_EVENTS}"
-    assert "click" not in dev.ops() and "swipe_refresh" not in dev.ops(), dev.ops()
+    assert not {"click", "click_sel", "click_miss", "swipe_refresh"} & set(dev.ops()), dev.ops()  # tanpa ketukan
     no_forbidden_shell(dev)
 
 
@@ -1432,6 +1437,8 @@ def test_doctor_android_all_pass_read_only(tmp_path, device, term, sync_calls, a
     assert list(out.rows) == DOCTOR_ROWS, out.rows
     assert {lvl for lvl, _ in out.rows.values()} == {"PASS"}, out.rows
     assert "saran android.lead_ms = 150 (config 300)" in out.rows["latensi query Android"][1]
+    assert re.fullmatch(r"tap_mode=selector; estimasi ketuk: selector ~\d+ ms \(1 RPC: cari\+ketuk di HP\), coord "
+                        r"~\d+ ms \(baca \+ tap koordinat\)", out.rows["mode ketuk Android"][1])
     assert out.rows["versi Shopee vs kalibrasi"][1] == "3.40.21 = kalibrasi"
     assert "Hasil doctor: PASS (alarm belum diuji: tambahkan --beep)" in out.text
     assert len(sync_calls) == 1 and alarms == [], "doctor tanpa --beep tidak membunyikan alarm"
@@ -1515,7 +1522,7 @@ LOCK_HOLDER = ("import sys\nfrom flashbuy.runlock import RunLock\nRunLock(sys.ar
                "print('held', flush=True)\nsys.stdin.read()\n")
 
 
-@pytest.mark.parametrize("command", ["run", "precheck", "doctor", "login", "calibrate"])
+@pytest.mark.parametrize("command", ["run", "precheck", "doctor", "login", "calibrate", "rehearse"])
 def test_second_process_rejected_by_file_lock(tmp_path, device, term, sync_calls, command):
     import subprocess
     import sys
@@ -1532,7 +1539,8 @@ def test_second_process_rejected_by_file_lock(tmp_path, device, term, sync_calls
                 "precheck": ["precheck", "--config", path],
                 "doctor": ["doctor", "--config", path],
                 "login": ["login", "--platform", "android", "--config", path],
-                "calibrate": ["calibrate", "--platform", "android", "--config", path]}[command]
+                "calibrate": ["calibrate", "--platform", "android", "--config", path],
+                "rehearse": ["rehearse", "--config", path]}[command]
         rc = cli.main(argv)
     finally:
         holder.stdin.close()
@@ -1542,3 +1550,47 @@ def test_second_process_rejected_by_file_lock(tmp_path, device, term, sync_calls
     assert f"flashbuy lain sedang berjalan: PID {holder.pid} (run, mulai" in text
     assert dev.configs == [] and dev.driver.calls == [], "driver Android tidak boleh dibuat"
     assert sync_calls == [], "timesync tidak boleh jalan"
+
+
+# ------------------------------------------------------------------ rehearse (jalur Android)
+
+
+def test_rehearse_android_cli_report_json_cart_and_exit_0(tmp_path, device, term, sync_calls, alarms):
+    """`rehearse` langsung jalan (start_time boleh lewat), tanpa timesync; tabel per langkah, JSON di
+    logs/<run>-rehearse/, sisa keranjang; tidak pernah mengetuk "Buat Pesanan"."""
+    dev = device(time.time() + 3600, button_enabled_before_open=True, go_cart=True)
+    path = write_cfg(tmp_path, time.time() - 86_400)  # start_time sudah lewat: rehearsal tetap boleh
+    rc = cli.main(["rehearse", "--config", str(path)])
+    text = term.getvalue()
+    assert rc == 0, text
+    assert "Rehearsal android: OK" in text and "Rehearsal android: semua langkah OK" in text
+    assert "keranjang berisi: Ponsel Uji Coba 128GB - hapus manual" in text
+    assert "lapis 1 harga produk: akan gagal: harga Rp150.000 > maks Rp100.000" in text
+    report = json.loads(only_log("logs/*-rehearse/android-rehearsal.json").read_text(encoding="utf-8"))
+    assert report["ok"] and report["exit_code"] == 0 and report["cart_items"] == ["Ponsel Uji Coba 128GB"]
+    assert sync_calls == [] and alarms == []
+    assert dev.app.kind("order") == [] and ("click", "Buat Pesanan") not in dev.driver.calls
+    no_forbidden_shell(dev)
+
+
+def test_rehearse_android_cli_captcha_exit_4_with_alarm(tmp_path, device, term, alarms):
+    dev = device(time.time() + 3600, button_enabled_before_open=True, captcha_after_buy=True)
+    rc = cli.main(["rehearse", "--config", str(write_cfg(tmp_path, time.time() + 3600))])
+    assert rc == 4, term.getvalue()
+    assert alarms == ["CAPTCHA"] and dev.app.screen == "captcha" and dev.app.kind("order") == []
+
+
+@pytest.mark.parametrize("how", ["cli", "config_live", "config_mode"])
+def test_rehearse_live_rejected_before_anything(tmp_path, device, term, sync_calls, how):
+    dev = device(time.time() + 3600)
+    path = write_cfg(tmp_path, time.time() + 3600)
+    argv = ["rehearse", "--config", str(path)]
+    if how == "cli":
+        argv.append("--live")
+    else:
+        extra = "live: true\n" if how == "config_live" else "mode: live\n"
+        path.write_text(path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+    rc = cli.main(argv)
+    assert rc == 2
+    assert "rehearse" in term.getvalue() and ("--live" in term.getvalue() or "live/mode" in term.getvalue())
+    assert dev.configs == [] and dev.driver.calls == [] and sync_calls == []

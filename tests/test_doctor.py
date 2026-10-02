@@ -171,6 +171,19 @@ def test_latency_not_measured_is_warning():
     assert doctor.check_latency({}, 300).level == WARN
 
 
+# ------------------------------------------------------------------ mode ketuk
+
+
+@pytest.mark.parametrize(("mode", "latency", "level", "detail"), [
+    ("selector", {"tap_selector": 12, "tap_coord": 25}, PASS, "selector ~12 ms (1 RPC: cari+ketuk di HP), coord ~25"),
+    ("coord", {"tap_selector": 12, "tap_coord": 25}, WARN, "celah: bila layar berganti"),
+    ("selector", {}, WARN, "tidak terukur"),
+])
+def test_tap_mode_rows(mode, latency, level, detail):
+    c = doctor.check_tap_mode(mode, latency)
+    assert c.level == level and detail in c.detail and f"tap_mode={mode}" in c.detail, c
+
+
 # ------------------------------------------------------------------ disk
 
 

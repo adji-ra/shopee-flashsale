@@ -25,8 +25,18 @@ from flashbuy.config import FLOW_TIMEOUT_S, ConfigError, TargetConfig, WebConfig
 from flashbuy.control import CANCEL_MESSAGE
 from flashbuy.guards import ENABLED_JS, MIN_IFRAME_PX, TERMINAL, Classification, Guard, PageState
 from flashbuy.notifier import Notifier
+from flashbuy.rehearsal import (
+    STOP_STATUSES,
+    PlaceOrderForbidden,
+    RehearsalReport,
+    RehearsalStep,
+    cart_line,
+    forbidden_gate,
+    guard_text,
+)
 from flashbuy.runner_base import (
     ALARM_STATUSES,
+    MAYBE_ORDERED_MSG,
     STOP_ALL_STATUSES,
     PollingGate,
     PrecheckItem,
@@ -102,6 +112,11 @@ async def _block_media(route: Route) -> None:
         await route.continue_()
 
 
+def _cand(cand: dict) -> str:
+    """Kandidat selector web untuk laporan, mis. role=button name='Beli Sekarang'."""
+    return " ".join(f"{k}={v!r}" if isinstance(v, str) else f"{k}={v}" for k, v in cand.items())
+
+
 def _first_line(e: PlaywrightError) -> str:
     return e.message.splitlines()[0] if e.message else type(e).__name__
 
@@ -130,6 +145,8 @@ class WebRunner:
         self.unknown_limit_s = UNKNOWN_LIMIT_S
         self.price_stable_timeout_s = PRICE_STABLE_TIMEOUT_S
         self.order_clicked = False  # "Buat Pesanan" sudah diklik (pesanan mungkin sudah dibuat)
+        self.rehearsal = False  # mode rehearsal: "Buat Pesanan" tidak pernah diklik (fungsi kliknya melempar)
+        self._live = False  # attempt live: satu-satunya keadaan klik "Buat Pesanan" diizinkan
         self._pw: Playwright | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
@@ -285,6 +302,10 @@ class WebRunner:
     async def _resolve(self, step: str) -> Locator | None:
         found = await selector_store.resolve(self.page, self.sel.candidates(step), self.variant)
         return found[0] if found else None
+
+    async def _resolve_cand(self, step: str) -> tuple[Locator, dict] | None:
+        """Seperti _resolve, plus kandidat selector yang cocok (laporan rehearsal)."""
+        return await selector_store.resolve(self.page, self.sel.candidates(step), self.variant)
 
     async def _body_text(self) -> str:
         try:
@@ -461,6 +482,7 @@ class WebRunner:
 
     async def attempt(self, clock: ServerClock, live: bool) -> RunResult:
         self.clock = clock
+        self._live = live and not self.rehearsal
         if live:
             try:
                 require_live_ready(self.cfg)
@@ -589,14 +611,22 @@ class WebRunner:
 
         self._checkpoint()  # stop global terakhir sebelum klik yang mengikat
         t_click = clock.now_ms()
-        self.order_clicked = True  # sejak sini stop global tidak menghentikan penantian layar PIN
-        await place.click(timeout=5000)
+        await self._click_place_order(place)
         self.log.mark("click_place_order", t_ms=t_click)
         outcome = await self._wait_for({PageState.PIN_SCREEN}, deadline)
         if outcome.state != PageState.PIN_SCREEN:
             return self._unexpected(outcome, "layar PIN")
         self.log.mark("pin_screen")
         return RunStatus.ORDER_PLACED_AWAIT_PIN, "pesanan dibuat; masukkan PIN ShopeePay secara manual"
+
+    async def _click_place_order(self, place: Locator) -> None:
+        """SATU-SATUNYA klik "Buat Pesanan". Dilarang di level fungsi pada rehearsal & dry-run (melempar sebelum
+        apa pun dikirim)."""
+        if self.rehearsal or not self._live:
+            mode = "rehearsal" if self.rehearsal else "dry-run"
+            raise PlaceOrderForbidden(f"klik 'Buat Pesanan' dilarang di mode {mode}")
+        self.order_clicked = True  # sejak sini stop global tidak menghentikan penantian layar PIN
+        await place.click(timeout=5000)
 
     def _window_closed(self, clicks: int) -> tuple[RunStatus, str]:
         """Jendela polling habis: PRICE_GUARD bila terakhir terhalang harga, selain itu NOT_STARTED_TIMEOUT."""
@@ -714,10 +744,14 @@ class WebRunner:
             pass
 
     async def _wait_resolve(self, step: str, deadline: float) -> Locator | None:
+        found = await self._wait_resolve_cand(step, deadline)
+        return found[0] if found else None
+
+    async def _wait_resolve_cand(self, step: str, deadline: float) -> tuple[Locator, dict] | None:
         loop = asyncio.get_running_loop()
         while loop.time() < deadline:
             self._checkpoint()
-            found = await self._resolve(step)
+            found = await self._resolve_cand(step)
             if found is not None:
                 return found
             await asyncio.sleep(POLL_S)
@@ -763,7 +797,7 @@ class WebRunner:
 
     # ------------------------------------------------------------------ lapis 3: checkout
 
-    async def _checkout_guard(self) -> pricing.CheckoutVerdict:
+    async def _checkout_guard(self, enforce: bool = True) -> pricing.CheckoutVerdict:
         cfg = {"rowCss": self.sel.layout.get("checkout_row", []),
                "totalCss": self.sel.layout.get("checkout_total", []),
                "shippingCss": self.sel.layout.get("checkout_shipping", []),
@@ -791,6 +825,8 @@ class WebRunner:
         verdict = pricing.check_checkout(snap, self.limits)
         self.log.info(f"checkout terbaca: {verdict.summary()}")
         if not verdict.ok:
+            if not enforce:  # rehearsal: dievaluasi & dilaporkan, tidak menghentikan
+                return verdict
             raise _Stop(RunStatus.PRICE_GUARD, f"{'; '.join(verdict.reasons)} | {verdict.summary()}")
         self.log.mark("price_guard_ok", verdict.summary())
         return verdict
@@ -819,6 +855,196 @@ class WebRunner:
                 return True, "ShopeePay dipilih (sebelumnya metode lain)"
             await asyncio.sleep(POLL_S)
         return False, "ShopeePay tidak terverifikasi terpilih; jalankan calibrate ulang"
+
+    # ------------------------------------------------------------------ rehearsal
+
+    async def rehearse(self, clock: ServerClock) -> RehearsalReport:
+        """Rehearsal sekali jalan di produk target asli (lihat flashbuy.rehearsal): buka produk -> variasi -> klik
+        Beli (lapis 1 hanya dievaluasi) -> keranjang (lapis 2 dievaluasi) -> Checkout -> ShopeePay -> baca checkout
+        (lapis 3 dievaluasi) -> cari tombol "Buat Pesanan" TANPA klik -> STOP. Klik "Buat Pesanan" dilarang di
+        fungsi kliknya; before_place_order diganti fungsi yang melempar."""
+        self.rehearsal, self._live = True, False
+        self.before_place_order = forbidden_gate
+        self.clock = clock
+        rep = RehearsalReport(self.name)
+        self._tracking, self._unknown_since = True, None
+        try:
+            await self._rehearse(rep, clock)
+        except _Stop as e:
+            rep.stop(str(e.status), e.message)
+        except _Aborted as e:
+            rep.stop("ABORTED", str(e))
+        except PlaywrightError as e:
+            rep.stop("ERROR", f"browser: {_first_line(e)}")
+        finally:
+            self._tracking = False
+        if self.order_clicked and not rep.message.startswith(MAYBE_ORDERED_MSG):  # PIN tanpa klik "Buat Pesanan"
+            rep.stop("UNKNOWN_STATE", f"{MAYBE_ORDERED_MSG} ({rep.message})")
+        if rep.status in STOP_STATUSES:  # captcha/verifikasi/login/UNKNOWN_STATE/PIN: stop + alarm, tanpa retry
+            if rep.status != "LOGIN_REQUIRED" and self.stop_event is not None:
+                self.stop_event.set()
+            self.notifier.alarm(rep.status, f"rehearsal web: {rep.message}", platform=self.name)
+        elif rep.status in ("OK", "GAGAL") and rep.clicked_buy:  # keranjang hanya berubah bila Beli diklik
+            rep.cart_items = await self._rehearse_cart()
+        self.log.mark("result", f"rehearsal {rep.status}: {rep.message or 'semua langkah OK'}")
+        self.log.info(cart_line(rep.cart_items))
+        rep.write(self.log.run_dir)
+        return rep
+
+    async def _rh(self, rep: RehearsalReport, name: str, t0: float, ok: bool, *, selector: str = "",
+                  values: dict | None = None, detail: str = "") -> None:
+        """Catat satu langkah rehearsal: latensi (sebelum screenshot), screenshot, log."""
+        ms = (asyncio.get_running_loop().time() - t0) * 1000
+        shot = ""
+        if self.page is not None:
+            path = self.log.screenshot_path(f"rehearsal-{len(rep.steps) + 1}-{name}")
+            try:
+                await self.page.screenshot(path=str(path), timeout=5000)
+                shot = str(path)
+            except PlaywrightError as e:
+                self.log.warn(f"screenshot gagal: {_first_line(e)}")
+        rep.add(RehearsalStep(name, ok, selector, round(ms, 1), values or {}, shot, detail))
+        text = f"rehearsal {name}: {'OK' if ok else 'GAGAL'}" + (f" [{selector}]" if selector else "")
+        (self.log.info if ok else self.log.warn)(text + (f" - {detail}" if detail else ""))
+
+    async def _rehearse(self, rep: RehearsalReport, clock: ServerClock) -> None:
+        loop = asyncio.get_running_loop()
+        # 1. buka produk
+        t0 = loop.time()
+        await self._goto(self.cfg.product_url)
+        found = await self._resolve_cand("buy_button")
+        self._buy = found[0] if found else None
+        c = await self._classify(with_buy=True)
+        if c.state in (PageState.LOGIN_REQUIRED, PageState.CAPTCHA, PageState.VERIFICATION):
+            raise _Stop(TERMINAL[c.state], f"saat membuka produk: {c.evidence}")
+        try:
+            self._product_title = await self.page.evaluate(PRODUCT_TITLE_JS) or ""
+        except PlaywrightError:
+            self._product_title = ""
+        values = {"url": self.page.url, "judul": self._product_title}
+        if self.cfg.expected_name:
+            values["nama cocok expected_name"] = pricing.name_matches(self._product_title, self.cfg.expected_name)
+        await self._rh(rep, "buka produk", t0, True, values=values)
+        # 2. tombol Beli
+        t0 = loop.time()
+        if found is None:
+            await self._rh(rep, "tombol Beli", t0, False, detail="tidak ditemukan - jalankan calibrate")
+            return
+        try:
+            label, enabled = (await self._buy.inner_text(timeout=2000)).strip(), await self._buy.evaluate(ENABLED_JS)
+        except PlaywrightError:
+            label, enabled = "", None
+        await self._rh(rep, "tombol Beli", t0, True, selector=_cand(found[1]), values={"teks": label, "aktif": enabled})
+        # 3. harga produk: lapis 1 dievaluasi, TIDAK ditegakkan (harga normal saat rehearsal)
+        t0 = loop.time()
+        price = pricing.check_product_price(await self.page.evaluate(PRICE_TEXT_JS, self.sel.css("product_price")),
+                                            self.limits)
+        rep.guards["lapis 1 harga produk"] = guard_text(price.verdict == "ok", price.describe(self.limits))
+        await self._rh(rep, "baca harga produk", t0, price.verdict != "unreadable",
+                       selector=", ".join(self.sel.css("product_price")) or "heuristik (nominal terbesar)",
+                       values={"harga": price.value, "teks": price.text})
+        # 4. variasi & kuantitas
+        if self.variant:
+            t0 = loop.time()
+            opt = await self._resolve_cand("variant_option")
+            picked = await self._select_variant(wait_s=2.0)
+            await self._rh(rep, "pilih variasi", t0, bool(picked), selector=_cand(opt[1]) if opt else "",
+                           values={"variasi": self.variant},
+                           detail="" if picked else "variasi tidak ditemukan / tidak bisa dipilih")
+            if not picked:
+                return
+        await self._ensure_qty_one_product()
+        # 5. klik Beli sekali (lewat RateLimiter jalur ini)
+        t0 = loop.time()
+        await clock.wait_until_async(self.limiter.reserve(clock.now()))
+        await self._click(self._buy, force=True, timeout=2000)
+        outcome = await self._wait_after_buy(loop, stale=False)
+        st = outcome.state
+        if st == PageState.PIN_SCREEN:  # tanpa klik "Buat Pesanan": pesanan mungkin ada -> stop semua, alarm
+            self.order_clicked = True
+            raise _Stop(RunStatus.UNKNOWN_STATE, f"{MAYBE_ORDERED_MSG} (layar PIN muncul setelah klik Beli)")
+        if st in TERMINAL:
+            raise _Stop(TERMINAL[st], outcome.evidence)
+        ok = st in (PageState.CART, PageState.CHECKOUT)
+        await self._rh(rep, "klik Beli", t0, ok, selector=_cand(found[1]), values={"hasil": str(st)},
+                       detail="" if ok else f"{st} {outcome.evidence}".strip())
+        if not ok:
+            return
+        deadline = loop.time() + self.flow_timeout_s
+        # 6. keranjang (web): lapis 2 dievaluasi, lalu klik Checkout
+        if st == PageState.CART:
+            t0 = loop.time()
+            await self._wait_loaded(deadline)
+            rows, counts = await self._read_cart()
+            values = {"item": [r.text.splitlines()[0][:60] for r in rows],
+                      "tercentang": sum(r.checked for r in rows), "tombol Checkout": counts}
+            try:
+                await self._cart_guard()
+                rep.guards["lapis 2 keranjang"] = guard_text(True, "1 item tercentang, kuantitas 1")
+            except _Stop as e:
+                if e.status != RunStatus.PRICE_GUARD:
+                    raise
+                rep.guards["lapis 2 keranjang"] = guard_text(False, e.message)
+            await self._rh(rep, "baca keranjang", t0, bool(rows), values=values,
+                           detail="" if rows else "baris keranjang tidak terbaca")
+            t0 = loop.time()
+            btn = await self._wait_resolve_cand("cart_checkout", deadline)
+            if btn is None:
+                await self._rh(rep, "klik Checkout", t0, False, detail="tombol Checkout tidak ditemukan")
+                return
+            await self._click(btn[0], timeout=5000)
+            outcome = await self._wait_for({PageState.CHECKOUT}, deadline)
+            if outcome.state in TERMINAL:
+                raise _Stop(TERMINAL[outcome.state], outcome.evidence)
+            ok = outcome.state == PageState.CHECKOUT
+            await self._rh(rep, "klik Checkout", t0, ok, selector=_cand(btn[1]),
+                           detail="" if ok else f"{outcome.state} {outcome.evidence}".strip())
+            if not ok:
+                return
+        # 7. checkout + ShopeePay
+        t0 = loop.time()
+        await self._wait_loaded(deadline)
+        await self._rh(rep, "halaman checkout", t0, True, values={"url": self.page.url})
+        t0 = loop.time()
+        ok, msg = await self._ensure_shopeepay(deadline)
+        pay = await self._resolve_cand("payment_shopeepay")
+        await self._rh(rep, "ShopeePay", t0, ok, selector=_cand(pay[1]) if pay else "", detail=msg)
+        # 8. baca checkout: lapis 3 dievaluasi, tidak ditegakkan
+        t0 = loop.time()
+        try:
+            verdict = await self._checkout_guard(enforce=False)
+        except _Stop as e:
+            if e.status != RunStatus.PRICE_GUARD:
+                raise
+            rep.guards["lapis 3 checkout"] = guard_text(False, e.message)
+            await self._rh(rep, "baca checkout", t0, False, detail=e.message)
+        else:
+            v = verdict.values
+            rep.guards["lapis 3 checkout"] = guard_text(
+                verdict.ok, ("; ".join(verdict.reasons) + " | " if verdict.reasons else "") + verdict.summary())
+            missing = [r for r in verdict.reasons if "terbaca" in r]
+            await self._rh(rep, "baca checkout", t0, not missing, values={
+                "nama cocok": v.get("name_ok"), "variasi cocok": v.get("variant_ok"), "qty": v.get("qty"),
+                "harga": v.get("item_price"), "ongkir": v.get("shipping"), "total": v.get("total")},
+                detail="; ".join(missing))
+        # 9. tombol "Buat Pesanan": hanya DICARI, tidak pernah diklik
+        t0 = loop.time()
+        place = await self._wait_resolve_cand("place_order", deadline)
+        await self._rh(rep, "tombol Buat Pesanan (tidak diklik)", t0, place is not None,
+                       selector=_cand(place[1]) if place else "",
+                       detail="ditemukan; rehearsal berhenti di sini" if place else
+                       "tidak ditemukan - jalankan calibrate")
+
+    async def _rehearse_cart(self) -> list[str] | None:
+        """Isi keranjang di akhir rehearsal (dilaporkan untuk dihapus manual; alat tidak menghapusnya)."""
+        try:
+            await self._goto(self._url("cart_page"))
+            await self._wait_loaded(asyncio.get_running_loop().time() + 5.0)
+            rows, _ = await self._read_cart()
+        except (PlaywrightError, _Stop, _Aborted, KeyError) as e:
+            self.log.warn(f"isi keranjang tidak terbaca: {e}")
+            return None
+        return [r.text.splitlines()[0][:60] + (f" (qty {r.qty})" if r.qty not in (None, 1) else "") for r in rows]
 
     # ------------------------------------------------------------------ akhir
 

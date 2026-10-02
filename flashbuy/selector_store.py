@@ -80,6 +80,7 @@ WEB_DEFAULT_URLS: dict[str, str] = {
     "address_page": "/user/account/address",
     "wallet_page": "/user/shopeepay",
     "login_page": "/buyer/login",
+    "cart_page": "/cart",  # rehearsal: isi keranjang dibaca di akhir (tidak dihapus alat)
 }
 
 

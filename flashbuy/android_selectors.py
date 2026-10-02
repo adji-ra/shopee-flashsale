@@ -136,6 +136,7 @@ ANDROID_DEFAULT_URLS: dict[str, str] = {
     # URL https yang dibuka lewat intent VIEW ke package Shopee (bila app tidak menanganinya -> tidak terbaca).
     "address_page": "https://shopee.co.id/user/account/address",
     "wallet_page": "https://shopee.co.id/user/shopeepay",
+    "cart_page": "https://shopee.co.id/cart",  # rehearsal: isi keranjang dibaca di akhir (tidak dihapus alat)
 }
 
 
@@ -174,6 +175,34 @@ def scoped(pattern: str) -> str:
         return f"(?:{pattern})"
     flags = "".join(sorted(set(re.sub(r"[()?]", "", m.group(0)))))
     return f"(?{flags}:{pattern[m.end():]})"
+
+
+# Teks "Buat Pesanan" pengujian selector langkah maju: selain langkah place_order, selector yang dipakai untuk
+# membaca/mengetuk TIDAK BOLEH cocok dengan teks ini (tombol Beli & "Buat Pesanan" sama-sama di kanan bawah).
+PLACE_ORDER_PROBE_TEXTS = ("Buat Pesanan", "BUAT PESANAN", "Buat pesanan", "buat pesanan", "Buat Pesanan (1)")
+
+
+def place_order_overlap(sel: Sel, place_cands: list[Sel]) -> str:
+    """"" bila `sel` tidak mungkin cocok dengan tombol "Buat Pesanan"; selain itu alasannya.
+
+    Diuji terhadap teks baku di atas + teks/content-desc/resource-id kandidat place_order (default & kalibrasi).
+    className polos ditolak: cocok dengan tombol apa pun, termasuk "Buat Pesanan"."""
+    from flashbuy.android_driver import Node, node_matches
+
+    if sel.by == "className":
+        return "tidak spesifik (className polos bisa cocok dengan 'Buat Pesanan')"
+    texts = set(PLACE_ORDER_PROBE_TEXTS)
+    rids: set[str] = set()
+    for c in place_cands:
+        if c.by in ("text", "description", "textContains", "descriptionContains", "textStartsWith"):
+            texts.add(c.value)
+        elif c.by == "resourceId":
+            rids.add(c.value)
+    probes = [*(Node(text=t) for t in texts), *(Node(desc=t) for t in texts), *(Node(rid=r) for r in rids)]
+    hit = next((p for p in probes if node_matches(p, sel)), None)
+    if hit is None:
+        return ""
+    return f"cocok dengan 'Buat Pesanan' ({hit.text or hit.desc or hit.rid!r})"
 
 
 def union(patterns: list[str]) -> str:

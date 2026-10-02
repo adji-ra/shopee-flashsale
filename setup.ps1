@@ -234,9 +234,11 @@ Langkah berikutnya (H-1), dari folder ini:
   2. Kalibrasi di produk biasa yang murah (Anda yang men-tap; alat tidak mengklik "Buat Pesanan"):
        python -m flashbuy calibrate --platform web --config target.yaml --url <URL produk murah>
        python -m flashbuy calibrate --platform android --config target.yaml
-  3. Dry-run (berhenti sebelum "Buat Pesanan"):
+  3. Rehearsal di produk target (harga normal; sampai checkout, tanpa "Buat Pesanan"; hapus sisa keranjang):
+       python -m flashbuy rehearse --config target.yaml
+  4. Dry-run (berhenti sebelum "Buat Pesanan"):
        python -m flashbuy run --config target.yaml
-  4. Cek akhir:
+  5. Cek akhir:
        python -m flashbuy doctor --config target.yaml --beep
 Hari H: doctor lalu `python -m flashbuy run --config target.yaml --live` (paling lambat T-70 detik; idealnya
 sebelum T-10 menit).

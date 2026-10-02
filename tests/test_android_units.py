@@ -1542,9 +1542,30 @@ class FakeU2Device:
         found = self._match(selector)
         return [x for info in found for x in (None, info)] if self.null_entries else found
 
-    def _rpc_click(self, x, y) -> bool:
+    def _rpc_click(self, *args) -> bool:
+        if len(args) == 1:  # klik selector di server: cari + ketuk dalam satu RPC (instance = cocok ke-i)
+            (selector,) = args
+            found = self._match(selector)
+            i = selector.get("instance") or 0
+            if i >= len(found):
+                raise UiObjectNotFoundError(-32002, "androidx.test.uiautomator.UiObjectNotFoundException", selector)
+            self.actions.append(("click_sel", found[i].get("text"), dict(selector)))
+            return True
+        x, y = args
         self.actions.append(("click", x, y))
         return True
+
+    configurator = {"actionAcknowledgmentTimeout": 3000, "keyInjectionDelay": 0, "scrollAcknowledgmentTimeout": 200,
+                    "waitForIdleTimeout": 0, "waitForSelectorTimeout": 10000}
+    honor_configurator = True
+
+    def _rpc_getConfigurator(self) -> dict:
+        return dict(self.configurator)
+
+    def _rpc_setConfigurator(self, cfg: dict) -> dict:
+        if self.honor_configurator:
+            self.configurator = dict(cfg)
+        return dict(self.configurator)
 
     def _rpc_deviceInfo(self) -> dict:
         if isinstance(self.device_info, Exception):
@@ -2325,3 +2346,61 @@ def test_progress_bar_does_not_hide_login_or_sold_out_button(tmp_path, screen, e
     for context in ("product", "after_buy", "any"):
         assert runner._classify(context).screen == expected, context
     log.close()
+
+
+# ------------------------------------------------------------------ U2Driver: klik selector (tap_mode selector)
+
+
+def test_u2_click_sel_turns_off_implicit_wait_once_and_keeps_other_settings():
+    drv, dev = _u2(package="com.shopee.id")
+    assert drv.click_sel(Sel("text", "Beli Sekarang")) is True
+    assert drv.click_sel(Sel("text", "Beli Sekarang")) is True
+    methods = [m for m, _, _ in dev.rpcs]
+    assert methods == ["getConfigurator", "setConfigurator", "click", "click"], "konfigurasi sekali, lalu 1 RPC/ketuk"
+    assert dev.configurator["waitForSelectorTimeout"] == 0
+    assert dev.configurator["actionAcknowledgmentTimeout"] == 3000, "field lain dipertahankan"
+    (_, label, selector), _ = dev.actions
+    assert label == "Beli Sekarang" and selector["text"] == "Beli Sekarang"
+    assert selector["packageName"] == "com.shopee.id" and "instance" not in selector
+    assert all(a[0] == "click_sel" for a in dev.actions), "tidak ada tap koordinat"
+
+
+def test_u2_click_sel_missing_element_is_false_without_any_tap():
+    drv, dev = _u2(package="com.shopee.id")
+    assert drv.click_sel(Sel("text", "Buat Pesanan")) is False
+    assert dev.actions == []
+
+
+def test_u2_click_sel_instance_targets_nth_match():
+    a = _u2_info("Beli Sekarang", None, "", "android.widget.Button", (360, 1500, 720, 1612))
+    b = _u2_info("Beli Sekarang", None, "", "android.widget.Button", (0, 1500, 720, 1612))
+    drv, dev = _u2(elements=[a, b])
+    assert drv.click_sel(Sel("text", "Beli Sekarang"), 1) is True
+    assert dev.actions[0][2]["instance"] == 1
+    assert drv.click_sel(Sel("text", "Beli Sekarang"), 2) is False  # instance di luar jumlah: tidak diketuk
+
+
+def test_u2_click_sel_reconfigures_after_agent_restart():
+    drv, dev = _u2()
+    drv.click_sel(Sel("text", "Beli Sekarang"))
+    drv.restart_agent()
+    dev.configurator = dict(FakeU2Device.configurator)  # agent baru: Configurator bawaan (tunggu 10 s)
+    drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert [m for m, _, _ in dev.rpcs].count("setConfigurator") == 2
+    assert dev.configurator["waitForSelectorTimeout"] == 0
+
+
+def test_u2_configurator_rejected_is_driver_error_and_no_click():
+    drv, dev = _u2()
+    dev.honor_configurator = False
+    with pytest.raises(DriverError, match="waitForSelectorTimeout tetap 10000"):
+        drv.click_sel(Sel("text", "Beli Sekarang"))
+    assert dev.actions == [] and "click" not in [m for m, _, _ in dev.rpcs]
+
+
+def test_u2_find_all_and_info_record_via_for_selector_click():
+    a = _u2_info("Konfirmasi", None, "", "android.widget.Button", (0, 1500, 720, 1612))
+    drv, dev = _u2(elements=[BUY_INFO, a, BUY_INFO])
+    sel = Sel("text", "Beli Sekarang")
+    assert drv.info(sel).via == (sel, None)
+    assert [n.via for n in drv.find_all(sel)] == [(sel, 0), (sel, 1)]
