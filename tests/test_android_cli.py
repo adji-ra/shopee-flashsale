@@ -36,6 +36,7 @@ from flashbuy.android_driver import AgentDead, DriverError, FakeDriver, Node, Se
 from flashbuy.android_runner import AndroidRunner
 from flashbuy.android_screen import RP_ANY_MATCH, parse_dump
 from flashbuy.android_selectors import KIND_RANK
+from flashbuy.orchestrator import EXIT_MANUAL, EXIT_PRECHECK, EXIT_UNKNOWN, UNKNOWN_AFTER_ORDER
 from flashbuy.runner_base import MAYBE_ORDERED_MSG, RunStatus
 from flashbuy.timesync import WIB, OffsetResult, SyncReport
 from tests.conftest import LIVE_NAME, PRICE_DEFAULTS
@@ -639,8 +640,9 @@ class AsyncToastApp(FakeShopeeApp):
 def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
     out = run_cli(tmp_path, device, term)
     assert out.rc == 0, out.text
-    assert "Jalur android | Mode: DRY-RUN" in out.text and "selectors: default teks" in out.text
+    assert "Jalur android | Mode: DRY-RUN" in out.text and "selectors android: default teks" in out.text
     assert "Status: DRYRUN_OK - " in out.text and f"Log: {Path('logs') / out.run_dir.name}" in out.text
+    assert "Status gabungan: DRYRUN_OK (exit 0)" in out.text
     assert out.result["status"] == "DRYRUN_OK" and out.result["live"] is False
     # timesync awal sekali; resync T-2 menit dilewati (run dimulai < T-2 menit)
     assert sync_calls == [{"samples": timesync.DEFAULT_SAMPLES, "http_url": "https://shopee.co.id/"}]
@@ -656,7 +658,7 @@ def test_run_android_dry_run_e2e(tmp_path, device, term, sync_calls, alarms):
     assert "place_order" not in [e["detail"] for e in out.dev.app.kind("tap")]
     assert out.dev.app.screen == "checkout", "aplikasi dibiarkan di checkout (tidak ditutup)"
     assert_safe_ops(out.dev)
-    assert alarms == []
+    assert alarms == ["DRYRUN_OK"], "satu alarm hasil akhir (pola pendek) dari orchestrator"
     # klik Beli & konfirmasi sheet tepat didahului clear_toast (operasi agent, tidak menyentuh aplikasi)
     assert assert_toast_cleared_before_clicks(out.dev) == 2
     # hot path polling (poll_start .. klik Beli): hanya query satu objek (info/exists; info_any = cek dialog sistem
@@ -696,7 +698,7 @@ def test_run_android_live_e2e_stops_at_pin_and_leaves_app_open(tmp_path, device,
 
 def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, device, term, alarms):
     out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, unknown_after_order=True)
-    assert out.rc == 1, out.text
+    assert out.rc == EXIT_UNKNOWN, out.text
     assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
     assert out.result["status"] == "UNKNOWN_STATE" and out.result["message"] == MAYBE_ORDERED_MSG
     # pesan diagnosa baru: dihitung dari waktu pengamatan, diagnosa (aplikasi aktif, WebView, content-desc)
@@ -705,7 +707,7 @@ def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, dev
     assert f"Detail: {out.result['detail']}" in out.text
     assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
     assert len(out.dev.app.kind("order")) == 1 and out.dev.app.screen == "order_unknown"
-    assert alarms == ["UNKNOWN_STATE"]
+    assert alarms == [UNKNOWN_AFTER_ORDER]
     # aplikasi/activity & WebView (klasifikasi spesifikasi F) dibaca ulang paling cepat tiap 0,5 s selama UNKNOWN;
     # diagnosa mahal (content-desc semua elemen) hanya SEKALI, saat naik ke UNKNOWN_STATE
     calls = out.dev.driver.calls
@@ -721,7 +723,7 @@ def test_run_android_live_unknown_after_order_prints_maybe_ordered(tmp_path, dev
                                                ("verification_after_buy", "VERIFICATION")])
 def test_run_android_captcha_left_as_is_without_retry(tmp_path, device, term, alarms, flag, status):
     out = run_cli(tmp_path, device, term, **{flag: True})
-    assert out.rc == 1, out.text
+    assert out.rc == EXIT_MANUAL, out.text
     assert f"Status: {status} - " in out.text
     assert "Captcha/verifikasi di HP dibiarkan apa adanya. Selesaikan manual; alat TIDAK akan retry." in out.text
     assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text  # dry-run pun dibiarkan
@@ -753,27 +755,27 @@ def test_run_android_variant_required_message_via_both_channels_is_error(tmp_pat
         assert "last_toast" in out.dev.ops()
     assert_toast_cleared_before_clicks(out.dev)
     assert_safe_ops(out.dev)
-    assert alarms == []
+    assert alarms == ["ERROR"], "satu alarm hasil akhir (pola pendek)"
 
 
 @pytest.mark.parametrize(("screen", "status"), [("captcha", "CAPTCHA"), ("verification", "VERIFICATION"),
                                                  ("login", "LOGIN_REQUIRED")])
 def test_run_android_terminal_screen_at_arm_alarms_immediately_once(tmp_path, monkeypatch, device, term, alarms,
                                                                      screen, status):
-    """Captcha/verifikasi/login muncul saat buka produk T-60 s (precheck normal): alarm SAAT ITU (sebelum T),
-    hasil akhir dari attempt() tanpa alarm kedua, tanpa polling/klik, layar dibiarkan apa adanya."""
+    """Captcha/verifikasi/login muncul saat buka produk T-60 s (precheck normal): hasil diminta SAAT ITU (tanpa
+    menunggu T), satu alarm hasil akhir, tanpa polling/klik, layar dibiarkan apa adanya."""
     hook_arm(monkeypatch, lambda r: setattr(r.d.inner.app, "arming", True))
     monkeypatch.setattr(ArmScreenApp, "arm_screen", screen)
     out = run_cli(tmp_path, device, term, app_cls=ArmScreenApp)
-    assert out.rc == 1, out.text
+    assert out.rc == EXIT_MANUAL, out.text
     assert out.result["status"] == status
     assert out.result["message"].startswith("saat membuka produk: teks "), out.result["message"]
     assert f"Status: {status} - saat membuka produk" in out.text
-    assert alarms == [status], "alarm sekali (arm), tidak diulang hasil akhir"
-    # alarm berasal dari arm (pesan "(T-60 s)"), dibunyikan sebelum menunggu T-lead
-    assert alarms.messages[0].startswith("saat membuka produk (T-60 s): teks "), alarms.messages
-    log = (out.run_dir / "android.log").read_text(encoding="utf-8")
-    assert log.index(f"WARN arm: {status}") < log.index("STEP t_minus_lead")
+    assert alarms == [status], "satu alarm hasil akhir"
+    assert "saat membuka produk: teks " in alarms.messages[0], alarms.messages
+    # tidak menunggu T-lead: hasil (dan alarm) sebelum T
+    assert "t_minus_lead" not in out.step_names()
+    assert out.step("result")["t_server_ms"] < out.open_at * 1000
     assert "poll_start" not in out.step_names() and "armed" not in out.step_names()
     assert out.buys() == [] and out.dev.app.kind("tap") == [] and "click" not in out.dev.ops()
     assert out.dev.app.screen == screen, "layar dibiarkan apa adanya"
@@ -804,9 +806,10 @@ def test_run_android_arm_driver_error_is_returned_by_attempt(tmp_path, monkeypat
 
 def test_run_android_precheck_error_stops_before_opening_product(tmp_path, device, term, alarms):
     out = run_cli(tmp_path, device, term, driver_cls=AgentWontRestartDriver, driver_kw={"alive": False})
-    assert out.rc == 1, out.text
+    assert out.rc == EXIT_PRECHECK, out.text
     assert out.result["status"] == "ERROR"
-    assert out.result["message"].startswith("pre-check: agent uiautomator2: mati, dihidupkan ulang -> tetap gagal")
+    assert out.result["message"].startswith(
+        "precheck gagal: agent uiautomator2: mati, dihidupkan ulang -> tetap gagal"), out.result["message"]
     assert "arm" not in out.step_names() and out.dev.app.kind("intent") == []
     assert out.buys() == [] and "click" not in out.dev.ops()
     assert alarms == ["precheck"]
@@ -815,18 +818,14 @@ def test_run_android_precheck_error_stops_before_opening_product(tmp_path, devic
 # ------------------------------------------------------------------ run: ditolak sebelum driver & timesync
 
 
-@pytest.mark.parametrize("case", ["run_no_only", "precheck_no_only", "android_disabled", "live_no_expected_name",
+@pytest.mark.parametrize("case", ["android_disabled", "live_no_expected_name",
                                   "live_blank_expected_name", "lead_out_of_range", "start_passed", "late_start",
                                   "live_late_start", "live_headless"])
 def test_run_rejected_before_driver_and_timesync(tmp_path, device, term, sync_calls, case):
     open_at = time.time() + {"start_passed": -30, "late_start": 5, "live_late_start": 30}.get(case, 3600)
     dev = device(open_at)
     cfg, argv, expect = {}, ["run", "--only", "android"], ""
-    if case == "run_no_only":
-        argv, expect = ["run"], "menyusul di tahap 4"
-    elif case == "precheck_no_only":
-        argv, expect = ["precheck"], "menyusul di tahap 4"
-    elif case == "android_disabled":
+    if case == "android_disabled":
         cfg, expect = {"android": {"enabled": False}, "web": {"enabled": True}}, "android.enabled = false di config"
     elif case == "live_no_expected_name":
         argv, expect = [*argv, "--live"], "mode --live ditolak: `expected_name` wajib diisi"
@@ -1350,7 +1349,7 @@ def test_run_android_timeline_keeps_bracketed_screen_text(tmp_path, device, term
     else:
         out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, go_cart=True,
                       cart_other_items=[(CLOSING_TAG_ITEM, 5_000, True)], unknown_after_order=True)
-        assert out.rc == 1, out.text
+        assert out.rc == EXIT_UNKNOWN, out.text
         assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
         assert CLOSING_TAG_ITEM in timeline_detail(out.text, "cart_uncheck")
 
@@ -1362,13 +1361,13 @@ def test_run_android_live_maybe_ordered_safety_holds_even_if_console_rendering_f
     aplikasi dibiarkan terbuka, tanpa retry."""
     out = run_cli(tmp_path, device, term, live=True, cfg={"expected_name": LIVE_NAME}, go_cart=True,
                   cart_other_items=[(CLOSING_TAG_ITEM, 5_000, True)], unknown_after_order=True, catch=True)
-    assert out.error is None and out.rc == 1, out.error or out.text
+    assert out.error is None and out.rc == EXIT_UNKNOWN, out.error or out.text
     assert f"Status: UNKNOWN_STATE - {MAYBE_ORDERED_MSG}" in out.text
     assert out.result["status"] == "UNKNOWN_STATE" and out.result["message"] == MAYBE_ORDERED_MSG
     assert [e["detail"] for e in out.dev.app.kind("cart_toggle")] == [CLOSING_TAG_ITEM], "item lain di-uncheck"
     assert len(out.buys()) == 1 and len(out.dev.app.kind("order")) == 1, "tepat satu pesanan, tanpa retry"
     assert out.dev.app.screen == "order_unknown", "aplikasi tidak ditutup / disentuh lagi"
-    assert alarms == ["UNKNOWN_STATE"]
+    assert alarms == [UNKNOWN_AFTER_ORDER]
     # pesan wajib tetap sampai ke konsol lewat baris log RunLog (Text tanpa markup) & app dibiarkan terbuka
     assert any("[android] STEP result - UNKNOWN_STATE: " + MAYBE_ORDERED_MSG in ln for ln in out.text.splitlines())
     assert "Aplikasi di HP dibiarkan terbuka apa adanya" in out.text
@@ -1376,3 +1375,170 @@ def test_run_android_live_maybe_ordered_safety_holds_even_if_console_rendering_f
     after = calls[calls.index(("click", "Buat Pesanan")) + 1:]
     assert not {"click", "press_back", "start_url", "swipe_refresh"} & {op for op, _ in after}
     assert_safe_ops(out.dev)
+
+
+# ------------------------------------------------------------------ doctor (jalur Android, tanpa keranjang/checkout)
+
+DOCTOR_ROWS = ["config: expected_name", "config: max_item_price", "config: max_total", "config: start_time",
+               "timesync", "precheck android", "versi Shopee vs kalibrasi", "umur selector android",
+               "latensi query Android", "ruang disk log"]
+# event aplikasi palsu yang berarti beli / keranjang / checkout / mengubah pilihan: doctor tidak boleh memicunya
+DOCTOR_FORBIDDEN_EVENTS = {"buy", "buy_disabled", "confirm", "checkout", "order", "variant", "payment",
+                           "cart_toggle", "tap"}
+
+
+@dataclass
+class DoctorRun:
+    rc: int
+    dev: Device | None
+    text: str
+
+    @property
+    def rows(self) -> dict[str, tuple[str, str]]:
+        return table_rows(self.text)
+
+
+@pytest.fixture
+def plenty_of_disk(monkeypatch):
+    from flashbuy import doctor
+
+    usage = SimpleNamespace(total=0, used=0, free=50 * 2**30)
+    monkeypatch.setattr(doctor.shutil, "disk_usage", lambda p: usage)
+
+
+def run_doctor(tmp_path, device, term, *, app_version: str = "3.40.21", days_ago: float | None = 0.5,
+               extra: tuple[str, ...] = (), cfg: dict | None = None, **scenario) -> DoctorRun:
+    meta = {"app_version": app_version, "wm_size": WM_SIZE}
+    if days_ago is not None:
+        meta["at"] = datetime.fromtimestamp(time.time() - days_ago * 86400).astimezone().strftime(
+            "%Y-%m-%dT%H:%M:%S%z")
+    android_selectors.save(tmp_path / "selectors.json", {}, meta)
+    dev = device(time.time() + 3600, **scenario)
+    path = write_cfg(tmp_path, dev.app.sc.open_at, **{"expected_name": LIVE_NAME, **(cfg or {})})
+    rc = cli.main(["doctor", "--config", str(path), *extra])
+    return DoctorRun(rc, dev, term.getvalue())
+
+
+def assert_doctor_read_only(dev: Device) -> None:
+    kinds = {e["kind"] for e in dev.app.events}
+    assert not kinds & DOCTOR_FORBIDDEN_EVENTS, f"doctor memicu {kinds & DOCTOR_FORBIDDEN_EVENTS}"
+    assert "click" not in dev.ops() and "swipe_refresh" not in dev.ops(), dev.ops()
+    no_forbidden_shell(dev)
+
+
+def test_doctor_android_all_pass_read_only(tmp_path, device, term, sync_calls, alarms, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term)
+    assert out.rc == 0, out.text
+    assert list(out.rows) == DOCTOR_ROWS, out.rows
+    assert {lvl for lvl, _ in out.rows.values()} == {"PASS"}, out.rows
+    assert "saran android.lead_ms = 150 (config 300)" in out.rows["latensi query Android"][1]
+    assert out.rows["versi Shopee vs kalibrasi"][1] == "3.40.21 = kalibrasi"
+    assert "Hasil doctor: PASS (alarm belum diuji: tambahkan --beep)" in out.text
+    assert len(sync_calls) == 1 and alarms == [], "doctor tanpa --beep tidak membunyikan alarm"
+    assert_doctor_read_only(out.dev)
+
+
+def test_doctor_android_shopee_version_changed_fails(tmp_path, device, term, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, app_version="3.39.0")
+    assert out.rc == 1, out.text
+    level, detail = out.rows["versi Shopee vs kalibrasi"]
+    assert level == "FAIL" and "versi berubah: kalibrasi 3.39.0, sekarang 3.40.21" in detail
+    assert "Hasil doctor: FAIL" in out.text
+    assert_doctor_read_only(out.dev)
+
+
+def test_doctor_android_old_selectors_warn(tmp_path, device, term, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, days_ago=4)
+    assert out.rc == 0, out.text
+    level, detail = out.rows["umur selector android"]
+    assert level == "WARN" and "4.0 hari lalu) > 3 hari" in detail
+    assert "Hasil doctor: WARN" in out.text
+
+
+def test_doctor_android_not_calibrated_warns(tmp_path, device, term, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, app_version="", days_ago=None)
+    assert out.rows["umur selector android"][0] == "WARN" and out.rows["versi Shopee vs kalibrasi"][0] == "WARN"
+
+
+def test_doctor_android_precheck_failure_is_fail(tmp_path, device, term, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, login_required=True)
+    assert out.rc == 1, out.text
+    level, detail = out.rows["precheck android"]
+    assert level == "FAIL" and detail.startswith("LOGIN_REQUIRED: "), detail
+    assert_doctor_read_only(out.dev)
+
+
+def test_doctor_android_slow_queries_warn_and_suggest_lead(tmp_path, device, term, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, driver_cls=SlowQueryDriver)
+    assert out.rc == 0, out.text
+    level, detail = out.rows["latensi query Android"]
+    assert level == "WARN" and "p95 > 100 ms" in detail, detail
+    assert re.search(r"saran android\.lead_ms = (5[05]0|600) \(config 300\)", detail), detail
+    assert_doctor_read_only(out.dev)
+
+
+def test_doctor_driver_connect_error_is_fail_row(tmp_path, monkeypatch, term, plenty_of_disk):
+    def boom(cfg):
+        raise DriverError("adb: device 'FAKE123' not found")
+
+    monkeypatch.setattr(cli, "_android_driver", boom)
+    android_selectors.save(tmp_path / "selectors.json", {}, {"app_version": "3.40.21"})
+    rc = cli.main(["doctor", "--config", str(write_cfg(tmp_path, time.time() + 3600, expected_name=LIVE_NAME))])
+    rows = table_rows(term.getvalue())
+    assert rc == 1
+    assert rows["precheck android"] == ("FAIL", "DriverError: adb: device 'FAKE123' not found")
+    assert rows["latensi query Android"][0] == "WARN"
+
+
+def test_doctor_invalid_config_skips_device_and_timesync(tmp_path, device, term, sync_calls, plenty_of_disk):
+    dev = device(time.time() + 3600)
+    path = write_cfg(tmp_path, time.time() - 600, max_total=1)
+    rc = cli.main(["doctor", "--config", str(path)])
+    rows = table_rows(term.getvalue())
+    assert rc == 1
+    assert rows["config: max_total"][0] == "FAIL" and rows["config: start_time"][0] == "FAIL"
+    assert "ruang disk log" in rows and "timesync" not in rows
+    assert sync_calls == [] and dev.configs == [] and dev.driver.calls == []
+
+
+def test_doctor_beep_plays_short_then_urgent(tmp_path, device, term, alarms, plenty_of_disk):
+    out = run_doctor(tmp_path, device, term, extra=("--beep",))
+    assert out.rc == 0, out.text
+    assert out.rows["alarm (--beep)"] == ("PASS", "pola pendek & mendesak dibunyikan; webhook tidak diset")
+    assert alarms == ["doctor_beep", "doctor_beep"]
+    assert "Hasil doctor: PASS" in out.text and "tambahkan --beep" not in out.text
+
+
+# ------------------------------------------------------------------ lock antar-proses (~/.flashbuy/run.lock)
+
+LOCK_HOLDER = ("import sys\nfrom flashbuy.runlock import RunLock\nRunLock(sys.argv[1]).acquire()\n"
+               "print('held', flush=True)\nsys.stdin.read()\n")
+
+
+@pytest.mark.parametrize("command", ["run", "precheck", "doctor", "login", "calibrate"])
+def test_second_process_rejected_by_file_lock(tmp_path, device, term, sync_calls, command):
+    import subprocess
+    import sys
+
+    from flashbuy.orchestrator import EXIT_BUSY
+
+    holder = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER, "run"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, cwd=Path(cli.__file__).parents[1])
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        dev = device(time.time() + 3600)
+        path = str(write_cfg(tmp_path, dev.app.sc.open_at, expected_name=LIVE_NAME))
+        argv = {"run": ["run", "--config", path, "--live"],
+                "precheck": ["precheck", "--config", path],
+                "doctor": ["doctor", "--config", path],
+                "login": ["login", "--platform", "android", "--config", path],
+                "calibrate": ["calibrate", "--platform", "android", "--config", path]}[command]
+        rc = cli.main(argv)
+    finally:
+        holder.stdin.close()
+        holder.wait(10)
+    text = term.getvalue()
+    assert rc == EXIT_BUSY, text
+    assert f"flashbuy lain sedang berjalan: PID {holder.pid} (run, mulai" in text
+    assert dev.configs == [] and dev.driver.calls == [], "driver Android tidak boleh dibuat"
+    assert sync_calls == [], "timesync tidak boleh jalan"

@@ -1072,6 +1072,11 @@ class AndroidRunner:
         if self._arm_state is None and self._arm_failure is None:
             self._keepalive = asyncio.ensure_future(self._keepalive_loop())
 
+    @property
+    def arm_blocked(self) -> bool:
+        """arm (T-60 s) berakhir di layar stop / gagal: attempt() langsung mengembalikan hasilnya tanpa aksi."""
+        return self._arm_state is not None or self._arm_failure is not None
+
     def _arm_guarded(self) -> None:
         try:
             self._arm_sync()
@@ -1282,16 +1287,14 @@ class AndroidRunner:
                 # toast lama bukan reaksi klik ini: dibersihkan SEBELUM klik (toast reaksi klik tetap terbaca) dan
                 # sebelum cek ulang tombol, supaya jarak cek ulang -> klik sesingkat mungkin
                 self.d.clear_toast()
-                if waited:
-                    # sempat menunggu slot: layar bisa sudah berubah (mis. checkout) -> cek ulang tombolnya
-                    fresh = self._find("buy_button")
-                    if fresh is None or fresh.bounds != btn.bounds:
-                        self.log.mark("buy_recheck", "tombol Beli berubah/hilang saat menunggu slot; tidak diklik")
-                        continue
                 if self._dialog_blocks_click():
                     continue  # dialog crash/ANR di atas tombol: tap akan mengenai dialog ("Tutup aplikasi")
                 if gate.expired():
                     return self._window_closed(clicks)
+                # klik ulang (klik sebelumnya bisa diterima server terlambat) atau sempat menunggu slot: layar bisa
+                # sudah berganti ke checkout sejak tombol dibaca; tap koordinat basi bisa mendarat di "Buat Pesanan"
+                if (clicks or waited) and not self._retap_ok(btn, lambda: self._find("buy_button"), "buy_recheck"):
+                    continue
                 t_click = clock.now_ms()
                 self.d.click(btn)
                 # slot berikutnya dihitung dari tap sebenarnya (RPC sebelum tap bisa lambat): jarak tap >= 425 ms
@@ -1311,6 +1314,7 @@ class AndroidRunner:
             if st == Screen.PIN_SCREEN:
                 # PIN tanpa klik "Buat Pesanan" dari alat: pesanan mungkin sudah terbuat (mis. tap tak sengaja)
                 self.order_clicked = True
+                self._signal_stop()  # jalur lain berhenti SEKARANG (gate menolak), bukan baru di _finish
                 return RunStatus.UNKNOWN_STATE, f"layar PIN muncul setelah klik Beli ({outcome.evidence})"
             if st in (Screen.NOT_STARTED, Screen.ERROR_TOAST):
                 self.log.mark("not_started", f"#{clicks} ({outcome.evidence})")
@@ -1448,6 +1452,7 @@ class AndroidRunner:
                         return ("sheet", None) if seen.screen == Screen.VARIANT_SHEET else ("progress", seen)
                     if seen.screen == Screen.PIN_SCREEN:
                         self.order_clicked = True
+                        self._signal_stop()  # pesanan mungkin ada: jalur lain berhenti SEKARANG, bukan di _finish
                         raise _Stop(RunStatus.UNKNOWN_STATE, f"layar PIN muncul saat polling ({seen.evidence})")
                     # layar tak dikenal / aplikasi lain / loading: jangan reload/klik, biarkan jaring UNKNOWN.
                     # Halaman pesan tanpa tombol Beli ("Gagal memuat", "belum dimulai") = belum siap -> reload.
@@ -1741,10 +1746,26 @@ class AndroidRunner:
         if gate is not None and gate.expired():
             return False  # konfirmasi ulang = aksi polling: tidak setelah T+8 s
         self.d.clear_toast()
+        if retry and not self._retap_ok(confirm, lambda: self._pick("sheet_confirm", self._sheet_nodes(
+                "sheet_confirm")) or self._find("sheet_confirm"), "confirm_recheck"):
+            return False
         t_click = self.clock.now_ms()
         self.d.click(confirm)
         self.log.mark("click_sheet_confirm", "ulang (lewat gate)" if retry else "", t_ms=t_click)
         return True
+
+    def _retap_ok(self, node: Node, read: Callable[[], Node | None], mark: str) -> bool:
+        """Tap ulang memakai koordinat elemen yang dibaca sebelumnya. Klik sebelumnya bisa diterima server
+        terlambat, sehingga checkout muncul di antara bacaan dan tap; tombol "Buat Pesanan" bisa berada di
+        koordinat yang sama. Dibaca ulang TEPAT sebelum tap (RPC terakhir sebelum tap): tidak boleh ada
+        "Buat Pesanan" di layar dan elemennya harus sama di posisi yang sama. Selain itu tidak di-tap; iterasi
+        berikutnya mengklasifikasi ulang layar."""
+        if self._has("place_order") is None:
+            fresh = read()
+            if fresh is not None and fresh.bounds == node.bounds:
+                return True
+        self.log.mark(mark, "berubah/hilang atau 'Buat Pesanan' tampil sejak dibaca; tidak di-tap")
+        return False
 
     # ------------------------------------------------------------------ lapis 2: keranjang
 

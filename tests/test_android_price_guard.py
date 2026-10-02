@@ -297,7 +297,8 @@ class _CheckoutPromoTexts(FakeShopeeApp):
 
 
 def _shipping_testid_app(value: int):
-    """Nilai ongkir ber-resource-id (hasil kalibrasi) (fake_shipping_value) terpisah dari pasangan label "Subtotal Pengiriman"."""
+    """Nilai ongkir ber-resource-id hasil kalibrasi (fake_shipping_value), terpisah dari pasangan label
+    "Subtotal Pengiriman"."""
 
     class _ShippingTestId(FakeShopeeApp):
         def _r_checkout(self):

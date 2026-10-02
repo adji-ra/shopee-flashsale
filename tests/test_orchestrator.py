@@ -13,6 +13,8 @@ Aturan yang diuji:
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -78,7 +80,7 @@ class Both:
 
 def run_both(mock, admin, tmp_path, *, live: bool = False, web_scenario: str = "normal", web: dict | None = None,
              app_cls=FakeShopeeApp, android: dict | None = None, open_in_ms: int = 5000,
-             platforms=("web", "android")) -> Both:
+             platforms=("web", "android"), android_gate=None, during=None) -> Both:
     admin.scenario(name=web_scenario, open_in_ms=open_in_ms, **(web or {}))
     st = admin.state()["scenario"]
     open_at = st["open_at"]
@@ -107,12 +109,17 @@ def run_both(mock, admin, tmp_path, *, live: bool = False, web_scenario: str = "
         lanes.append(Lane("android", android_runner, log, 300))
     for lane in lanes:
         wire(lane, control)
+    if android_gate is not None:  # sinkronisasi antar jalur khusus tes (bungkus hook asli, lock tetap sama)
+        android_runner.before_place_order = android_gate(android_runner.before_place_order)
 
     async def go():
+        task = asyncio.create_task(during(web_runner, open_at)) if during is not None else None
         try:
             return await orchestrate(lanes, open_at=open_at, live=live, clock=clock, notifier=notifier,
                                      control=control, schedule=SCHEDULE)
         finally:
+            if task is not None:
+                await task
             for lane in lanes:
                 await lane.runner.close()
                 lane.log.close()
@@ -133,10 +140,10 @@ def _no_android_action_after(out: Both, t_ms: int) -> None:
     assert late == [], f"aksi Android setelah {t_ms}: {late}"
 
 
-def _loser_aborted(out: Both, name: str) -> None:
+def _loser_aborted(out: Both, name: str, reasons: tuple[str, ...] = ("lock",)) -> None:
     res = out.result(name)
     assert res.status == RunStatus.ABORTED, (res.status, res.message)
-    assert "lock" in res.message, res.message
+    assert any(r in res.message for r in reasons), res.message
 
 
 # ------------------------------------------------------------------ lock pemenang
@@ -162,7 +169,7 @@ def test_both_reach_checkout_live_exactly_one_place_order(mock, admin, tmp_path)
 def test_faster_lane_wins_other_aborted_before_click(mock, admin, tmp_path, winner, live):
     """Jalur yang lebih cepat memegang lock; jalur lain ABORTED sebelum klik "Buat Pesanan" (dry & live)."""
     slow = {"web": {"web": {"checkout_latency_ms": 2500}},
-            "android": {"android": {"shipping_delay_ms": 3000}}}["web" if winner == "android" else "android"]
+            "android": {"android": {"loading_after_buy_ms": 3000}}}["web" if winner == "android" else "android"]
     out = run_both(mock, admin, tmp_path, live=live, **slow)
     loser = "web" if winner == "android" else "android"
     assert out.control.winner == winner
@@ -177,23 +184,18 @@ def test_faster_lane_wins_other_aborted_before_click(mock, admin, tmp_path, winn
     assert out.outcome.exit_code == EXIT_OK
 
 
-class _UnknownAfterOrderApp(FakeShopeeApp):
-    """'Buat Pesanan' tercatat, lalu layar tak dikenal (bukan PIN)."""
-
-    def __init__(self, sc, clock):
-        sc.unknown_after_order = True
-        super().__init__(sc, clock)
-
-
 def test_winner_falls_to_unknown_state_lock_never_released(mock, admin, tmp_path):
     """Pemenang (Android) mengambil lock, klik "Buat Pesanan", lalu UNKNOWN_STATE: lock tidak dilepas; web tidak
     pernah mengklik "Buat Pesanan"; status gabungan UNKNOWN_STATE (setelah order), alarm mendesak, exit 5."""
-    out = run_both(mock, admin, tmp_path, live=True, web={"checkout_latency_ms": 2500}, app_cls=_UnknownAfterOrderApp)
-    assert out.control.winner == "android"
+    out = run_both(mock, admin, tmp_path, live=True, web={"checkout_latency_ms": 2500},
+                   android={"unknown_after_order": True})
+    assert out.control.winner == "android" and out.control.lock_held()
     assert out.result("android").status == RunStatus.UNKNOWN_STATE
     assert out.result("android").message == MAYBE_ORDERED_MSG
     assert out.web_kind("order") == [] and out.orders() == 1
-    _loser_aborted(out, "web")
+    # web berhenti di gate (lock) atau lebih dulu oleh stop global dari UNKNOWN_STATE Android; keduanya tanpa klik
+    _loser_aborted(out, "web", ("lock", "stop global dari android"))
+    assert [c[:2] for c in out.control.gate_calls if c[0] == "web"] in ([], [("web", False)])
     assert out.outcome.status == UNKNOWN_AFTER_ORDER and out.outcome.exit_code == EXIT_UNKNOWN
     _one_final_alarm(out, UNKNOWN_AFTER_ORDER, "urgent")
 
@@ -216,6 +218,33 @@ def test_captcha_on_web_stops_android_with_zero_taps_after_stop(mock, admin, tmp
     _one_final_alarm(out, str(RunStatus.CAPTCHA), "short")
 
 
+@pytest.mark.parametrize("at_s", [3.5, 1.0], ids=["sebelum_arm", "menunggu_T_lead"])
+def test_web_captcha_page_event_while_idle_stops_all_lanes_now(mock, admin, tmp_path, at_s):
+    """Captcha muncul di browser saat jalur web DIAM (menunggu arm T-2 s / menunggu T-lead): event halaman
+    langsung memicu stop global; semua jalur bangun dan berhenti saat itu, bukan baru di T; Android 0 aksi
+    setelah stop; alarm hasil akhir (CAPTCHA) sebelum T."""
+    async def captcha_appears(web: WebRunner, open_at: float) -> None:
+        while time.time() < open_at - at_s:
+            await asyncio.sleep(0.02)
+        await web.page.goto(mock.base_url + "/verify/captcha")  # seperti redirect tantangan dari Shopee
+
+    out = run_both(mock, admin, tmp_path, live=True, during=captcha_appears)
+    t_ms = int(out.open_at * 1000)
+    assert out.control.stopped() and out.control.stop_source == "web"
+    assert out.control.stop_ms < t_ms - (at_s - 0.5) * 1000
+    assert out.result("web").status == RunStatus.CAPTCHA, out.result("web").message
+    res = out.result("android")
+    assert res.status == RunStatus.ABORTED and "stop global dari web" in res.message, res.message
+    _no_android_action_after(out, out.control.stop_ms)
+    assert out.app.kind("buy") == [] and out.web_kind("buy") == [] and out.orders() == 0
+    assert out.result("android").step("result").t_server_ms < t_ms - 500, "berhenti sebelum T, bukan di T"
+    assert out.outcome.status == str(RunStatus.CAPTCHA) and out.outcome.exit_code == EXIT_MANUAL
+    _one_final_alarm(out, str(RunStatus.CAPTCHA), "short")
+    if at_s > 2:  # sebelum arm: halaman produk tidak dibuka lagi (arm) di kedua jalur setelah stop
+        assert [e for e in out.web_kind("product") if e["t_server_ms"] >= out.control.stop_ms] == []
+        assert "page_open" not in [st.name for st in out.result("web").steps]
+
+
 class _SlowPinApp(FakeShopeeApp):
     """'Buat Pesanan' -> spinner 3 s -> layar PIN (server lambat)."""
 
@@ -226,12 +255,31 @@ class _SlowPinApp(FakeShopeeApp):
         self.loading_until, self.after_loading, self.screen = self.now() + 3.0, "pin", "loading"
 
 
-def test_winner_after_place_order_survives_other_lane_captcha(mock, admin, tmp_path):
+def test_winner_after_place_order_survives_other_lane_captcha(mock, admin, tmp_path, monkeypatch):
     """Android menang dan sudah mengklik "Buat Pesanan" (PIN muncul 3 s kemudian); jawaban klik Beli web baru
-    datang 1,5 s setelahnya berupa CAPTCHA -> stop global SETELAH klik pemenang: pemenang tetap sampai
-    ORDER_PLACED_AWAIT_PIN; status gabungan ORDER_PLACED_AWAIT_PIN (prioritas tertinggi)."""
-    out = run_both(mock, admin, tmp_path, live=True, web_scenario="captcha", web={"buy_latency_ms": 1500},
-                   app_cls=_SlowPinApp)
+    datang 1 s setelahnya berupa CAPTCHA -> stop global SETELAH klik pemenang: pemenang tetap sampai
+    ORDER_PLACED_AWAIT_PIN; status gabungan ORDER_PLACED_AWAIT_PIN (prioritas tertinggi).
+
+    Urutan dibuat deterministik (tidak bergantung beban CPU): gate Android menunggu sampai request Beli web
+    tercatat di mock, jadi web sudah melewati polling (tidak kena event batal) saat Android memegang lock."""
+    web_buy = threading.Event()
+    record = mock.record
+
+    def spy(**entry) -> None:
+        record(**entry)
+        if entry.get("kind") == "buy":
+            web_buy.set()
+
+    monkeypatch.setattr(mock, "record", spy)
+
+    def after_web_buy(gate):
+        def before_place_order() -> bool:
+            assert web_buy.wait(10), "web tidak pernah mengklik Beli"
+            return gate()
+        return before_place_order
+
+    out = run_both(mock, admin, tmp_path, live=True, web_scenario="captcha", web={"buy_latency_ms": 1000},
+                   app_cls=_SlowPinApp, android_gate=after_web_buy)
     assert out.control.winner == "android"
     click = out.step_ms("android", "click_place_order")
     assert out.control.stopped() and out.control.stop_source == "web" and out.control.stop_ms > click
@@ -243,13 +291,27 @@ def test_winner_after_place_order_survives_other_lane_captcha(mock, admin, tmp_p
 
 
 def test_price_guard_on_one_lane_other_lane_continues_and_succeeds(mock, admin, tmp_path):
-    """PRICE_GUARD (total checkout web > max_total) bukan status stop: Android tetap jalan dan sukses."""
-    out = run_both(mock, admin, tmp_path, live=True, web={"shipping": 50_000})
+    """PRICE_GUARD (total checkout web > max_total) bukan status stop: Android tetap jalan dan sukses. Android
+    dibuat lambat (spinner 3 s setelah Beli) supaya web sampai lapis 3 lebih dulu (bukan dibatalkan lock)."""
+    out = run_both(mock, admin, tmp_path, live=True, web={"shipping": 50_000},
+                   android={"loading_after_buy_ms": 3000})
     assert out.result("web").status == RunStatus.PRICE_GUARD, out.result("web").message
     assert not out.control.stopped()
     assert out.result("android").status == RunStatus.ORDER_PLACED_AWAIT_PIN
     assert out.control.winner == "android" and out.orders() == 1 and out.web_kind("order") == []
     assert out.outcome.status == str(RunStatus.ORDER_PLACED_AWAIT_PIN) and out.outcome.exit_code == EXIT_OK
+
+
+def test_polling_rate_limit_is_shared_by_both_lanes(mock, admin, tmp_path):
+    """Satu akun: maks 1 aksi polling per 400 ms untuk SEMUA jalur bersama (klik Beli kedua jalur tidak
+    bersamaan di T, tapi berjarak >= 425 ms)."""
+    # kedua jalur lambat setelah klik Beli: keduanya sempat klik sebelum lock diambil
+    out = run_both(mock, admin, tmp_path, web={"checkout_latency_ms": 2500}, android={"loading_after_buy_ms": 1500})
+    assert out.web.limiter is out.control.limiter is out.android.limiter
+    slots = out.control.limiter.history
+    assert len(slots) >= 2 and all(b - a >= 0.425 - 1e-6 for a, b in zip(slots, slots[1:], strict=False)), slots
+    web_buy, app_buy = out.web_kind("buy")[0]["t_server_ms"], out.app.kind("buy")[0]["t_server_ms"]
+    assert abs(web_buy - app_buy) >= 350, (web_buy, app_buy)  # slot 425 ms dikurangi latensi kirim tiap jalur
 
 
 # ------------------------------------------------------------------ precheck

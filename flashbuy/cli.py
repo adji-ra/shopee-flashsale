@@ -432,12 +432,25 @@ async def _hand_over_browser(runner, live: bool, status, headless: bool,
                       "(PIN, verifikasi, status pesanan), lalu tutup jendela browser sendiri.[/]")
     else:
         console.print("[bold]Browser dibiarkan terbuka. Selesaikan secara manual, lalu tutup jendela browser.[/]")
-    if wait_user is not None:
-        await wait_user(runner)
-    elif headless:
+    if wait_user is None and headless:
         console.print("[yellow]--headless (khusus mock/tes): tidak ada jendela untuk ditutup pengguna.[/]")
-    else:
-        await runner.wait_closed()
+        return
+    # Live: Ctrl+C PERTAMA tidak menutup browser (PIN / status pesanan masih di layar); yang kedua = paksa keluar.
+    # Ctrl+C yang sudah terjadi di tengah run (task sedang dibatalkan) dihitung sebagai yang pertama.
+    task = asyncio.current_task()
+    ignored = task is None or task.cancelling() > 0
+    while True:
+        try:
+            await (wait_user(runner) if wait_user is not None else runner.wait_closed())
+            return
+        except asyncio.CancelledError:
+            if not live or ignored:
+                raise
+            ignored = True
+            task.uncancel()
+            console.print("[bold red]Ctrl+C: mode LIVE, browser TIDAK ditutup alat. Selesaikan PIN / cek status "
+                          "pesanan, lalu tutup jendela browser sendiri. Ctrl+C sekali lagi = paksa keluar "
+                          "(browser ikut tertutup).[/]")
 
 
 async def run_orchestrated(cfg: TargetConfig, platforms: list[str], sels: dict, driver, *, live: bool,
@@ -493,6 +506,9 @@ async def run_orchestrated(cfg: TargetConfig, platforms: list[str], sels: dict, 
                     await _hand_over_browser(lane.runner, live, status, headless, wait_user)
         finally:
             for lane in lanes:
+                # alarm saat close (mis. `svc power stayon` gagal dikembalikan) = alarm keselamatan terpisah:
+                # dibunyikan sungguhan, bukan ditahan DeferredNotifier milik fase run
+                lane.runner.notifier = notifier
                 try:
                     await lane.runner.close()
                 finally:
@@ -561,7 +577,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         console.print(f"[red]Terlambat: run harus dimulai paling lambat T-{LATE_START_S} s "
                       "(precheck & buka halaman produk sebelum T-60 s).[/]")
         return 2
-    if args.live and args.headless and "web" in platforms and not args.allow_local:
+    if args.live and args.headless and not args.allow_local:
         console.print("[red]--live tidak boleh --headless: browser live tidak pernah ditutup otomatis.[/]")
         return 2
     lock = _lock("run")

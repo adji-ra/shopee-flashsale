@@ -186,6 +186,7 @@ class WebRunner:
         if frame == self.page.main_frame:
             self._event_hit = Classification(state, f"navigasi ke {url}")
             self.log.warn(f"event: {state} - {url}")
+            self._event_stop()
         else:
             task = asyncio.ensure_future(self._check_iframe(frame, state, url))
             self._bg.add(task)
@@ -202,8 +203,16 @@ class WebRunner:
             if self._event_hit is None:
                 self._event_hit = Classification(state, f"iframe {url[:100]}")
                 self.log.warn(f"event: {state} - iframe {url[:100]}")
+                self._event_stop()
         else:
             self.log.info(f"iframe cocok pola tapi kecil/tersembunyi, diabaikan: {url[:100]}")
+
+    def _event_stop(self) -> None:
+        """Captcha/verifikasi dari event halaman: stop global SAAT ITU JUGA (jalur lain berhenti sebelum tap
+        berikutnya), walaupun jalur ini sedang diam (menunggu arm atau T-lead) dan baru melaporkan di checkpoint."""
+        if self._event_hit is not None and TERMINAL[self._event_hit.state] in STOP_ALL_STATUSES \
+                and self.stop_event is not None:
+            self.stop_event.set()
 
     async def abort(self, reason: str = "") -> None:
         self._abort_reason = reason or "dibatalkan"
@@ -370,6 +379,15 @@ class WebRunner:
             await self._arm()
         except (_Aborted, _Stop) as e:  # stop global saat arm: attempt langsung berhenti tanpa aksi
             self.log.warn(f"arm dihentikan: {e}")
+            if isinstance(e, _Stop) and self._event_hit is not None and self._arm_state is None:
+                # captcha/verifikasi dari event halaman (navigasi/iframe) saat arm: hasil diminta SEKARANG
+                self._arm_state = self._event_hit
+                self._event_stop()
+
+    @property
+    def arm_blocked(self) -> bool:
+        """arm (T-60 s) berakhir di login/captcha/verifikasi: attempt() langsung mengembalikan hasilnya."""
+        return self._arm_state is not None
 
     async def _arm(self) -> None:
         await self._goto(self.cfg.product_url)
@@ -397,7 +415,9 @@ class WebRunner:
                 pass
         self.log.mark("armed", f"status {c.state}, produk {self._product_title[:40]!r}")
 
-    async def _select_variant(self, wait_s: float = 0.0) -> bool:
+    async def _select_variant(self, wait_s: float = 0.0, gate: PollingGate | None = None) -> bool | None:
+        """Pilih variasi bila belum terpilih. Di fase polling (`gate`) klik chip = aksi polling: lewat RateLimiter
+        & jendela T-1..T+8 s (None = jendela habis, tidak diklik)."""
         if not self.variant:
             return True
         loop = asyncio.get_running_loop()
@@ -414,6 +434,8 @@ class WebRunner:
             if not await opt.evaluate(ENABLED_JS):
                 self.log.warn(f"variasi '{self.variant}' belum bisa dipilih")
                 return False
+            if gate is not None and not await gate.acquire():
+                return None
             await self._click(opt, timeout=3000)
         except PlaywrightError as e:
             self.log.warn(f"gagal memilih variasi: {_first_line(e)}")
@@ -490,7 +512,7 @@ class WebRunner:
                 self.log.mark("reload")
                 self._blocked_price = _NO_PRICE
                 self._buy = await self._wait_resolve("buy_button", loop.time() + 2.0)
-                await self._select_variant(wait_s=2.0)  # variasi hilang setelah reload -> pilih ulang
+                await self._select_variant(wait_s=2.0, gate=gate)  # variasi lepas setelah reload -> pilih ulang
                 continue
             price: pricing.ProductPrice = info
             t_ready = clock.now_ms()
@@ -516,11 +538,19 @@ class WebRunner:
             if st == PageState.VARIANT_REQUIRED:
                 if not self.variant:
                     return RunStatus.ERROR, "produk wajib pilih variasi; isi `variant` di target.yaml"
-                if not await self._select_variant():
+                picked = await self._select_variant(gate=gate)
+                if picked is None:
+                    return self._window_closed(clicks)
+                if not picked:
                     return RunStatus.ERROR, f"variasi '{self.variant}' tidak bisa dipilih"
                 continue
             if st == PageState.PIN_SCREEN:
-                return RunStatus.ERROR, "layar PIN muncul tak terduga setelah klik Beli"
+                # PIN tanpa klik "Buat Pesanan" dari alat: pesanan mungkin sudah terbuat -> jalur lain berhenti
+                # SEKARANG (gate menolak), hasil UNKNOWN_STATE + pesan wajib "Pesanan MUNGKIN sudah terbuat"
+                self.order_clicked = True
+                if self.stop_event is not None:
+                    self.stop_event.set()
+                return RunStatus.UNKNOWN_STATE, "layar PIN muncul setelah klik Beli"
             self.log.mark("no_response", f"#{clicks} ({outcome.evidence or st})")
 
         # ---- klik Beli berhasil: langkah maju sekali-sekali, tanpa throttle, batas 30 s

@@ -57,6 +57,7 @@ class Scenario:
     captcha_redirect_after_buy: bool = False  # redirect penuh ke /verify/captcha
     captcha_iframe_after_buy: bool = False  # overlay iframe captcha (bukan dialog)
     unknown_page_after_buy: bool = False  # redirect ke halaman asing
+    pin_after_buy: bool = False  # klik Beli langsung berujung layar PIN (pesanan mungkin sudah terbuat)
     # --- keranjang & checkout
     cart_other_items: list[dict] = field(default_factory=list)  # {"name","price","checked"}
     cart_uncheck_fails: bool = False
@@ -84,6 +85,7 @@ PRESETS: dict[str, dict] = {
     "captcha_redirect": {"captcha_redirect_after_buy": True},
     "captcha_iframe": {"captcha_iframe_after_buy": True},
     "unknown_page": {"unknown_page_after_buy": True},
+    "pin_after_buy": {"pin_after_buy": True},
 }
 
 
@@ -347,6 +349,8 @@ def _make_handler(mock: MockShopee):
                 return self._json({"captcha_iframe": True})
             if s.unknown_page_after_buy:
                 return self._json({"redirect": "/promo/kejutan"})
+            if s.pin_after_buy:
+                return self._json({"redirect": "/pin"})
             flash = state == "open" and s.flash_available
             unit = mock.flash_price(body.get("variant")) if flash else s.original_price
             sid = secrets.token_hex(6)

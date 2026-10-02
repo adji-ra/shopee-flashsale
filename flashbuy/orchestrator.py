@@ -60,6 +60,7 @@ EXIT_CODES = {
 }
 
 UNKNOWN_AFTER_ORDER = "UNKNOWN_STATE (setelah order)"
+STOP_POLL_S = 0.05  # jalur yang menunggu (arm / T-lead) memeriksa stop global sesering ini
 # Prioritas status gabungan (indeks kecil menang). "UNKNOWN_STATE (setelah order)" = klik "Buat Pesanan" tanpa
 # layar PIN: pesanan mungkin terbuat.
 PRIORITY: tuple[str, ...] = (
@@ -98,11 +99,13 @@ class Lane:
         return bool(getattr(self.runner, "order_clicked", False))
 
     def label(self) -> str:
-        """Status untuk prioritas: UNKNOWN_STATE setelah klik 'Buat Pesanan' dibedakan."""
+        """Status untuk prioritas. Setelah klik 'Buat Pesanan' (atau PIN tanpa klik alat) tanpa layar PIN,
+        APA PUN statusnya (UNKNOWN_STATE, juga CAPTCHA/VERIFICATION/LOGIN_REQUIRED yang dipertahankan
+        after_order_click) = pesanan MUNGKIN terbuat -> UNKNOWN_STATE (setelah order): alarm mendesak, exit 5."""
         if self.result is None:
             return str(RunStatus.ERROR)
-        if self.result.status == RunStatus.UNKNOWN_STATE and (self.order_clicked or
-                                                             self.result.message == MAYBE_ORDERED_MSG):
+        if self.result.status != RunStatus.ORDER_PLACED_AWAIT_PIN and (
+                self.order_clicked or self.result.message == MAYBE_ORDERED_MSG):
             return UNKNOWN_AFTER_ORDER
         return str(self.result.status)
 
@@ -127,6 +130,7 @@ def wire(lane: Lane, control: RunControl) -> None:
     r.stop_event = control.stop_view(lane.name)
     r.cancel_event = control.cancel_event(lane.name)
     r.before_place_order = control.place_order_gate(lane.name)
+    r.limiter = control.limiter  # rate limit polling dibagi semua jalur (satu akun)
     r.notifier = DeferredNotifier()
 
 
@@ -157,6 +161,18 @@ def _deferred(lane: Lane) -> list[dict]:
 def _precheck_failure(pre: PrecheckResult) -> str:
     failed = [f"{i.name}: {i.detail}" for i in pre.items if i.ok is False]
     return "; ".join(failed) or str(pre.status or "gagal")
+
+
+async def _wait_or_stop(clock: ServerClock, t: float, control: RunControl, lead_ms: float = 0.0) -> float | None:
+    """Tunggu sampai `t - lead_ms` (jam server) ATAU stop global, mana yang lebih dulu. Stop (mis. captcha dari
+    event halaman web saat menunggu arm/T-lead) membangunkan semua jalur segera supaya alarm tidak menunggu T.
+    Return keterlambatan ms, atau None bila stop lebih dulu."""
+    deadline = t - lead_ms / 1000.0
+    while not control.stopped():
+        if deadline - clock.now() <= 2 * STOP_POLL_S + clock.spin_threshold_s:
+            return await clock.wait_until_async(t, lead_ms)  # sisa singkat: presisi penuh (busy-wait akhir)
+        await clock.clock.asleep(STOP_POLL_S)
+    return None
 
 
 async def _guarded(lane: Lane, phase: str, coro) -> object:
@@ -233,35 +249,42 @@ async def orchestrate(lanes: list[Lane], *, open_at: float, live: bool, clock: S
     # ---- resync T-2 mnt (satu kali, jam bersama)
     resync_at = open_at - schedule.resync_before_s
     if sync_fn is not None:
-        if clock.now() < resync_at:
-            await clock.wait_until_async(resync_at)
+        if clock.now() < resync_at and await _wait_or_stop(clock, resync_at, control) is not None:
             for lane in ok_lanes:
                 lane.log.mark("resync")
             clock = await resync(clock, sync_fn, ok_lanes[0].log)
             control.set_clock(lambda: clock.now_ms())
             for lane in lanes:
                 lane.log.clock = clock
-        else:
+        elif not control.stopped():
             ok_lanes[0].log.info("run dimulai setelah T-2 menit; timesync awal masih segar, resync dilewati")
 
     # ---- arm T-60 s (paralel)
-    await clock.wait_until_async(open_at - schedule.arm_before_s)
+    await _wait_or_stop(clock, open_at - schedule.arm_before_s, control)  # stop: arm segera (berhenti tanpa aksi)
     for lane in ok_lanes:
         lane.log.mark("arm")
-    await asyncio.gather(*(_guarded(lane, "arm", lane.runner.arm(open_at)) for lane in ok_lanes))
+    armed = await asyncio.gather(*(_guarded(lane, "arm", lane.runner.arm(open_at)) for lane in ok_lanes))
+    for lane, res in zip(ok_lanes, armed, strict=True):
+        if isinstance(res, Exception):  # arm melempar (bug/driver): jalur ini selesai ERROR, tanpa attempt
+            lane.result = RunResult(lane.name, RunStatus.ERROR, f"arm: {type(res).__name__}: {res}", live,
+                                    steps=list(lane.log.steps))
+            lane.log.write_result(lane.result)
 
     # ---- attempt T-lead per jalur
     async def attempt(lane: Lane) -> None:
-        if not control.stopped():  # stop global saat arm: langsung minta hasil (tanpa aksi), jangan tunggu T
-            late_ms = await clock.wait_until_async(open_at, lane.lead_ms)
-            lane.log.mark("t_minus_lead", f"lead {lane.lead_ms:.0f} ms, telat {late_ms:.1f} ms")
+        # stop global / arm gagal (captcha, verifikasi, login, intent gagal di T-60 s): hasil diminta SEKARANG
+        # (attempt langsung berhenti tanpa aksi) supaya alarm tidak menunggu T
+        if not control.stopped() and not getattr(lane.runner, "arm_blocked", False):
+            late_ms = await _wait_or_stop(clock, open_at, control, lane.lead_ms)
+            if late_ms is not None:
+                lane.log.mark("t_minus_lead", f"lead {lane.lead_ms:.0f} ms, telat {late_ms:.1f} ms")
         res = await _guarded(lane, "attempt", lane.runner.attempt(clock, live))
         if isinstance(res, Exception):
             res = RunResult(lane.name, RunStatus.ERROR, f"{type(res).__name__}: {res}", live,
                             steps=list(lane.log.steps))
         lane.result = res
 
-    await asyncio.gather(*(attempt(lane) for lane in ok_lanes))
+    await asyncio.gather(*(attempt(lane) for lane in ok_lanes if lane.result is None))
     return _finish(lanes, live, control, alarms, final_alarm=alarm)
 
 
